@@ -44,6 +44,7 @@ import {
 import {
   captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
 } from '../lib/run-sitting-intelligence';
+import { buildDeleteProjectBatch } from './project-room/delete-project';
 import {
   observeSimilarEffortCases as persistSimilarEffortOccurrences,
   recordSimilarityFeedback as persistSimilarityFeedback,
@@ -3809,99 +3810,9 @@ export class ProjectRoom extends DurableObject<Env> {
            JOIN tasks t  ON t.id  = d.task_id
          WHERE bt.project_id = ? AND t.project_id != ?`,
       ).bind(pid, pid).all<{ id: string; pid: string }>();
-      const tasksSub = 'SELECT id FROM tasks WHERE project_id = ?';
-      // PLNR-319: no plan.tasks_unlinked/task.docs_unlinked here, deliberately — this project's
-      // OWN `events` table is deleted a few statements below, and its ProjectMemory graph is
-      // project-scoped and orphaned along with everything else once `projects` loses the row.
-      // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
-      await this.env.DB.batch([
-        this.env.DB.prepare('DELETE FROM runner_coordination_waits WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_coordination_leases WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_coordination_fences WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_observations WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_routes WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_events WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_intelligence_tasks WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_intelligence_jobs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_episode_jobs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_job_items WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runner_jobs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM similar_effort_feedback WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM similar_effort_occurrences WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM project_quality_events WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
-        this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),
-        this.env.DB.prepare(`DELETE FROM claims WHERE task_id IN (${tasksSub})`).bind(pid),
-        this.env.DB.prepare('DELETE FROM file_locks WHERE project_id = ?').bind(pid), // PLNR-203: before tasks/projects (FK targets)
-        this.env.DB.prepare(`DELETE FROM task_refs WHERE task_id IN (${tasksSub})`).bind(pid),
-        this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
-        this.env.DB.prepare(`DELETE FROM task_docs WHERE task_id IN (${tasksSub}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`).bind(pid, pid),
-        this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM doc_versions WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare(`DELETE FROM comments WHERE task_id IN (${tasksSub})`).bind(pid),
-        this.env.DB.prepare(`DELETE FROM attachments WHERE task_id IN (${tasksSub})`).bind(pid),
-        this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM messages WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM events WHERE project_id = ?').bind(pid),
-        // Runs and their children go BEFORE plans (PLNR-236): runs.plan_id (0030) and
-        // runs.plan_dispatch_id (0046) are FKs, so deleting plans/plan_dispatches while any
-        // run still points at them aborts the whole batch — which is exactly what happened to
-        // every project that ever had a plan-anchored or pump-dispatched run. Same ordering
-        // rule inside the block: run children first (run_log_segments 0048, runtime_deliveries,
-        // steers), then runs, then the dispatch/landing records, then plans below.
-        // Runners are machines (project_id optional, multi-project) → unpin, not delete;
-        // the daemon's heartbeat keeps its status.
-        this.env.DB.prepare('DELETE FROM run_log_segments WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM memory_episode_jobs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM memory_analytics_jobs WHERE project_id = ?').bind(pid),
-        // Canonical execution history owns FKs to Runs/plans/tasks. Remove the orchestration
-        // scope first; its CASCADE clears nodes, relations, and lifecycle events.
-        this.env.DB.prepare('DELETE FROM orchestrations WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM plan_dispatches WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM plan_landings WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))').bind(pid),
-        this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM plan_docs WHERE project_id = ?').bind(pid), // PLNR-200: before plans (FK target)
-        this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM docs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
-        this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
-        // Tags go AFTER tasks (PLNR-108): the legacy tasks.category_id column still holds a
-        // FK to tags(id) on old data, so dropping tags while tasks exist FK-aborts the batch.
-        this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM boards WHERE project_id = ?').bind(pid),
-        // Project Memory registry (PLNR-246): compact rows only, before the projects row they
-        // FK-reference. The canonical memory graph itself is erased separately, below — it
-        // lives in the ProjectMemory DO, not D1, so it cannot ride this batch.
-        // repository_checkouts (PLNR-259) FK-references project_repositories — delete first.
-        this.env.DB.prepare(
-          'DELETE FROM repository_checkouts WHERE project_repository_id IN (SELECT id FROM project_repositories WHERE project_id = ?)',
-        ).bind(pid),
-        this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM memory_event_dedup WHERE project_id = ?').bind(pid),
-        // PLNR-326: explicit access grants FK-reference projects and must go before the
-        // project row. Authorization audit rows are soft historical evidence and survive.
-        this.env.DB.prepare('DELETE FROM project_grants WHERE project_id = ?').bind(pid),
-        // A durable erasure tombstone (PLNR-250) — deliberately NOT deleted here, and not an
-        // FK target of `projects`: it must outlive the row this batch is about to remove, the
-        // same exemption `templates`/`event_seq` get and for the same reason (see CLAUDE.md).
-        // Written in this SAME atomic batch so the record of "this project's memory must be
-        // erased" can never be lost even if the fire-and-forget attempt below never lands.
-        this.env.DB.prepare(
-          `INSERT INTO memory_erasure_tombstones (project_id, requested_at) VALUES (?, ?)
-           ON CONFLICT (project_id) DO NOTHING`,
-        ).bind(pid, nowIso()),
-        this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
-      ]);
+      // PLNR-319: no plan.tasks_unlinked/task.docs_unlinked here — this project's events table
+      // is deleted in the batch below. FK order + table inventory: project-room/delete-project.ts
+      await this.env.DB.batch(buildDeleteProjectBatch(this.env.DB, pid, nowIso()));
       // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.
       if (this.env.FILES) for (const key of r2Keys) await this.env.FILES.delete(key).catch(() => {});
       // The deleted project's key stands in for a blocker id nothing can resolve anymore.
