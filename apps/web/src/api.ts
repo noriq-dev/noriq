@@ -1697,6 +1697,7 @@ export interface ApiMemoryCapabilities {
   vectorize: boolean;
   workersAI: boolean;
   codeVectorize: boolean;
+  repositoryIndexing: boolean;
 }
 
 export interface ApiMemoryOpsStatus {

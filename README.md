@@ -76,7 +76,8 @@ read-only repository [noriq-dev/runner](https://github.com/noriq-dev/runner) (fi
 `RunnerHub`, `/ws/runner`, and runner REST are **gone** from the Worker (historical D1 tables may
 remain; do not use wrangler `deleted_classes` on the old DO class). **Device OAuth**,
 **execution specs on tasks**, and **Project Memory read/Ask** on already-indexed data remain;
-**repository ingest via the runner CLI is paused** until a non-daemon indexer exists. The Agents
+**repository code indexing is not a Noriq product capability** (local agents own code understanding;
+legacy ingest rails exist only when `REPOSITORY_INDEXING=1`). The Agents
 page lists **copilots only**. See [docs/RUNNER_CUTOVER.md](docs/RUNNER_CUTOVER.md).
 Landing-site marketing may lag this repo until a separate update.
 

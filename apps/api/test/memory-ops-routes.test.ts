@@ -55,13 +55,14 @@ describe('GET /api/projects/:pid/memory/ops-status (PLNR-273)', () => {
       health: { hasPriorGeneration: boolean; sizeStatus: string };
       registry: unknown;
       hierarchy: { state: string; active: unknown };
-      capabilities: { r2: boolean; vectorize: boolean; workersAI: boolean; codeVectorize: boolean };
+      capabilities: { r2: boolean; vectorize: boolean; workersAI: boolean; codeVectorize: boolean; repositoryIndexing: boolean };
     };
     expect(body.health.hasPriorGeneration).toBe(false);
     expect(body.registry).toBeNull(); // never touched its memory store yet
     expect(body.hierarchy).toMatchObject({ state: 'unavailable', active: null });
     expect(typeof body.capabilities.r2).toBe('boolean');
     expect(typeof body.capabilities.vectorize).toBe('boolean');
+    expect(body.capabilities.repositoryIndexing).toBe(true);
   });
 
   it('renders without crashing on a project with no repositories, generations, or backups', async () => {

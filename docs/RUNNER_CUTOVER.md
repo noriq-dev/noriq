@@ -24,9 +24,12 @@ drop with FK-breaking rebuilds). They are not part of the live product API or UI
 - Claims, boards, plans, execution specs as planning artifacts
 - Project Memory **read/Ask** on already-indexed data
 
-## Deferred
+## Not planned
 
-- Non-daemon repository indexer (memory ingest was runner-driven)
+- **Repository code indexing** — not a Noriq product capability; local agents own code understanding.
+  Legacy `/api/memory-ingest` index routes and operator generation controls require
+  `REPOSITORY_INDEXING=1` (tests/legacy only).
+
 - Public landing-site copy may lag this repo until updated separately
 
 ## Schema leftovers (do not destructively drop)

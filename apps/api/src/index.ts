@@ -60,6 +60,7 @@ import {
   getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, runMemoryBackup,
   type ProjectMemoryStub, type MemoryReviewReason,
 } from './lib/project-memory';
+import { repositoryIndexingProductEnabled, REPOSITORY_INDEXING_DISABLED_MESSAGE } from './lib/repository-indexing';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
@@ -1613,7 +1614,10 @@ app.post('/api/projects/:pid/memory/intelligence', userAuth, async (c) => {
 // "the number shown is the number the server enforces against").
 app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [repos, generations] = await Promise.all([listProjectRepositories(c.env, pid), memoryDO(c.env, pid).listIndexGenerations(pid)]);
+  const repos = await listProjectRepositories(c.env, pid);
+  const generations = repositoryIndexingProductEnabled(c.env)
+    ? await memoryDO(c.env, pid).listIndexGenerations(pid)
+    : [];
   const withCheckouts = await Promise.all(repos.map(async (r) => {
     const checkouts = await listRepositoryCheckouts(c.env, r.id);
     // stale/failedIngest/activeGeneration/stagedGenerations: shared with the runner's agentAuth
@@ -1788,6 +1792,9 @@ app.post('/api/projects/:pid/memory/generations/prune-retained', userAuth, async
 // validation-failed generation — the DO's guard is the authority (locked decision: the UI does
 // not re-implement it), this route only translates that throw into an HTTP 409 for the client.
 app.post('/api/projects/:pid/memory/generations/:generationId/activate', userAuth, async (c) => {
+  if (!repositoryIndexingProductEnabled(c.env)) {
+    return c.json({ error: REPOSITORY_INDEXING_DISABLED_MESSAGE }, 410);
+  }
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   const pid = c.req.param('pid')!;
   try {
@@ -1800,6 +1807,9 @@ app.post('/api/projects/:pid/memory/generations/:generationId/activate', userAut
 // Cancel a still-staged generation (e.g. one that failed validation) and drop its staged rows —
 // abortIndexIngest already refuses once active/superseded.
 app.post('/api/projects/:pid/memory/generations/:generationId/abort', userAuth, async (c) => {
+  if (!repositoryIndexingProductEnabled(c.env)) {
+    return c.json({ error: REPOSITORY_INDEXING_DISABLED_MESSAGE }, 410);
+  }
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   const pid = c.req.param('pid')!;
   try {
@@ -3687,6 +3697,9 @@ async function requireIngestCap(c: Context<AppContext>, token: string): Promise<
   if (!secret) return c.json({ error: 'ingest not enabled' }, 503);
   const claims = await verifyIngestToken(secret, token, Math.floor(Date.now() / 1000));
   if (!claims) return c.json({ error: 'invalid or expired ingest token' }, 401);
+  if (claims.purpose === 'index' && !repositoryIndexingProductEnabled(c.env)) {
+    return c.json({ error: REPOSITORY_INDEXING_DISABLED_MESSAGE }, 410);
+  }
   // Capabilities are stateless, so a signature minted before project deletion remains valid
   // until `exp`. Re-check the live project/repository association on every use; otherwise an old
   // index token can recreate rows in an already-erased ProjectMemory DO after its tombstone has

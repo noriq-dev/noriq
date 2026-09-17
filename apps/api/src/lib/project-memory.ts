@@ -20,6 +20,7 @@ import type {
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from '../memory/evidence-frame';
 import { userCanAccessProject } from './visibility';
 import { readExecutionSpec } from './execution-spec';
+import { repositoryIndexingProductEnabled } from './repository-indexing';
 
 /** PLNR-266: one stored, deduplicated guidance-drift finding — see ProjectMemory.
  *  listGuidanceDriftFindings and memory/guidance-drift.ts's DriftFinding for the full shape this
@@ -774,8 +775,16 @@ export interface MemoryCapabilities {
   vectorize: boolean;
   workersAI: boolean;
   codeVectorize: boolean;
+  /** Git-checkout repository index ingest / generation operator controls (product gate). */
+  repositoryIndexing: boolean;
 }
 
 export function memoryCapabilities(env: Env): MemoryCapabilities {
-  return { r2: !!env.FILES, vectorize: !!env.VECTORIZE, workersAI: !!env.AI, codeVectorize: !!env.CODE_VECTORIZE };
+  return {
+    r2: !!env.FILES,
+    vectorize: !!env.VECTORIZE,
+    workersAI: !!env.AI,
+    codeVectorize: !!env.CODE_VECTORIZE,
+    repositoryIndexing: repositoryIndexingProductEnabled(env),
+  };
 }

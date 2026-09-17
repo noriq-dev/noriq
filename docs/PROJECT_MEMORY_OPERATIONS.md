@@ -1,7 +1,7 @@
 # Project Memory operations
 
 This is the self-hosting and day-two operations guide for Project Memory. It covers the boundary
-between D1 and the per-project Durable Object, optional Cloudflare services, repository indexing
+between D1 and the per-project Durable Object, optional Cloudflare services, and (legacy) repository indexing when explicitly enabled
 (cut-over: runner CLI ingest paused), upgrades, recovery, deletion, and release checks. Dual-plane
 cutover (D1 + ProjectMemory + AgentSession cursors) is summarized at the top of
 [`apps/api/BACKUP.md`](../apps/api/BACKUP.md). Detailed snapshot formats and restore semantics
@@ -157,18 +157,15 @@ The supported client executes this server-owned sequence:
    generation never becomes canonical. An admin can inspect and activate or abort a retained
    staged generation as an explicit recovery action.
 
-**Legacy runner CLI (do not start for new work):**
+**Repository code indexing (product default: off).** Noriq no longer owns git-checkout
+repository indexing. Local agents (Cursor, Codex, Claude Code, etc.) own code understanding.
+Project Memory (decisions, hazards, episodes, Ask), project docs, and task/doc/plan
+`reindex_search` remain supported. Register `repository_key` rows only for stable URI prefixes
+and citations.
 
-```sh
-# Paused with runner cut-over — listed for operators finishing in-flight uploads only
-noriq-runner index-repo --check-determinism  # local-only preview; cannot upload
-noriq-runner index-status
-noriq-runner index-reindex                   # request validation + atomic activation
-noriq-runner index-cancel
-```
-
-Turning `[index].enabled` off stops future triggers; it does not retract previously activated
-server content. Server-side removal belongs to the project operator and project deletion lifecycle.
+When `REPOSITORY_INDEXING=1` is set on the Worker (legacy/tests only), the `/api/memory-ingest`
+index path and Memory > Operations activate/abort controls remain available. The archived runner
+CLI (`noriq-runner index-*`) is not a supported product surface.
 
 ## Routine operations
 
@@ -190,7 +187,7 @@ Available admin actions in Memory > Operations include:
 
 - back up and restore a chosen portable generation;
 - roll back the immediately preceding restored generation or prune that retained copy;
-- activate or abort a repository index generation;
+- activate or abort a repository index generation (only when `REPOSITORY_INDEXING=1`);
 - rebuild ProjectMemory vectors from canonical rows;
 - rebuild the disposable Constellation hierarchy and backfill coordination graph projections
   through the lifecycle sweep;
@@ -201,9 +198,9 @@ There are three different reindex operations; use the one matching the stale der
 - **Task/doc/plan search stale:** call the MCP `reindex_search` maintenance tool, passing its
   returned offset until `remaining` is zero.
 - **Memory/episode semantic vectors dirty:** Memory > Operations > Rebuild vectors.
-- **Repository generation stale:** Memory > Operations (activate staged generation or abort), or
-  legacy `noriq-runner index-reindex` only while runner ingest is still enabled on the instance.
-  Do not replace this with the task/doc/plan Search reindex.
+- **Repository generation stale:** not applicable on default deployments (repository indexing is
+  off). With `REPOSITORY_INDEXING=1`, use Memory > Operations to activate or abort a staged
+  generation. Do not replace this with the task/doc/plan Search reindex.
 
 ## Backups, restore, and recovery rehearsal
 
