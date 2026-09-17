@@ -2694,28 +2694,6 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
-  // Project archive (PLNR-567): soft-hide via projects.status ('active'|'archived').
-  // Column existed since 0001; this is the sole writer that flips it. Data stays;
-  // default GET /api/projects and agent briefing lists filter status='active'.
-  // ---------------------------------------------------------------------------
-
-  async setProjectArchived(projectId: string, actor: Actor, archived: boolean) {
-    return this.ctx.blockConcurrencyWhile(async () => {
-      await this.setPid(projectId);
-      const proj = await this.env.DB.prepare('SELECT id, key, name, status FROM projects WHERE id = ?')
-        .bind(this.projectId).first<{ id: string; key: string; name: string; status: string }>();
-      if (!proj) throw new Error('project not found');
-      const next = archived ? 'archived' : 'active';
-      if (proj.status === next) return { ok: true as const, key: proj.key, archived, status: next };
-      await this.env.DB.prepare('UPDATE projects SET status = ? WHERE id = ?').bind(next, this.projectId).run();
-      await this.emit(actor, archived ? 'project.archived' : 'project.restored', 'project', this.projectId, {
-        key: proj.key, name: proj.name, status: next,
-      });
-      return { ok: true as const, key: proj.key, archived, status: next };
-    });
-  }
-
-  // ---------------------------------------------------------------------------
   // Archive (PLNR-70/73): archived tasks drop off the board unless the switch is on.
   // ---------------------------------------------------------------------------
 

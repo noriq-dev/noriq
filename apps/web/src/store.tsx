@@ -269,7 +269,6 @@ export function useAppStore() {
     liveAgentCount: p.liveAgentCount,
     historicalAgentCount: p.historicalAgentCount,
     isPublic: !!p.public,
-    status: p.status ?? 'active',
     effectiveRole: p.effectiveRole,
     accessSource: p.accessSource,
     canView: p.canView,
@@ -882,17 +881,6 @@ export function useAppStore() {
       setCurrentPid(null);
       setView('home');
       await loadProjects(); // refetches without the deleted project
-    },
-    async archiveProject(projectId: string) {
-      await api.archiveProject(projectId);
-      setSelectedTaskId(null);
-      setCurrentPid(null);
-      setView('home');
-      await loadProjects();
-    },
-    async restoreProject(projectId: string) {
-      await api.restoreProject(projectId);
-      await loadProjects();
     },
 
     // --- boards (PLNR-80) ---

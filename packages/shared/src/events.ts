@@ -16,11 +16,6 @@ import { ActorKind } from './model';
 // unreachable in memory/projection.ts before this pass.
 export const EventVerb = z.enum([
   'project.updated',
-  // Soft-hide a project from default lists without delete (PLNR-567). Mirrors task/plan
-  // archive/restore verbs rather than overloading project.updated — operators need a distinct
-  // feed signal when a project leaves or re-enters the active directory.
-  'project.archived',
-  'project.restored',
   'milestone.created',
   'milestone.updated',
   'milestone.deleted',

@@ -245,15 +245,7 @@ export const api = {
   submitReset: (token: string, password: string) =>
     req<{ user: import('./types').UserVM }>('POST', '/api/reset', { token, password }),
 
-  projects: (opts?: 'all' | { scope?: 'all'; archived?: boolean }) => {
-    const scope = opts === 'all' ? 'all' : opts?.scope;
-    const archived = typeof opts === 'object' && opts?.archived === true;
-    const q = new URLSearchParams();
-    if (scope === 'all') q.set('scope', 'all');
-    if (archived) q.set('archived', '1');
-    const qs = q.toString();
-    return req<{ projects: ApiProject[]; admin: boolean }>('GET', `/api/projects${qs ? `?${qs}` : ''}`);
-  },
+  projects: (scope?: 'all') => req<{ projects: ApiProject[]; admin: boolean }>('GET', scope === 'all' ? '/api/projects?scope=all' : '/api/projects'),
   // The snapshot always includes archived tasks (flagged by archivedAt); the store
   // filters them for display (PLNR-150).
   snapshot: (pid: string) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot`),
@@ -495,9 +487,6 @@ export const api = {
   rejectProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
-  /** Soft-hide project from default lists (PLNR-567). Owner-only; data retained. */
-  archiveProject: (pid: string) => req<{ ok: true; key: string; archived: true; status: 'archived' }>('POST', `/api/projects/${pid}/archive`),
-  restoreProject: (pid: string) => req<{ ok: true; key: string; archived: false; status: 'active' }>('POST', `/api/projects/${pid}/restore`),
   /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + proposed + overdue tasks. */
   attention: () =>
     req<{
@@ -1218,8 +1207,6 @@ export interface ApiProject {
   key: string;
   name: string;
   description: string;
-  /** Wire status from projects.status (PLNR-567). Default list is active-only. */
-  status: 'active' | 'archived';
   liveTasks: number;
   openTasks: number;
   totalTasks: number;
