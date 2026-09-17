@@ -2,7 +2,6 @@
 // flag baked ON (env vars do not reach the SELF worker isolate at runtime).
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { RUNNER_DISABLED_CODE } from '../src/lib/runner-disabled';
 import { createUser, loginSession } from './helpers';
 
 const DB = () => (env as unknown as { DB: D1Database }).DB;
@@ -52,7 +51,7 @@ describe('RUNNER_DISABLED kill-switch', () => {
     expect(health.runnerDisabled).toBe(true);
   });
 
-  it('refuses runner registration, heartbeat, dispatch, and WS upgrade with 410', async () => {
+  it('returns 404 for removed runner-plane REST routes', async () => {
     for (const [path, headers, body] of [
       ['/api/runners', { ...bearer, ...asJson }, { label: 'x', maxConcurrency: 1 }],
       ['/api/runners/rnr_test/heartbeat', { ...bearer, ...asJson }, { freeSlots: 1, status: 'online' }],
@@ -62,9 +61,11 @@ describe('RUNNER_DISABLED kill-switch', () => {
       const res = await SELF.fetch(`https://noriq.test${path}`, {
         method: 'POST', headers, body: JSON.stringify(body),
       });
-      expect(res.status, path).toBe(410);
-      expect(await res.json()).toMatchObject({ code: RUNNER_DISABLED_CODE });
+      expect(res.status, path).toBe(404);
     }
+
+    const listRunners = await SELF.fetch('https://noriq.test/api/runners', { headers: { Cookie: sessionCookie } });
+    expect(listRunners.status).toBe(404);
 
     const dispatch = await SELF.fetch(
       `https://noriq.test/api/projects/${sessionProjectId}/tasks/tsk_any/runner-jobs`,
@@ -74,9 +75,10 @@ describe('RUNNER_DISABLED kill-switch', () => {
         body: JSON.stringify({ runnerId: 'rnr_test', repoRef: 'main' }),
       },
     );
-    expect(dispatch.status).toBe(410);
-    expect(await dispatch.json()).toMatchObject({ code: RUNNER_DISABLED_CODE });
+    expect(dispatch.status).toBe(404);
+  });
 
+  it('refuses runner WS upgrade with 410 while RUNNER_DISABLED', async () => {
     const ws = await SELF.fetch('https://noriq.test/ws/runner/rnr_test', {
       headers: { ...bearer, Upgrade: 'websocket' },
     });

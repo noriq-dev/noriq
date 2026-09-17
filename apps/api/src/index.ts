@@ -3960,6 +3960,122 @@ app.get('/api/memory-ingest/:token/status', async (c) => {
   return c.json(result);
 });
 
+// --- per-task comment pages (bounded; detail already returns open + a short resolved tail)
+app.get('/api/tasks/:tid/comments', userAuth, async (c) => {
+  const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ?').bind(tid).first<{ pid: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'not found' }, 404);
+  const statusRaw = c.req.query('status');
+  const authorRaw = c.req.query('authorKind');
+  if (statusRaw && !['open', 'resolved', 'all'].includes(statusRaw)) {
+    return c.json({ error: 'status must be open, resolved, or all' }, 400);
+  }
+  if (authorRaw && !['agent', 'human', 'system'].includes(authorRaw)) {
+    return c.json({ error: 'authorKind must be agent, human, or system' }, 400);
+  }
+  try {
+    const page = await listTaskCommentsPaged(c.env.DB, tid, {
+      status: statusRaw === 'open' || statusRaw === 'resolved' || statusRaw === 'all' ? statusRaw : undefined,
+      authorKind: authorRaw === 'agent' || authorRaw === 'human' || authorRaw === 'system' ? authorRaw : undefined,
+      limit: clampCommentLimit(parseInt(c.req.query('limit') ?? '', 10) || undefined),
+      before: c.req.query('before') || undefined,
+    });
+    return c.json(page);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/not found on this task/.test(message)) return c.json({ error: message }, 400);
+    throw err;
+  }
+});
+
+// --- per-task event timeline (PLNR-34) ----------------------------------------------
+app.get('/api/tasks/:tid/events', userAuth, async (c) => {
+  const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ?').bind(tid).first<{ pid: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'not found' }, 404); // PLNR-97
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, payload, created_at AS createdAt
+     FROM events WHERE project_id = ?2 AND (subject_id = ?1 OR payload LIKE '%"taskId":"' || ?1 || '"%')
+     ORDER BY rowid DESC LIMIT 60`,
+  ).bind(tid, task.pid).all();
+  return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
+});
+
+// --- attachments (PLNR-31): bytes in R2, metadata in D1 -------------------------------
+const MAX_ATTACHMENT = 100 * 1024 * 1024;
+
+app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
+  if (!c.env.FILES) return c.json({ error: 'attachments not configured — enable R2 and bind FILES (see wrangler.jsonc)' }, 503);
+  const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ?').bind(tid)
+    .first<{ id: string; pid: string }>();
+  if (!task) return c.json({ error: 'task not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'task not found' }, 404); // PLNR-98
+  const filename = (c.req.query('filename') ?? 'file').replace(/[\/\\]/g, '_').slice(0, 120);
+  // Early reject on an honest oversized Content-Length; but the header is
+  // client-controlled, so the REAL size is enforced from R2 after the stream lands
+  // (a forged small length used to under-report while R2 stored the full body — PLNR-98).
+  if (Number(c.req.header('Content-Length') ?? '0') > MAX_ATTACHMENT) {
+    return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
+  }
+  const id = newId('att');
+  const key = `att/${task.pid}/${id}/${filename}`;
+  const ct = c.req.header('Content-Type') ?? 'application/octet-stream';
+  const obj = await c.env.FILES.put(key, c.req.raw.body, { httpMetadata: { contentType: ct } });
+  const size = obj?.size ?? 0;
+  if (!size || size > MAX_ATTACHMENT) {
+    await c.env.FILES.delete(key).catch(() => {});
+    return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'human', ?, ?)`,
+  ).bind(id, tid, filename, ct, size, key, c.var.user!.id, nowIso()).run();
+  await room(c.env, task.pid).noteAttachment(task.pid, humanActor(c), tid, filename, id);
+  return c.json({ id, filename, size });
+});
+
+// Agent upload via capability token (PLNR-173). No cookie/bearer — the signed token IS
+// the authorization, minted by attach_files upload mode for exactly this (agent, task,
+// file). Bytes stream straight to R2, never through the model context. Mirrors the POST
+// route above, including the PLNR-98 real-size check (Content-Length is client-controlled).
+app.put('/api/attachments/upload/:token', async (c) => {
+  if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
+  const secret = resolveUploadSecret(c.env);
+  if (!secret) return c.json({ error: 'uploads not enabled' }, 503);
+  const claims = await verifyUploadToken(secret, c.req.param('token')!, Math.floor(Date.now() / 1000));
+  if (!claims) return c.json({ error: 'invalid or expired upload token' }, 401);
+  // The task must still exist (deleted within the TTL, or a stale token) — checked so a
+  // dangling FK can't orphan an R2 object.
+  const task = await c.env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ?')
+    .bind(claims.tid).first<{ id: string; pid: string }>();
+  if (!task || task.pid !== claims.pid) return c.json({ error: 'task not found' }, 404);
+  if (Number(c.req.header('Content-Length') ?? '0') > claims.max) {
+    return c.json({ error: `attachment exceeds ${claims.max} bytes` }, 413);
+  }
+  const key = `att/${claims.pid}/${claims.aid}/${claims.fn}`;
+  const obj = await c.env.FILES.put(key, c.req.raw.body, { httpMetadata: { contentType: claims.ct } });
+  const size = obj?.size ?? 0;
+  if (!size || size > claims.max) {
+    await c.env.FILES.delete(key).catch(() => {});
+    return c.json({ error: `attachment must be 1 byte – ${claims.max} bytes` }, 413);
+  }
+  // Idempotent on the attachment id: a replayed PUT overwrites the same object and inserts
+  // nothing new, so it stays exactly one row (and one WS event).
+  const ins = await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'agent', ?, ?)`,
+  ).bind(claims.aid, claims.tid, claims.fn, claims.ct, size, key, claims.agentId, nowIso()).run();
+  if (ins.meta.changes > 0) {
+    const nm = await c.env.DB.prepare('SELECT COALESCE(label, name) AS name FROM agents WHERE id = ?')
+      .bind(claims.agentId).first<{ name: string }>();
+    await room(c.env, claims.pid).noteAttachment(claims.pid, { kind: 'agent', id: claims.agentId, name: nm?.name ?? 'agent' }, claims.tid, claims.fn, claims.aid);
+  }
+  return c.json({ id: claims.aid, filename: claims.fn, size });
+});
+
 app.get('/api/attachments/:aid', userAuth, async (c) => {
   const row = await c.env.DB.prepare(
     `SELECT a.r2_key AS key, a.filename, a.content_type AS ct, t.project_id AS pid
