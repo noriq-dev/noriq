@@ -1412,8 +1412,13 @@ app.post('/api/projects/:pid/tasks/:tid/restore', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).archiveTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, false)));
 
 // --- deletion (PLNR-70) ------------------------------------------------------
-app.delete('/api/projects/:pid/milestones/:mid', userAuth, async (c) =>
-  c.json(await room(c.env, c.req.param('pid')!).deleteMilestone(c.req.param('pid')!, humanActor(c), c.req.param('mid')!)));
+app.delete('/api/projects/:pid/milestones/:mid', userAuth, async (c) => {
+  try {
+    return c.json(await room(c.env, c.req.param('pid')!).deleteMilestone(c.req.param('pid')!, humanActor(c), c.req.param('mid')!));
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+  }
+});
 
 // Merge tag :tid INTO another tag (PLNR-194) — the vocabulary-cleanup primitive.
 app.post('/api/projects/:pid/tags/:tid/merge', userAuth, async (c) => {

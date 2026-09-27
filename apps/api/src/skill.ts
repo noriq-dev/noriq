@@ -148,6 +148,12 @@ order them accordingly. Never tag with status, type, or priority words (\`bug\`,
 \`in-progress\`, \`p1\`, …) — those concepts live in dedicated fields and the server
 rejects them as tags.
 
+Every task must have a milestone. Choose a meaningful existing milestone from
+\`get_project.milestones\` and set \`milestoneId\` on each task, or in \`defaults\` when
+the whole batch shares it. Create a milestone first if the work has no suitable home.
+An omitted milestone on older clients lands in Backlog; treat that as a compatibility
+fallback, then place the task deliberately. Reassign tasks before deleting a milestone.
+
 Tags are the project's **shared filter vocabulary**, not per-item keywords: reuse the
 existing set (\`get_project\` → tags) before minting, keep it to 1–3 per item, and only
 mint a name that will group several items. The server rejects near-duplicates of
@@ -216,12 +222,17 @@ After a blocking \`request_input\`, do not repeat the question in chat or wait t
 parked and released the task; call \`next_claimable\` and continue useful work. After a
 non-blocking request, keep the current claim and continue immediately.
 
-Found real work that is not your task's? Use \`create_tasks\` with \`proposal\` metadata: the
-finding becomes its own **proposed** task — visible on the board but unclaimable until a human
-accepts it (accept → todo) or rejects it (→ cancelled) — with your task and the finding text
-recorded as durable provenance. If it belongs in a plan, set \`phaseId\` when you file it.
-Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert is a concern that is
-NOT work, a proposal is work that is not YOURS.
+Found real work outside your current task? Search for an existing task first. If it is
+missing, create a normal task with \`create_tasks\`, choose its milestone, type and honest
+priority, and link its source in the body. A confirmed critical bug should be an active
+P0/P1 bug task so it can be claimed promptly; do not bury it in Proposed or Backlog.
+Stay within your current claim unless you are authorized to take the new task.
+
+Use \`proposal\` metadata only when a human must decide whether the work should exist or
+proceed — for example, an optional product change or a disputed scope expansion. A
+proposed task is inert until a human accepts or rejects it; it is not a general label
+for work discovered by an agent. If there is an immediate operational concern, use
+\`raise_alert\` as well as the actionable task.
 
 ## Planning
 

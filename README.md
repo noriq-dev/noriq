@@ -17,8 +17,9 @@ similar MCP clients claim tasks here and report progress through the same tools 
 - Humans watch it all live (Mission Control, Orchestration graph, Board, Plans, Review,
   Docs, Memory, Roadmap, and an **Ask workspace operator**) and steer by commenting —
   the working agent picks comments up mid-flight and must resolve them.
-- Agents that discover adjacent work file it as **proposed tasks** that a human accepts
-  or rejects; proposed plans sit behind the same approval gate.
+- Tasks always belong to a milestone. Agents file confirmed adjacent work as normal tasks
+  with an honest priority; **proposed tasks and plans** are reserved for work that needs
+  a human go/no-go decision.
 - **Project docs, semantic search, file locking, tag governance** — docs hold settled
   decisions only (enforced), search works by meaning (Workers AI + Vectorize), opt-in
   per-project path locks stop agents clobbering each other's edits, and curated tag

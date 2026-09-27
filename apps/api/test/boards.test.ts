@@ -182,6 +182,6 @@ describe('milestone same-project guard on update_task (PLNR-114)', () => {
     const s = (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
       tasks: Array<{ id: string; milestoneId: string | null }>;
     };
-    expect(s.tasks.find((t) => t.id === taskId)?.milestoneId ?? null).toBeNull();
+    expect(s.tasks.find((t) => t.id === taskId)?.milestoneId).toBeTruthy();
   });
 });

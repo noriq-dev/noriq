@@ -192,7 +192,7 @@ export function Drawer({ store }: { store: AppStore }) {
         body: eBody,
         type: eType,
         tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
-        milestoneId: eMilestone || null,
+        milestoneId: eMilestone,
         // End-of-day UTC so "due today" doesn't read overdue at 9am.
         dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
         ...(eBoard ? { boardId: eBoard } : {}),
@@ -835,7 +835,7 @@ export function Drawer({ store }: { store: AppStore }) {
             </div>
             <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: phone ? '1fr' : '1fr 1fr', gap: 10 }}>
               <Select aria-label="Task milestone" value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
-                <option value="">— no milestone —</option>
+                <option value="" disabled>Choose a milestone…</option>
                 {(snapshot?.milestones ?? []).map((mm) => (
                   <option key={mm.id} value={mm.id}>{mm.title}</option>
                 ))}

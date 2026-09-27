@@ -33,9 +33,15 @@ The plan you'd write in plan mode maps onto \`create_plan\` one-to-one:
   for ones that already exist. Every new task needs descriptive tags, either on the task or
   through \`taskDefaults\`; the first tag is its primary topic.
 
-Use \`proposed:true\` when a scope run is handing a plan to a human for approval. Proposed-plan
-tasks stay inert until approval. A Copilot creating a plan it is authorized to execute normally
-creates an active plan. Repeated shapes belong in \`save_template\` and can be inspected with
+Choose a milestone for every new task. Set \`taskDefaults.milestoneId\` when all new
+tasks share one, or set each \`newTasks[].milestoneId\` to place work in the right
+milestone. Create a suitable milestone before writing the plan if needed. Backlog is
+only the fallback for an older client that omits placement.
+
+Use \`proposed:true\` when a scope run is handing a plan to a human for a real
+go/no-go decision. Proposed-plan tasks stay inert until approval. If the work is
+already authorized, including urgent bug fixes, create an active plan and mark the
+tasks with their actual priority. Repeated shapes belong in \`save_template\` and can be inspected with
 \`list_templates\`, then instantiated with \`create_plan.templateId\`.
 
 Phase order is **enforced by the phases themselves**: a task in phase N is claimable

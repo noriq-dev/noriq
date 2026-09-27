@@ -100,8 +100,9 @@ describe('the webhook never restatuses a CLAIMED task (PLNR-226)', () => {
     }
     await db.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id).run();
     await db.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run();
+    await db.prepare("INSERT OR IGNORE INTO milestones (id, project_id, title) VALUES ('ms_wh_backlog', 'prj_wh', 'Backlog')").run();
     await db.prepare(
-      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES (?, 'prj_wh', ?, 'wh', ?, ?)",
+      "INSERT INTO tasks (id, project_id, key, milestone_id, title, status, claimed_by) VALUES (?, 'prj_wh', ?, 'ms_wh_backlog', 'wh', ?, ?)",
     ).bind(id, key, status, claimedBy).run();
   };
   const statusOf = async (id: string) =>

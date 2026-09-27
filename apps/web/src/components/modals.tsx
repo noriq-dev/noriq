@@ -164,9 +164,9 @@ function CreateTaskModal({ store }: { store: AppStore }) {
             <option value={4}>P4 · someday</option>
           </Select>
         </Field>
-        <Field label="Milestone" hint="optional">
+        <Field label="Milestone" hint="required">
           <Select value={milestoneId} onChange={(e) => setMilestoneId(e.target.value)}>
-            <option value="">— none —</option>
+            <option value="">Choose a milestone…</option>
             {milestones.map((m) => (
               <option key={m.id} value={m.id}>{m.title}</option>
             ))}
@@ -222,7 +222,7 @@ function CreateTaskModal({ store }: { store: AppStore }) {
         <Button variant="ghost" onClick={() => store.actions.openModal('milestone')}>+ new milestone</Button>
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
-        <Button disabled={busy || !title.trim() || (!!planId && !phaseId)} onClick={run}>Create task</Button>
+        <Button disabled={busy || !title.trim() || !milestoneId || (!!planId && !phaseId)} onClick={run}>Create task</Button>
       </div>
     </Modal>
   );
@@ -232,6 +232,7 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
   const editing = store.editMilestone;
   const [title, setTitle] = useState(editing?.title ?? '');
   const [dueAt, setDueAt] = useState(editing?.dueAt ? editing.dueAt.slice(0, 10) : '');
+  const [deleteError, setDeleteError] = useState('');
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitMilestone(title.trim(), dueAt ? new Date(dueAt).toISOString() : undefined);
   });
@@ -253,16 +254,20 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
           <Button
             variant="danger"
             onClick={async () => {
-              if (await confirm(`Delete milestone "${editing.title}"? Its tasks stay, just unassigned.`)) {
-                await store.actions.deleteMilestone(editing.id);
-                store.actions.closeModal();
+              if (await confirm(`Delete milestone "${editing.title}"? Reassign its tasks first.`)) {
+                try {
+                  await store.actions.deleteMilestone(editing.id);
+                  store.actions.closeModal();
+                } catch (e) {
+                  setDeleteError(e instanceof Error ? e.message : String(e));
+                }
               }
             }}
           >
             Delete
           </Button>
         )}
-        <ErrorNote>{error}</ErrorNote>
+        <ErrorNote>{error || deleteError}</ErrorNote>
         <div style={{ flex: 1 }} />
         <Button disabled={busy || !title.trim()} onClick={run}>{editing ? 'Save changes' : 'Create milestone'}</Button>
       </div>

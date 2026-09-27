@@ -20,14 +20,39 @@ beforeAll(async () => {
 }, 60000);
 
 describe('deletion', () => {
-  it('milestone delete keeps its tasks (milestone_id nulled)', async () => {
+  it('requires reassigning tasks before deleting a milestone', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELM', name: 'delm' })).body;
     const ms = (await mcpCall(agent.apiKey, 'create_milestone', { projectId: p.id, title: 'M1' })).body;
     const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'keep me', milestoneId: ms.id })).body;
+    const refused = await del(p.id, `/milestones/${ms.id}`);
+    expect(refused.status).toBe(400);
+    expect((await refused.json() as { error: string }).error).toContain('reassign');
+    const before = await snap(p.id);
+    const backlog = before.milestones.find((m) => (m as { title: string }).title === 'Backlog') as { id: string };
+    const moved = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/tasks/${t.id}`, {
+      method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ milestoneId: backlog.id }),
+    });
+    expect(moved.status).toBe(200);
     expect((await del(p.id, `/milestones/${ms.id}`)).status).toBe(200);
     const s = await snap(p.id);
     expect(s.milestones.find((m) => (m as { id: string }).id === ms.id)).toBeUndefined();
-    expect(s.tasks.find((x) => x.id === t.id)!.milestoneId).toBeNull();
+    expect(s.tasks.find((x) => x.id === t.id)!.milestoneId).toBe(backlog.id);
+  });
+
+  it('places legacy callers in Backlog and inherits a parent milestone', async () => {
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELM2', name: 'milestone defaults' })).body;
+    const ms = (await mcpCall(agent.apiKey, 'create_milestone', { projectId: p.id, title: 'Release' })).body;
+    const plain = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'legacy caller' })).body;
+    const parent = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'parent', milestoneId: ms.id })).body;
+    const child = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'child', parentTaskId: parent.id })).body;
+    const s = await snap(p.id);
+    const backlog = s.milestones.find((m) => (m as { title: string }).title === 'Backlog') as { id: string };
+    expect(s.tasks.find((x) => x.id === plain.id)?.milestoneId).toBe(backlog.id);
+    expect(s.tasks.find((x) => x.id === child.id)?.milestoneId).toBe(ms.id);
+    const cleared = await mcpCall(agent.apiKey, 'update_task', { projectId: p.id, taskId: plain.id, milestoneId: null });
+    expect(cleared.isError).toBe(true);
+    expect((await snap(p.id)).tasks.find((x) => x.id === plain.id)?.milestoneId).toBe(backlog.id);
   });
 
   it('plan delete keeps its tasks', async () => {

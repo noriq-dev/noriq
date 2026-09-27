@@ -72,7 +72,7 @@ describe('task plan placement', () => {
     const submitTask = vi.fn().mockResolvedValue(undefined);
     mount({
       modal: 'task', currentPid: 'prj_1', snapshot: {
-        ...placementSnapshot, milestones: [], tags: [],
+        ...placementSnapshot, milestones: [{ id: 'ms_release', title: 'Release', dueAt: null, order: 0 }], tags: [],
       },
       data: { projects: [{ id: 'prj_1', name: 'Project One' }] },
       actions: { closeModal: vi.fn(), submitTask, openModal: vi.fn() },
@@ -84,12 +84,13 @@ describe('task plan placement', () => {
       title.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await choose('Task plan', 'Release plan');
+    await choose('Milestone', 'Release');
     expect(dropdown('Task phase').disabled).toBe(false);
     await choose('Task phase', 'Ship');
     await act(async () => { button('Create task').click(); });
 
     expect(submitTask).toHaveBeenCalledWith(expect.objectContaining({
-      title: 'Place this work', phaseId: 'phase_ship',
+      title: 'Place this work', phaseId: 'phase_ship', milestoneId: 'ms_release',
     }));
   });
 });

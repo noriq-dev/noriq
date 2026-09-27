@@ -894,10 +894,11 @@ export class ProjectRoom extends DurableObject<Env> {
         : (await this.parentBoardId(input.parentTaskId))
           ?? (await this.actorRepoBoardId(actor))
           ?? (await this.defaultBoardId(pid));
-      // Milestones validate like boards (PLNR-232): unvalidated, an unknown or foreign-project
-      // milestone id aborted the insert batch as an opaque FK error — atomically here, but from
-      // create_plan's task loop it was a mid-plan throw, i.e. a partial plan left behind.
-      if (input.milestoneId) await this.requireProjectMilestone(input.milestoneId);
+      // A task always belongs to a milestone. Older API clients can omit it; put their
+      // work beside its parent, or in Backlog. Explicit placement must be project-local.
+      const milestoneId = input.milestoneId
+        ? await this.requireProjectMilestone(input.milestoneId)
+        : (await this.parentMilestoneId(input.parentTaskId)) ?? (await this.backlogMilestoneId(pid));
       // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
       // whole create cleanly instead of leaving a task without its intended links.
       const docs = await this.requireProjectDocs(input.docIds);
@@ -946,7 +947,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, proposed_at, spinoff_run_id, spinoff_source_task_id, spinoff_finding, proposal_actor_kind, proposal_actor_id, proposal_execution_id, "order", created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec,
+        ).bind(id, pid, key, milestoneId, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec,
           input.proposal ? now : null, input.proposal?.runId ?? null, input.proposal?.sourceTaskId ?? null, input.proposal?.finding ?? null,
           input.proposal?.actorKind ?? null, input.proposal?.actorId ?? null, input.proposal?.executionId ?? null,
           proj.n, now, now),
@@ -1083,6 +1084,10 @@ export class ProjectRoom extends DurableObject<Env> {
       // which is distinct from an explicit null (clear it).
       const executionSpec =
         patch.executionSpec === undefined ? undefined : writeExecutionSpec(patch.executionSpec);
+      if (patch.milestoneId === null || patch.milestoneId === '') {
+        throw new Error('every task needs a milestone; choose one from get_project.milestones');
+      }
+      if (patch.milestoneId) patch.milestoneId = await this.requireProjectMilestone(patch.milestoneId);
       // Consumed by the tag paths only — must not reach the generic field loop.
       const allowNewTags = patch.allowNewTags;
       delete patch.allowNewTags;
@@ -1180,7 +1185,6 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.boardId) patch.boardId = await this.requireProjectBoard(patch.boardId);
       // Ditto for milestones — the column allowlist blocks project_id but not a foreign
       // project's milestone id, which would corrupt cross-project references (PLNR-114).
-      if (patch.milestoneId) patch.milestoneId = await this.requireProjectMilestone(patch.milestoneId);
       const sets: string[] = [];
       const binds: unknown[] = [];
       const fields: Array<[keyof TaskPatch, string]> = [
@@ -2561,6 +2565,21 @@ export class ProjectRoom extends DurableObject<Env> {
     return row.id;
   }
 
+  private async parentMilestoneId(parentTaskId?: string | null): Promise<string | null> {
+    if (!parentTaskId) return null;
+    const parent = await this.env.DB.prepare('SELECT milestone_id AS milestoneId FROM tasks WHERE id = ? AND project_id = ?')
+      .bind(parentTaskId, this.projectId).first<{ milestoneId: string | null }>();
+    return parent?.milestoneId ?? null;
+  }
+
+  private async backlogMilestoneId(projectId: string): Promise<string> {
+    const row = await this.env.DB.prepare(
+      "SELECT id FROM milestones WHERE project_id = ? ORDER BY CASE WHEN title = 'Backlog' THEN 0 ELSE 1 END, \"order\", id LIMIT 1",
+    ).bind(projectId).first<{ id: string }>();
+    if (!row) throw new Error('project has no milestone; create one before adding tasks');
+    return row.id;
+  }
+
   // ---------------------------------------------------------------------------
   // Search indexing (PLNR-184) — fire-and-forget from every content write seam.
   // Never awaited on the write path and never throws: freshness is best-effort,
@@ -2790,17 +2809,20 @@ export class ProjectRoom extends DurableObject<Env> {
   // for attachments are removed out-of-band before the rows.
   // ---------------------------------------------------------------------------
 
-  /** Delete a milestone; its tasks survive (milestone_id nulled). */
+  /** Delete an empty milestone; tasks must be reassigned first. */
   async deleteMilestone(projectId: string, actor: Actor, milestoneId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const ms = await this.env.DB.prepare('SELECT id, title FROM milestones WHERE id = ? AND project_id = ?')
         .bind(milestoneId, this.projectId).first<{ id: string; title: string }>();
       if (!ms) throw new Error('milestone not found');
-      await this.env.DB.batch([
-        this.env.DB.prepare('UPDATE tasks SET milestone_id = NULL WHERE milestone_id = ?').bind(milestoneId),
-        this.env.DB.prepare('DELETE FROM milestones WHERE id = ?').bind(milestoneId),
-      ]);
+      const assigned = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM tasks WHERE milestone_id = ?')
+        .bind(milestoneId).first<{ n: number }>();
+      if (assigned?.n) throw new Error(`milestone has ${assigned.n} task(s); reassign them before deleting it`);
+      const remaining = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM milestones WHERE project_id = ?')
+        .bind(this.projectId).first<{ n: number }>();
+      if ((remaining?.n ?? 0) <= 1) throw new Error('a project needs at least one milestone; create another before deleting this one');
+      await this.env.DB.prepare('DELETE FROM milestones WHERE id = ?').bind(milestoneId).run();
       await this.emit(actor, 'milestone.deleted', 'milestone', milestoneId, { title: ms.title });
       return { ok: true };
     });
@@ -2971,6 +2993,7 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(task.id).all<{ planId: string; phaseId: string }>();
       const docLinkCount = severedDocs.length;
 
+      const milestoneId = await this.backlogMilestoneId(toProjectId);
       const alloc = await this.env.DB.prepare(
         'UPDATE projects SET next_task_number = next_task_number + 1 WHERE id = ? RETURNING next_task_number AS next',
       ).bind(toProjectId).first<{ next: number }>();
@@ -2983,8 +3006,8 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare(
-          'UPDATE tasks SET project_id = ?, key = ?, milestone_id = NULL, board_id = ?, parent_task_id = NULL, "order" = ?, updated_at = ? WHERE id = ?',
-        ).bind(toProjectId, newKey, boardId, num, nowIso(), task.id),
+          'UPDATE tasks SET project_id = ?, key = ?, milestone_id = ?, board_id = ?, parent_task_id = NULL, "order" = ?, updated_at = ? WHERE id = ?',
+        ).bind(toProjectId, newKey, milestoneId, boardId, num, nowIso(), task.id),
       ]);
 
       // Re-tag by name in the target. Tag creation is deliberately event-silent here (see doc).

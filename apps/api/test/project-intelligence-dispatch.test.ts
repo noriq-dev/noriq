@@ -26,10 +26,12 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
       id: `task_pi_bound_${index + 1}`,
       key: `PIBOUND-${index + 1}`,
     }));
+    const milestone = await appEnv.DB.prepare("SELECT id FROM milestones WHERE project_id = ? AND title = 'Backlog'")
+      .bind(projectId).first<{ id: string }>();
     await appEnv.DB.batch(tasks.map((item, index) => appEnv.DB.prepare(
-      `INSERT INTO tasks (id, project_id, key, title, status, priority, "order")
-       VALUES (?, ?, ?, ?, 'todo', 2, ?)`,
-    ).bind(item.id, projectId, item.key, `Bounded task ${index + 1}`, index)));
+      `INSERT INTO tasks (id, project_id, key, milestone_id, title, status, priority, "order")
+       VALUES (?, ?, ?, ?, ?, 'todo', 2, ?)`,
+    ).bind(item.id, projectId, item.key, milestone!.id, `Bounded task ${index + 1}`, index)));
 
     let assemblies = 0;
     const result = await getDispatchIntelligence(appEnv, projectId, {
@@ -292,11 +294,13 @@ describe('plan dispatch intelligence (PLNR-534)', () => {
       appEnv.DB.prepare("INSERT INTO plans (id, project_id, title, description, body, status) VALUES (?, ?, 'Large dispatch plan', 'bounded aggregate', '', 'active')").bind(planId, projectId),
       appEnv.DB.prepare("INSERT INTO phases (id, plan_id, title, body, \"order\") VALUES (?, ?, 'All work', '', 0)").bind(phaseId, planId),
     ]);
+    const milestone = await appEnv.DB.prepare("SELECT id FROM milestones WHERE project_id = ? AND title = 'Backlog'")
+      .bind(projectId).first<{ id: string }>();
     await appEnv.DB.prepare(
       `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
-       INSERT INTO tasks (id, project_id, key, title, status, priority, "order")
-       SELECT 'task_pi_large_' || i, ?1, 'PIPLANB-' || i, 'Large member task ' || i, 'todo', 2, i FROM n`,
-    ).bind(projectId).run();
+       INSERT INTO tasks (id, project_id, key, milestone_id, title, status, priority, "order")
+       SELECT 'task_pi_large_' || i, ?1, 'PIPLANB-' || i, ?2, 'Large member task ' || i, 'todo', 2, i FROM n`,
+    ).bind(projectId, milestone!.id).run();
     await appEnv.DB.prepare(
       `INSERT INTO phase_tasks (phase_id, task_id)
        SELECT ?1, id FROM tasks WHERE project_id = ?2`,

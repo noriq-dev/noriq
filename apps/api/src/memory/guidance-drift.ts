@@ -168,9 +168,9 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   },
   {
     id: 'escalation-channels',
-    description: 'request_input blocks on a decision, raise_alert flags a non-blocking concern, and create_tasks proposal metadata files out-of-scope work',
+    description: 'request_input handles decisions, raise_alert flags urgent concerns, create_tasks files confirmed work normally, and proposal metadata is only for a human go/no-go decision',
     expectedSurfaces: BASE_SURFACES,
-    detect: coOccurring(Infinity, [/request_input/i, /raise_alert/i, /create_tasks/i, /proposal/i]),
+    detect: coOccurring(Infinity, [/request_input/i, /raise_alert/i, /create_tasks/i, /proposal/i, /critical bug/i]),
   },
   {
     id: 'priority-inversion',
