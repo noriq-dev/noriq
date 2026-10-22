@@ -120,7 +120,6 @@ describe('ReviewView Validity inbox', () => {
   it('wires Supersede… to setSupersedes without inventing auto-close', async () => {
     mockInbox([inboxItems[0]!]);
     const supersede = vi.spyOn(api, 'setSupersedes').mockResolvedValue({ ok: true });
-    const moveTask = vi.fn();
     vi.spyOn(api, 'searchTasks').mockResolvedValue({
       tasks: [{
         id: 'task_new',
@@ -142,7 +141,7 @@ describe('ReviewView Validity inbox', () => {
     document.body.appendChild(container);
     root = createRoot(container);
     const s = store();
-    (s.actions as { moveTask: ReturnType<typeof vi.fn> }).moveTask = moveTask;
+    const moveTask = s.actions.moveTask as unknown as ReturnType<typeof vi.fn>;
     await act(async () => { root!.render(<ReviewView store={s} />); });
     const validity = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Validity'));
     await act(async () => { validity!.click(); });
