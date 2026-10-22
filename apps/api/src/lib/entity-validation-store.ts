@@ -1,11 +1,12 @@
 import type {
   DormancyConfig,
   ReviewCause,
+  ReviewCauseStatus,
   SubjectFreshness,
   ValidationBaselines,
   ValidationSubjectType,
 } from '@noriq-dev/shared';
-import { parseDormancyQuietSeconds } from '@noriq-dev/shared';
+import { parseDormancyQuietSeconds, resolveSnoozedUntil } from '@noriq-dev/shared';
 import { newId, nowIso } from './util';
 import {
   computeFreshness,
@@ -184,12 +185,18 @@ async function batchStoredCauses(
   const map = new Map<string, StoredCauseRow[]>();
   for (const chunk of chunkIds(subjectIds)) {
     const { results } = await db.prepare(
-      `SELECT subject_id AS subjectId, cause, status, detail FROM entity_review_causes
+      `SELECT subject_id AS subjectId, cause, status, detail, snoozed_until AS snoozedUntil
+         FROM entity_review_causes
         WHERE project_id = ? AND subject_type = ? AND subject_id IN (${chunk.map(() => '?').join(',')})`,
     ).bind(projectId, subjectType, ...chunk).all<StoredCauseRow & { subjectId: string }>();
     for (const r of results ?? []) {
       const list = map.get(r.subjectId) ?? [];
-      list.push({ cause: r.cause, status: r.status, detail: r.detail });
+      list.push({
+        cause: r.cause,
+        status: r.status,
+        detail: r.detail,
+        snoozedUntil: r.snoozedUntil ?? null,
+      });
       map.set(r.subjectId, list);
     }
   }
@@ -320,10 +327,20 @@ async function loadStoredCauses(
   subjectId: string,
 ): Promise<StoredCauseRow[]> {
   const { results } = await db.prepare(
-    `SELECT cause, status, detail FROM entity_review_causes
+    `SELECT cause, status, detail, snoozed_until AS snoozedUntil FROM entity_review_causes
       WHERE project_id = ? AND subject_type = ? AND subject_id = ?`,
   ).bind(projectId, subjectType, subjectId).all<StoredCauseRow>();
-  return results ?? [];
+  return (results ?? []).map((r) => ({
+    cause: r.cause,
+    status: r.status,
+    detail: r.detail,
+    snoozedUntil: r.snoozedUntil ?? null,
+  }));
+}
+
+/** SQL predicate: stored cause is inbox-active (open, or snoozed past expiry). */
+function reviewCauseActiveSql(alias: string, nowBind: string): string {
+  return `(${alias}.status = 'open' OR (${alias}.status = 'snoozed' AND ${alias}.snoozed_until IS NOT NULL AND ${alias}.snoozed_until <= ${nowBind}))`;
 }
 
 /** Resolve effective dormancy quiet seconds: entity override → project → off (null). */
@@ -539,25 +556,43 @@ export async function setReviewCause(
     subjectType: ValidationSubjectType;
     subjectId: string;
     cause: ReviewCause;
-    status: 'open' | 'dismissed';
+    status: ReviewCauseStatus;
     detail?: string;
+    /** Absolute ISO until — required (or durationSeconds) when status=snoozed. */
+    snoozedUntil?: string | null;
+    /** Duration → until; alternative to snoozedUntil when status=snoozed. */
+    durationSeconds?: number | null;
   },
 ) {
+  const at = nowIso();
+  let snoozedUntil: string | null = null;
+  try {
+    snoozedUntil = resolveSnoozedUntil({
+      status: input.status,
+      snoozedUntil: input.snoozedUntil,
+      durationSeconds: input.durationSeconds,
+      now: at,
+    });
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err));
+  }
+
   await db.prepare(
     `INSERT INTO entity_review_causes
-      (project_id, subject_type, subject_id, cause, status, detail, updated_at, actor_kind, actor_name)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (project_id, subject_type, subject_id, cause, status, detail, snoozed_until, updated_at, actor_kind, actor_name)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (project_id, subject_type, subject_id, cause) DO UPDATE SET
        status = excluded.status,
        detail = excluded.detail,
+       snoozed_until = excluded.snoozed_until,
        updated_at = excluded.updated_at,
        actor_kind = excluded.actor_kind,
        actor_name = excluded.actor_name`,
   ).bind(
     projectId, input.subjectType, input.subjectId, input.cause, input.status,
-    input.detail ?? '', nowIso(), actor.kind, actor.name,
+    input.detail ?? '', snoozedUntil, at, actor.kind, actor.name,
   ).run();
-  return { ok: true as const };
+  return { ok: true as const, snoozedUntil };
 }
 
 /** Pin docs on a task. Versions null → pin to current_version at write time. */
@@ -719,7 +754,8 @@ export async function reviewInbox(
 }> {
   const limit = Math.min(100, Math.max(1, opts.limit ?? 50));
   const offset = Math.max(0, opts.offset ?? 0);
-  const now = Date.now();
+  const clockIso = nowIso();
+  const now = Date.parse(clockIso);
 
   // Project dormancy once — entity overrides come in on the candidate rows.
   const projectRow = await db.prepare(
@@ -727,11 +763,14 @@ export async function reviewInbox(
   ).bind(projectId).first<{ quietSeconds: number | null }>();
   const projectQuiet = parseDormancyQuietSeconds(projectRow?.quietSeconds);
 
-  // Candidate subjects: validation / open cause / supersession / drifted pins —
+  // Candidate subjects: validation / open|expired-snooze cause / supersession / drifted pins —
   // OR dormancy-eligible (effective threshold + quiet clock exceeded). never_validated alone
   // is still omitted unless another actionable cause (e.g. dormant) surfaces.
   // Content timestamps + override quiet + fingerprint fields ride along so evaluation
   // needs no per-subject subject/activity round-trips.
+  // Active snoozes are omitted here; expired snoozes re-enter so causes resurface without
+  // a new validation record (P2-C / PLNR-594).
+  const causeActive = reviewCauseActiveSql('erc', '?');
   const taskCandidates = await db.prepare(
     `SELECT DISTINCT t.id AS id, t.key AS key, t.title AS title, 'task' AS subjectType,
             t.content_activity_at AS contentActivityAt, t.created_at AS createdAt,
@@ -743,7 +782,7 @@ export async function reviewInbox(
       WHERE t.project_id = ? AND t.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = t.id AND ev.subject_type = 'task')
-          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = t.id AND erc.subject_type = 'task' AND erc.status = 'open')
+          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = t.id AND erc.subject_type = 'task' AND ${causeActive})
           OR EXISTS (SELECT 1 FROM tasks s WHERE s.supersedes_task_id = t.id)
           OR EXISTS (
             SELECT 1 FROM task_docs td JOIN docs d ON d.id = td.doc_id
@@ -752,7 +791,7 @@ export async function reviewInbox(
           )
           OR ${dormancyCandidateSql('t')}
         )`,
-  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
+  ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const planCandidates = await db.prepare(
     `SELECT DISTINCT p.id AS id, NULL AS key, p.title AS title, 'plan' AS subjectType,
@@ -765,7 +804,7 @@ export async function reviewInbox(
       WHERE p.project_id = ? AND p.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = p.id AND ev.subject_type = 'plan')
-          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = p.id AND erc.subject_type = 'plan' AND erc.status = 'open')
+          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = p.id AND erc.subject_type = 'plan' AND ${causeActive})
           OR EXISTS (SELECT 1 FROM plans s WHERE s.supersedes_plan_id = p.id)
           OR EXISTS (
             SELECT 1 FROM plan_doc_refs pdr JOIN docs d ON d.id = pdr.doc_id
@@ -774,7 +813,7 @@ export async function reviewInbox(
           )
           OR ${dormancyCandidateSql('p')}
         )`,
-  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
+  ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const docCandidates = await db.prepare(
     `SELECT DISTINCT d.id AS id, NULL AS key, d.name AS title, 'doc' AS subjectType,
@@ -787,11 +826,11 @@ export async function reviewInbox(
       WHERE d.project_id = ? AND d.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = d.id AND ev.subject_type = 'doc')
-          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = d.id AND erc.subject_type = 'doc' AND erc.status = 'open')
+          OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = d.id AND erc.subject_type = 'doc' AND ${causeActive})
           OR EXISTS (SELECT 1 FROM docs s WHERE s.supersedes_doc_id = d.id)
           OR ${dormancyCandidateSql('d')}
         )`,
-  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
+  ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const candidates = [
     ...(taskCandidates.results ?? []),
@@ -876,6 +915,7 @@ export async function reviewInbox(
       dormancyQuietSeconds: quietSeconds,
       contentActivityAt: c.contentActivityAt,
       createdAt: c.createdAt,
+      now: clockIso,
     });
 
     // Inbox excludes pure never_validated+impact_unknown with no other signal — those flood.

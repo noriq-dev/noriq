@@ -9,6 +9,8 @@ import {
   type ValidationSubjectType,
   ValidationBaselines as ValidationBaselinesSchema,
   isCriticalReviewCause,
+  isReviewCauseEffectivelyOpen,
+  isReviewCauseSuppressed,
   reviewCauseSeverity,
   parseDocRef,
 } from '@noriq-dev/shared';
@@ -98,8 +100,10 @@ export async function planContentFingerprint(
 
 export type StoredCauseRow = {
   cause: string;
-  status: 'open' | 'dismissed';
+  status: 'open' | 'dismissed' | 'snoozed';
   detail: string;
+  /** ISO until; required when status=snoozed. Ignored after expiry (cause resurfaces). */
+  snoozedUntil?: string | null;
 };
 
 /**
@@ -260,16 +264,21 @@ export function computeFreshness(input: {
   declaredRevision?: DeclaredCodeRevision | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
-  const dismissed = new Set(
-    input.storedCauses.filter((c) => c.status === 'dismissed').map((c) => c.cause),
+  const nowIso = input.now ?? new Date().toISOString();
+  // Dismissed permanently suppress; active snooze suppresses until snoozedUntil (P2-C).
+  const suppressed = new Set(
+    input.storedCauses
+      .filter((c) => isReviewCauseSuppressed(c.status, c.snoozedUntil, nowIso))
+      .map((c) => c.cause),
   );
   const push = (code: ReviewCause, detail?: string) => {
-    // code_assessment_stale is derived from declared baseId; a dismissed sentinel must not
+    // code_assessment_stale is derived from declared baseId; a dismissed/snoozed sentinel must not
     // forever-suppress later B→C drift (revalidation clears open rows instead of dismissing).
-    if (dismissed.has(code) && code !== 'human_flagged' && code !== 'code_assessment_stale') return;
-    // human_flagged only surfaces when open
+    if (suppressed.has(code) && code !== 'human_flagged' && code !== 'code_assessment_stale') return;
+    // human_flagged surfaces when open, or when a prior snooze has expired.
     if (code === 'human_flagged') {
-      const row = input.storedCauses.find((c) => c.cause === 'human_flagged' && c.status === 'open');
+      const row = input.storedCauses.find((c) =>
+        c.cause === 'human_flagged' && isReviewCauseEffectivelyOpen(c.status, c.snoozedUntil, nowIso));
       if (!row) return;
       causes.push({ code, severity: reviewCauseSeverity(code), detail: row.detail || detail });
       return;
@@ -347,7 +356,8 @@ export function computeFreshness(input: {
   }
 
   for (const row of input.storedCauses) {
-    if (row.status !== 'open') continue;
+    // Effectively-open includes expired snoozes (cause resurfaces without a new validation).
+    if (!isReviewCauseEffectivelyOpen(row.status, row.snoozedUntil, nowIso)) continue;
     if (row.cause === 'human_flagged') push('human_flagged', row.detail);
     // Dormancy may also be explicitly force-opened.
     if (row.cause === 'dormant') push('dormant', row.detail);

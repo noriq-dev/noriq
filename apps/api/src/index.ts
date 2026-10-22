@@ -1563,13 +1563,26 @@ app.post('/api/projects/:pid/review-causes', userAuth, async (c) => {
     subjectType: import('@noriq-dev/shared').ValidationSubjectType;
     subjectId: string;
     cause: import('@noriq-dev/shared').ReviewCause;
-    status: 'open' | 'dismissed';
+    status: 'open' | 'dismissed' | 'snoozed';
     detail?: string;
+    snoozedUntil?: string | null;
+    durationSeconds?: number | null;
   }>();
   if (!body.subjectType || !body.subjectId || !body.cause || !body.status) {
     return c.json({ error: 'subjectType, subjectId, cause, and status required' }, 400);
   }
-  return c.json(await room(c.env, pid).setReviewCause(pid, humanActor(c), body));
+  if (body.status === 'snoozed' && !body.snoozedUntil && body.durationSeconds == null) {
+    return c.json({ error: 'snoozed status requires snoozedUntil or durationSeconds' }, 400);
+  }
+  try {
+    return c.json(await room(c.env, pid).setReviewCause(pid, humanActor(c), body));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/snoozedUntil|durationSeconds|snooze/i.test(message)) {
+      return c.json({ error: message }, 400);
+    }
+    throw err;
+  }
 });
 app.post('/api/projects/:pid/supersedes', userAuth, async (c) => {
   const pid = c.req.param('pid')!;

@@ -1124,3 +1124,156 @@ describe('reviewInbox batched freshness (PLNR-585 scale)', () => {
     expect(item!.primaryCause).toBe('content_changed');
   });
 });
+
+describe('timed snooze (PLNR-594 / P2-C)', () => {
+  it('computeFreshness omits actively snoozed causes and resurfaces after expiry', () => {
+    const prior = {
+      id: 'val_1', projectId: 'p', subjectType: 'task' as const, subjectId: 'task_snooze',
+      contentFingerprint: 'fp0', validatedAt: '2020-01-01T00:00:00.000Z',
+      actorKind: 'agent' as const, actorId: 'a', actorName: 'a', baselinesJson: '{}', note: '',
+    };
+    const base = {
+      subjectType: 'task' as const,
+      subjectId: 'task_snooze',
+      contentFingerprint: 'fp1',
+      // Caller already filtered: current fingerprint ≠ prior → no matching validation.
+      latestMatching: null as null,
+      latestAny: prior,
+      docPins: [],
+      supersededById: null as string | null,
+      contentActivityAt: '2020-01-01T00:00:00.000Z',
+    };
+
+    const open = computeFreshness({
+      ...base,
+      storedCauses: [],
+      now: '2026-06-01T00:00:00.000Z',
+    });
+    expect(open.causes.some((c) => c.code === 'content_changed')).toBe(true);
+
+    const snoozed = computeFreshness({
+      ...base,
+      storedCauses: [{
+        cause: 'content_changed',
+        status: 'snoozed',
+        detail: '',
+        snoozedUntil: '2026-07-01T00:00:00.000Z',
+      }],
+      now: '2026-06-01T00:00:00.000Z',
+    });
+    expect(snoozed.causes.some((c) => c.code === 'content_changed')).toBe(false);
+
+    const expired = computeFreshness({
+      ...base,
+      storedCauses: [{
+        cause: 'content_changed',
+        status: 'snoozed',
+        detail: '',
+        snoozedUntil: '2026-05-01T00:00:00.000Z',
+      }],
+      now: '2026-06-01T00:00:00.000Z',
+    });
+    expect(expired.causes.some((c) => c.code === 'content_changed')).toBe(true);
+
+    const dismissed = computeFreshness({
+      ...base,
+      storedCauses: [{ cause: 'content_changed', status: 'dismissed', detail: '', snoozedUntil: null }],
+      now: '2026-06-01T00:00:00.000Z',
+    });
+    expect(dismissed.causes.some((c) => c.code === 'content_changed')).toBe(false);
+  });
+
+  it('MCP snooze hides cause from freshness/inbox until duration expires; dismiss stays permanent', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'snooze me', body: 'snooze-body', tags: ['lifecycle'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id as string;
+
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'human_flagged',
+      status: 'open',
+      detail: 'check later',
+    });
+
+    let fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'human_flagged')).toBe(true);
+
+    let inbox = await mcpCall(agent.apiKey, 'list_review_inbox', {
+      projectId, cause: 'human_flagged',
+    });
+    expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(true);
+
+    const snooze = await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'human_flagged',
+      status: 'snoozed',
+      durationSeconds: 3600,
+    });
+    expect(snooze.isError).toBeFalsy();
+    expect(snooze.body.snoozedUntil).toBeTruthy();
+    expect(Date.parse(snooze.body.snoozedUntil)).toBeGreaterThan(Date.now());
+
+    fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'human_flagged')).toBe(false);
+
+    inbox = await mcpCall(agent.apiKey, 'list_review_inbox', {
+      projectId, cause: 'human_flagged',
+    });
+    expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(false);
+
+    // Expire the snooze in D1 — cause must resurface without a new validation record.
+    await env.DB.prepare(
+      `UPDATE entity_review_causes SET snoozed_until = ?
+        WHERE project_id = ? AND subject_type = 'task' AND subject_id = ? AND cause = 'human_flagged'`,
+    ).bind('2020-01-01T00:00:00.000Z', projectId, taskId).run();
+
+    fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'human_flagged')).toBe(true);
+
+    inbox = await mcpCall(agent.apiKey, 'list_review_inbox', {
+      projectId, cause: 'human_flagged',
+    });
+    expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(true);
+
+    // Dismiss remains permanent.
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'human_flagged',
+      status: 'dismissed',
+    });
+    fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'human_flagged')).toBe(false);
+  });
+
+  it('rejects snoozed without until/duration', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'bad snooze', body: 'x', tags: ['schema'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id as string;
+    const bad = await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'human_flagged',
+      status: 'snoozed',
+    });
+    expect(bad.isError).toBeTruthy();
+  });
+});

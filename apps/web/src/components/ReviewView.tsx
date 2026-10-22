@@ -238,6 +238,29 @@ function ValidityInbox({ store }: { store: AppStore }) {
     }
   };
 
+  const snoozeCause = async (
+    item: ApiEntityReviewInboxItem,
+    cause: ApiReviewCause,
+    durationSeconds: number,
+  ) => {
+    setActing(item.subjectId);
+    setError('');
+    try {
+      await api.setReviewCause(pid, {
+        subjectType: item.subjectType,
+        subjectId: item.subjectId,
+        cause,
+        status: 'snoozed',
+        durationSeconds,
+      });
+      await load(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing(null);
+    }
+  };
+
   const supersede = async (item: ApiEntityReviewInboxItem, replacementId: string) => {
     setActing(item.subjectId);
     setError('');
@@ -331,6 +354,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
                   onOpen={() => openSubject(item)}
                   onValidate={() => void markValidated(item)}
                   onDismiss={(c) => void dismissCause(item, c)}
+                  onSnooze={(c, seconds) => void snoozeCause(item, c, seconds)}
                   onSupersede={(replacementId) => void supersede(item, replacementId)}
                 />
               ))}
@@ -366,8 +390,15 @@ function GroupToggle({ active, onClick, children }: { active: boolean; onClick: 
   );
 }
 
+/** Timed-snooze presets (P2-C) — duration → until; does not invent validity. */
+const SNOOZE_PRESETS: Array<{ label: string; seconds: number }> = [
+  { label: '1h', seconds: 3600 },
+  { label: '1d', seconds: 86400 },
+  { label: '1w', seconds: 7 * 86400 },
+];
+
 function ValidityRow({
-  item, pid, busy, onOpen, onValidate, onDismiss, onSupersede,
+  item, pid, busy, onOpen, onValidate, onDismiss, onSnooze, onSupersede,
 }: {
   item: ApiEntityReviewInboxItem;
   pid: string;
@@ -375,10 +406,12 @@ function ValidityRow({
   onOpen: () => void;
   onValidate: () => void;
   onDismiss: (cause: ApiReviewCause) => void;
+  onSnooze: (cause: ApiReviewCause, durationSeconds: number) => void;
   onSupersede: (replacementId: string) => void;
 }) {
   const primary = causeMeta(item.primaryCause);
   const [superseding, setSuperseding] = useState(false);
+  const [snoozing, setSnoozing] = useState(false);
   const [replacementId, setReplacementId] = useState('');
   const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
 
@@ -427,7 +460,7 @@ function ValidityRow({
           ? ` · last validated ${new Date(item.lastValidatedAt).toLocaleDateString()}`
           : ' · never validated'}
       </div>
-      {!superseding ? (
+      {!superseding && !snoozing ? (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           <Button variant="primary" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onValidate}>
             mark validated
@@ -446,11 +479,47 @@ function ValidityRow({
           <Button
             variant="ghost"
             style={{ padding: '5px 12px', fontSize: 11.5 }}
+            onClick={() => setSnoozing(true)}
+            title="Timed snooze — omit from inbox until expiry; does not invent validity"
+          >
+            snooze…
+          </Button>
+          <Button
+            variant="ghost"
+            style={{ padding: '5px 12px', fontSize: 11.5 }}
             onClick={() => { setSuperseding(true); setReplacementId(''); }}
             title="Link a newer subject that supersedes this one — history stays readable; nothing auto-closes"
           >
             Supersede…
           </Button>
+        </div>
+      ) : snoozing ? (
+        <div style={{ display: 'grid', gap: 8, marginTop: 2 }}>
+          <div style={{ color: 'var(--text-dim)', fontSize: 11.5, lineHeight: 1.45 }}>
+            Snooze {primary?.label ?? item.primaryCause} — omitted from inbox until expiry; resurfaces without a new validation.
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {SNOOZE_PRESETS.map((preset) => (
+              <Button
+                key={preset.label}
+                variant="primary"
+                style={{ padding: '5px 12px', fontSize: 11.5 }}
+                onClick={() => {
+                  onSnooze(item.primaryCause, preset.seconds);
+                  setSnoozing(false);
+                }}
+              >
+                {preset.label}
+              </Button>
+            ))}
+            <Button
+              variant="ghost"
+              style={{ padding: '5px 12px', fontSize: 11.5 }}
+              onClick={() => setSnoozing(false)}
+            >
+              cancel
+            </Button>
+          </div>
         </div>
       ) : (
         <div style={{ display: 'grid', gap: 8, marginTop: 2 }}>

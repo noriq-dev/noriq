@@ -29,6 +29,13 @@ export function causeMeta(code: ApiReviewCause) {
   return VALIDITY_CAUSES.find((c) => c.id === code);
 }
 
+/** Timed-snooze presets (P2-C) — duration → until; does not invent validity. */
+const SNOOZE_PRESETS: Array<{ label: string; seconds: number }> = [
+  { label: '1h', seconds: 3600 },
+  { label: '1d', seconds: 86400 },
+  { label: '1w', seconds: 7 * 86400 },
+];
+
 export interface ValidityStripProps {
   projectId: string;
   subjectType: ApiValidationSubjectType;
@@ -54,6 +61,7 @@ export function ValidityStrip({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [superseding, setSuperseding] = useState(false);
+  const [snoozing, setSnoozing] = useState(false);
   const [replacementId, setReplacementId] = useState('');
   const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
 
@@ -119,6 +127,26 @@ export function ValidityStrip({
     }
   };
 
+  const snoozeCause = async (cause: ApiReviewCause, durationSeconds: number) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api.setReviewCause(projectId, {
+        subjectType,
+        subjectId,
+        cause,
+        status: 'snoozed',
+        durationSeconds,
+      });
+      setSnoozing(false);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const confirmSupersede = async () => {
     if (!replacementId || replacementId === subjectId) return;
     setBusy(true);
@@ -142,6 +170,12 @@ export function ValidityStrip({
   const causes = freshness?.causes.map((c) => c.code) ?? [];
   const critical = new Set(freshness?.criticalCauses ?? []);
   const lastValidatedAt = freshness?.lastValidatedAt ?? null;
+  // Prefer critical, else first non-never/impact cause, else first cause — for snooze target.
+  const snoozeTarget =
+    freshness?.causes.find((c) => critical.has(c.code))?.code
+    ?? freshness?.causes.find((c) => c.code !== 'never_validated' && c.code !== 'impact_unknown')?.code
+    ?? freshness?.causes[0]?.code
+    ?? null;
 
   return (
     <section
@@ -195,7 +229,7 @@ export function ValidityStrip({
         <div style={{ color: 'var(--red-soft)', fontSize: 11.5, marginBottom: 8 }}>{error}</div>
       )}
 
-      {canAct && !superseding && (
+      {canAct && !superseding && !snoozing && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Button
             variant="primary"
@@ -217,6 +251,15 @@ export function ValidityStrip({
           <Button
             variant="ghost"
             style={{ padding: '4px 10px', fontSize: 11 }}
+            onClick={() => setSnoozing(true)}
+            disabled={busy || loading || !snoozeTarget}
+            title="Timed snooze — omit cause from freshness until expiry; does not invent validity"
+          >
+            Snooze…
+          </Button>
+          <Button
+            variant="ghost"
+            style={{ padding: '4px 10px', fontSize: 11 }}
             onClick={() => { setSuperseding(true); setReplacementId(''); }}
             disabled={busy || loading}
             title="Link a newer subject that supersedes this one — history stays readable; nothing auto-closes"
@@ -231,6 +274,34 @@ export function ValidityStrip({
           >
             Open in Review
           </Button>
+        </div>
+      )}
+
+      {canAct && snoozing && snoozeTarget && (
+        <div style={{ display: 'grid', gap: 8 }}>
+          <div style={{ color: 'var(--text-dim)', fontSize: 11.5, lineHeight: 1.45 }}>
+            Snooze {causeMeta(snoozeTarget)?.label ?? snoozeTarget} — omitted until expiry; resurfaces without a new validation.
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {SNOOZE_PRESETS.map((preset) => (
+              <Button
+                key={preset.label}
+                variant="primary"
+                style={{ padding: '4px 10px', fontSize: 11 }}
+                onClick={() => void snoozeCause(snoozeTarget, preset.seconds)}
+                disabled={busy}
+              >
+                {preset.label}
+              </Button>
+            ))}
+            <Button
+              variant="ghost"
+              style={{ padding: '4px 10px', fontSize: 11 }}
+              onClick={() => setSnoozing(false)}
+            >
+              cancel
+            </Button>
+          </div>
         </div>
       )}
 
