@@ -99,7 +99,7 @@ Noriq reuses one \`session_copilot\` per agent run.
 ## Tool availability
 
 Every OAuth copilot session receives the full coordination catalog on every connection — catalog
-revision 3 contains 56 tools. There are no optional packs to enable, and \`configure_agent\`
+revision 4 contains 64 tools. There are no optional packs to enable, and \`configure_agent\`
 never changes tool availability. Do not reconnect just to expand the catalog. A visible tool is
 capability, not authorization; project roles, token scope, and server-side validation still
 govern each call.

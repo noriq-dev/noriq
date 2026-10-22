@@ -95,7 +95,7 @@ describe('server/discover', () => {
     expect(r.cacheScope).toBe('private');
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
     expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
-    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 4 });
     expect(r._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 
@@ -115,7 +115,7 @@ describe('server/discover', () => {
     expect(toolBody(configured.body.result)).not.toHaveProperty('toolPacks');
     expect(toolBody(configured.body.result)).not.toHaveProperty('catalogChanged');
     const discovered = await modern(configuredAgent.apiKey, 'server/discover');
-    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 4 });
     expect(discovered.body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 });
@@ -126,7 +126,7 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result.resultType).toBe('complete');
     expect(body.result._meta[SERVER_INFO_KEY].name).toBe('noriq');
-    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 4 });
     expect(body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
     expect(toolBody(body.result).you.name).toBeDefined();
   });
@@ -302,7 +302,7 @@ describe('dual-era coexistence', () => {
       : JSON.parse(raw);
     expect(data.result.protocolVersion).toBe('2025-11-25');
     expect(data.result.serverInfo).toMatchObject({
-      name: 'noriq', catalogRevision: 3,
+      name: 'noriq', catalogRevision: 4,
     });
     expect(data.result.serverInfo).not.toHaveProperty('toolPacks');
   });

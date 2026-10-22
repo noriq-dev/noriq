@@ -628,7 +628,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       return {
         you: {
           id: agent.id, name: agent.name, role: agent.role, kind: agent.kind,
-          catalogRevision: 3,
+          catalogRevision: SERVER_INFO.catalogRevision,
           ...(opts.sessionId ? await describeCopilotSession(env, agent.id) : {}),
         },
         playbook: GET_BRIEFING_PLAYBOOK,
