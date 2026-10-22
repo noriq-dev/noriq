@@ -818,6 +818,18 @@ export const ContextPackTaskFacts = z.object({
   executionSpecUnreadable: z.boolean(),
   /** Explicit relationships are required task facts and are never displaced by retrieval. */
   relatedDocuments: z.array(ContextPackDocumentReference).optional(),
+  /** PLNR-579: pre-start freshness (causes, lastValidatedAt, impact unknown). Optional for older packs. */
+  freshness: z.object({
+    contentFingerprint: z.string(),
+    lastValidatedAt: z.string().nullable(),
+    causes: z.array(z.object({
+      code: z.string(),
+      severity: z.enum(['critical', 'advisory']),
+      detail: z.string().optional(),
+    })),
+    criticalCauses: z.array(z.string()),
+    impactUnknown: z.boolean(),
+  }).optional(),
 });
 export type ContextPackTaskFacts = z.infer<typeof ContextPackTaskFacts>;
 

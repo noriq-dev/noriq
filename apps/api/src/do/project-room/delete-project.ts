@@ -37,6 +37,9 @@ export const DELETE_PROJECT_BATCH_SQL: readonly string[] = [
   `DELETE FROM task_refs WHERE task_id IN (${TASKS_SUBQUERY})`,
   `DELETE FROM task_tags WHERE task_id IN (${TASKS_SUBQUERY}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`,
   `DELETE FROM task_docs WHERE task_id IN (${TASKS_SUBQUERY}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`,
+  'DELETE FROM plan_doc_refs WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
+  'DELETE FROM entity_validations WHERE project_id = ?',
+  'DELETE FROM entity_review_causes WHERE project_id = ?',
   'DELETE FROM doc_tags WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
   'DELETE FROM doc_versions WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
   `DELETE FROM comments WHERE task_id IN (${TASKS_SUBQUERY})`,
@@ -87,6 +90,7 @@ function bindDeleteProjectStatement(db: D1Database, sql: string, projectId: stri
   if (sql.includes('dependencies WHERE')) return db.prepare(sql).bind(pid, pid);
   if (sql.includes('task_tags WHERE')) return db.prepare(sql).bind(pid, pid);
   if (sql.includes('task_docs WHERE')) return db.prepare(sql).bind(pid, pid);
+  if (sql.includes('plan_doc_refs WHERE')) return db.prepare(sql).bind(pid, pid);
   if (sql.startsWith('DELETE FROM projects')) return db.prepare(sql).bind(pid);
   return db.prepare(sql).bind(pid);
 }

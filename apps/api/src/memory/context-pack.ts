@@ -534,6 +534,10 @@ export async function assembleContextPack(
     ...planDocs.results.map(planDocumentReference),
   ];
 
+  // PLNR-579: freshness is required task fact for pre-start — never displaced by budget.
+  const { subjectFreshness } = await import('../lib/entity-validation-store');
+  const freshness = await subjectFreshness(env.DB, projectId, 'task', row.id).catch(() => null);
+
   const taskFacts: ContextPackTaskFacts = {
     taskId: row.id,
     key: row.key,
@@ -547,6 +551,15 @@ export async function assembleContextPack(
     executionSpec: storedSpec.spec,
     executionSpecUnreadable: !!storedSpec.unreadable,
     relatedDocuments,
+    ...(freshness ? {
+      freshness: {
+        contentFingerprint: freshness.contentFingerprint,
+        lastValidatedAt: freshness.lastValidatedAt,
+        causes: freshness.causes.map((c) => ({ code: c.code, severity: c.severity, detail: c.detail })),
+        criticalCauses: freshness.criticalCauses,
+        impactUnknown: freshness.impactUnknown,
+      },
+    } : {}),
   };
   const anticipatedFiles = storedSpec.spec?.anticipatedFiles?.map((f) => f.path) ?? [];
 
