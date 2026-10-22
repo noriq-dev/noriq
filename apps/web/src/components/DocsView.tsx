@@ -10,6 +10,7 @@ import { Markdown } from './Markdown';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, TextInput } from './ui';
 import { confirm } from './Dialog';
+import { ValidityStrip } from './ValidityStrip';
 
 export interface DocumentDiffRow {
   kind: 'same' | 'changed' | 'added' | 'removed' | 'omitted';
@@ -496,6 +497,16 @@ export function DocsView({ store }: { store: AppStore }) {
                 delete
               </Button>
             </div>
+            {!editing && !viewingHistory && (
+              <ValidityStrip
+                projectId={currentPid}
+                subjectType="doc"
+                subjectId={sel.id}
+                canAct={store.permissions?.canContribute !== false}
+                setView={store.actions.setView}
+                compact
+              />
+            )}
             {versions.length > 0 && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '.05em' }}>

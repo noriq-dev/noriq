@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
-import { api, type ApiAgentEvent } from '../api';
+import { api, type ApiAgentEvent, type ApiSubjectFreshness } from '../api';
 import { isSettledTaskStatus, type ExecutionSpec } from '@noriq-dev/shared';
 import { statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
@@ -14,6 +14,7 @@ import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
 import { CollapsibleMarkdown, DrawerComments } from './DrawerComments';
+import { ValidityStrip } from './ValidityStrip';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from '../viewport';
 
 const USER_SETTABLE_TASK_STATUSES: Array<{
@@ -86,6 +87,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [spec, setSpec] = useState<ExecutionSpec | null>(null);
   const [specUnreadable, setSpecUnreadable] = useState(false);
   const [specLoad, setSpecLoad] = useState<SpecLoad>('loading');
+  const [freshness, setFreshness] = useState<ApiSubjectFreshness | null>(null);
   // Detail fetches race: select A, select B, and A's response can land last. Every read stamps
   // the selection it was issued for and drops itself if the drawer has moved on — otherwise A's
   // spec renders under B, and the next save writes it there.
@@ -108,6 +110,7 @@ export function Drawer({ store }: { store: AppStore }) {
       setSpec(null);
       setSpecUnreadable(false);
       setSpecLoad('loading');
+      setFreshness(null);
       api.taskDetail(forTask)
         .then((r) => {
           if (detailFor.current !== forTask) return; // a later task won the race
@@ -117,6 +120,7 @@ export function Drawer({ store }: { store: AppStore }) {
           setSpec((r.task.executionSpec as ExecutionSpec | null) ?? null);
           setSpecUnreadable(r.task.executionSpecUnreadable === true);
           setSpecLoad('loaded');
+          setFreshness(r.freshness ?? null);
         })
         .catch(() => {
           if (detailFor.current !== forTask) return;
@@ -126,6 +130,7 @@ export function Drawer({ store }: { store: AppStore }) {
           setSpec(null);
           setSpecUnreadable(false);
           setSpecLoad('error');
+          setFreshness(null);
         });
       api.docs(currentPid).then((r) => setAllDocs(r.docs)).catch(() => setAllDocs([]));
     }
@@ -381,6 +386,16 @@ export function Drawer({ store }: { store: AppStore }) {
               ? <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading task details…</span>
               : <CollapsibleMarkdown source={detailBody} />}
           </div>
+
+          <ValidityStrip
+            projectId={currentPid}
+            subjectType="task"
+            subjectId={task.id}
+            initialFreshness={freshness}
+            canAct={store.permissions.canContribute}
+            setView={actions.setView}
+            compact
+          />
 
           {/* Proposal provenance + decision. The panel persists after the decision — who filed
               it and the available execution/run/source context form the durable record the

@@ -663,6 +663,8 @@ export const api = {
   },
   recordValidation: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; note?: string }) =>
     req<ApiValidationRecord>('POST', `/api/projects/${pid}/validations`, body),
+  subjectFreshness: (pid: string, subjectType: ApiValidationSubjectType, subjectId: string) =>
+    req<ApiSubjectFreshness>('GET', `/api/projects/${pid}/freshness/${subjectType}/${encodeURIComponent(subjectId)}`),
   setReviewCause: (pid: string, body: {
     subjectType: ApiValidationSubjectType; subjectId: string; cause: ApiReviewCause; status: 'open' | 'dismissed'; detail?: string;
   }) => req<{ ok: true }>('POST', `/api/projects/${pid}/review-causes`, body),
@@ -1642,6 +1644,10 @@ export interface ApiTaskDetail {
   tagIds: string[];
   /** Related project docs (PLNR-182). */
   docs: Array<{ id: string; name: string; description: string }>;
+  /** Entity freshness (same shape as MCP get_task / GET …/freshness). */
+  freshness?: ApiSubjectFreshness;
+  supersession?: ApiSupersession;
+  lastValidatedAt?: string | null;
 }
 
 // --- Project Memory explorer (PLNR-271) — mirrors apps/api/src/{lib/project-memory.ts,
@@ -1875,6 +1881,35 @@ export type ApiReviewCause =
   | 'dormant'
   | 'human_flagged';
 export type ApiValidationSubjectType = 'task' | 'plan' | 'doc';
+
+export interface ApiFreshnessCause {
+  code: ApiReviewCause;
+  severity: 'critical' | 'advisory';
+  detail?: string;
+}
+
+export interface ApiSubjectFreshness {
+  subjectType: ApiValidationSubjectType;
+  subjectId: string;
+  contentFingerprint: string;
+  lastValidatedAt: string | null;
+  matchingValidationId: string | null;
+  causes: ApiFreshnessCause[];
+  criticalCauses: ApiReviewCause[];
+  impactUnknown: boolean;
+  baselines: { docPins: Array<{ docId: string; version: number }>; codeAssessments: unknown[] } | null;
+  docPins: Array<{
+    docId: string;
+    version: number | null;
+    currentVersion: number | null;
+    drifted: boolean;
+  }>;
+}
+
+export interface ApiSupersession {
+  supersedesId: string | null;
+  supersededById: string | null;
+}
 
 export interface ApiValidationRecord {
   id: string;

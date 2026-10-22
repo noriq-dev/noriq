@@ -10,6 +10,7 @@ import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
 import { Markdown } from './Markdown';
 import { confirm } from './Dialog';
+import { ValidityStrip } from './ValidityStrip';
 
 /**
  * The active phase = the first phase still holding unfinished work.
@@ -50,7 +51,7 @@ type PlanArchiveTaskCancellation = typeof PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS
 type PlanDeleteTaskDisposition = typeof PLAN_DELETE_TASK_DISPOSITION_OPTIONS[number]['value'];
 
 export function PlansView({ store }: { store: AppStore }) {
-  const { snapshot, currentPid, helpers, actions } = store;
+  const { snapshot, currentPid, helpers, actions, permissions } = store;
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Archived plans hide by default (PLNR-148) — a display concern, nothing else changes.
   const [showArchived, setShowArchived] = useState(false);
@@ -266,6 +267,16 @@ export function PlansView({ store }: { store: AppStore }) {
               {/* expanded: the plan document + stacked phases */}
               {open && (
                 <div className="plan-expanded">
+                  <div style={{ padding: '0 18px' }}>
+                    <ValidityStrip
+                      projectId={currentPid}
+                      subjectType="plan"
+                      subjectId={plan.id}
+                      canAct={permissions?.canContribute !== false}
+                      setView={actions.setView}
+                      compact
+                    />
+                  </div>
                   {plan.body && (
                     <div className="plan-body">
                       <Markdown source={plan.body} />

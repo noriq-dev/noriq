@@ -1004,7 +1004,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_doc',
-    'Read a project doc in full (markdown), plus its immutable version index and the tasks that cite it. Omit version for the current body or pass a version number to read that historical snapshot. Archived docs remain readable by exact id but are absent from list_docs and search. What the current version states is settled — build to it; if reality has moved on, restore if needed and update_doc to the new truth rather than silently deviating.',
+    'Read a project doc in full (markdown), plus its immutable version index and the tasks that cite it. Also returns `freshness` / `supersession` / `lastValidatedAt` for the current subject (same shape as get_task — no follow-up get_freshness needed). Omit version for the current body or pass a version number to read that historical snapshot. Archived docs remain readable by exact id but are absent from list_docs and search. What the current version states is settled — build to it; if reality has moved on, restore if needed and update_doc to the new truth rather than silently deviating.',
     { projectId: z.string(), docId: z.string(), version: z.number().int().positive().optional().describe('Read a specific historical version (1-based); omit for the current one') },
     tool(async ({ projectId, docId, version }) => {
       const current = await env.DB.prepare(
@@ -1035,7 +1035,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status
          FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ? ORDER BY t.key`,
       ).bind(docId).all();
-      return { ...doc, resource: docUri(String(doc.id)), versions, linkedTasks: tasks };
+      // Freshness is always for the live subject (current version), even when reading history.
+      const [freshness, supersession] = await Promise.all([
+        subjectFreshness(env.DB, projectId, 'doc', docId),
+        getSupersession(env.DB, projectId, 'doc', docId),
+      ]);
+      return {
+        ...doc, resource: docUri(String(doc.id)), versions, linkedTasks: tasks,
+        freshness, supersession, lastValidatedAt: freshness.lastValidatedAt,
+      };
     }),
   );
 
@@ -2100,7 +2108,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_plans',
-    'Plans in a project with per-phase progress — see how the work program is advancing. Each phase reports `order` numbered from 1 (matching the Plans view — the first phase is 1, never 0; a user who says "start phase 3" means order 3), plus `total`, `done` (shipped) and `settled` (done + cancelled): a phase is FINISHED, and the next one open, when `settled === total` — a cancelled task is never coming back, so it gates nothing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
+    'Plans in a project with per-phase progress — see how the work program is advancing. Each phase reports `order` numbered from 1 (matching the Plans view — the first phase is 1, never 0; a user who says "start phase 3" means order 3), plus `total`, `done` (shipped) and `settled` (done + cancelled): a phase is FINISHED, and the next one open, when `settled === total` — a cancelled task is never coming back, so it gates nothing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc. Each plan includes `freshness` / `supersession` / `lastValidatedAt` (same shape as get_task) so pre-start validity does not need a follow-up get_freshness.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
@@ -2109,27 +2117,39 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(projectId).all();
       const enriched = [];
       for (const p of plans) {
-        const { results: phasesRows } = await env.DB.prepare(
-          `SELECT ph.id, ph.title, ph.body, ph."order",
-                  (SELECT COUNT(*) FROM phase_tasks pt WHERE pt.phase_id = ph.id) AS total,
-                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done,
-                  -- settled is what gates the next phase, and it is NOT done (PLNR-229): a
-                  -- cancelled task will never be worked, so it holds nothing open. Both are
-                  -- reported because they answer different questions — how much SHIPPED vs how
-                  -- much is still owed — and a phase is finished when settled === total.
-                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status IN ('done','cancelled')) AS settled,
-                  (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
-           FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
-        ).bind(p.id).all<{
-          id: string; title: string; body: string; order: number;
-          total: number; done: number; settled: number; taskKeys: string | null;
-        }>();
-        // Plan-local docs (PLNR-200): summaries only — the body is fetched on demand via
-        // get_plan_doc so a plan with many working docs doesn't bloat every get_plans.
-        const { results: docRows } = await env.DB.prepare(
-          'SELECT id, name, description, updated_at AS updatedAt FROM plan_docs WHERE plan_id = ? ORDER BY updated_at DESC',
-        ).bind(p.id).all();
-        enriched.push({ ...p, phases: phasesRows.map(presentPhaseOrder), docs: docRows });
+        const planId = String(p.id);
+        const [{ results: phasesRows }, { results: docRows }, freshness, supersession] = await Promise.all([
+          env.DB.prepare(
+            `SELECT ph.id, ph.title, ph.body, ph."order",
+                    (SELECT COUNT(*) FROM phase_tasks pt WHERE pt.phase_id = ph.id) AS total,
+                    (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done,
+                    -- settled is what gates the next phase, and it is NOT done (PLNR-229): a
+                    -- cancelled task will never be worked, so it holds nothing open. Both are
+                    -- reported because they answer different questions — how much SHIPPED vs how
+                    -- much is still owed — and a phase is finished when settled === total.
+                    (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status IN ('done','cancelled')) AS settled,
+                    (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
+             FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
+          ).bind(planId).all<{
+            id: string; title: string; body: string; order: number;
+            total: number; done: number; settled: number; taskKeys: string | null;
+          }>(),
+          // Plan-local docs (PLNR-200): summaries only — the body is fetched on demand via
+          // get_plan_doc so a plan with many working docs doesn't bloat every get_plans.
+          env.DB.prepare(
+            'SELECT id, name, description, updated_at AS updatedAt FROM plan_docs WHERE plan_id = ? ORDER BY updated_at DESC',
+          ).bind(planId).all(),
+          subjectFreshness(env.DB, projectId, 'plan', planId),
+          getSupersession(env.DB, projectId, 'plan', planId),
+        ]);
+        enriched.push({
+          ...p,
+          phases: phasesRows.map(presentPhaseOrder),
+          docs: docRows,
+          freshness,
+          supersession,
+          lastValidatedAt: freshness.lastValidatedAt,
+        });
       }
       return { plans: enriched };
     }),

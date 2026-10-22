@@ -12,6 +12,12 @@ export function openReviewMemoryTab(setView: (view: 'review') => void) {
   setView('review');
 }
 
+/** Open Review → Validity from a subject inspector (P2-B). */
+export function openReviewValidityTab(setView: (view: 'review') => void) {
+  try { sessionStorage.setItem(REVIEW_TAB_KEY, 'validity'); } catch { /* optional */ }
+  setView('review');
+}
+
 /** Read-only: safe under React StrictMode's double useState initializer. */
 export function readReviewShellTab(): ReviewShellTab {
   try {
