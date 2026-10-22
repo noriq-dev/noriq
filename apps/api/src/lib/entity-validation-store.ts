@@ -15,6 +15,7 @@ import {
   taskContentFingerprint,
   validationFromRow,
   wireValidation,
+  type DeclaredCodeRevision,
   type DocPinRow,
   type ReviewInboxItem,
   type StoredCauseRow,
@@ -138,6 +139,7 @@ export async function subjectFreshness(
   projectId: string,
   subjectType: ValidationSubjectType,
   subjectId: string,
+  declaredRevision?: DeclaredCodeRevision | null,
 ): Promise<SubjectFreshness> {
   const { latestAny, latestMatching, fingerprint } = await latestValidations(db, projectId, subjectType, subjectId);
   const [docPins, replacedBy, storedCauses] = await Promise.all([
@@ -154,6 +156,7 @@ export async function subjectFreshness(
     docPins,
     supersededById: replacedBy,
     storedCauses,
+    declaredRevision: declaredRevision ?? null,
   });
 }
 
@@ -197,10 +200,11 @@ export async function recordValidation(
       actor.kind, actor.id, actor.name, serializeBaselines(baselines), input.note ?? '',
     ),
     // Clear open content_changed / never_validated / doc_baseline_moved dismissals aren't needed —
-    // those are derived. Clear human_flagged when validating.
+    // those are derived. Clear human_flagged + leftover code_assessment_stale when validating.
     db.prepare(
       `UPDATE entity_review_causes SET status = 'dismissed', updated_at = ?, actor_kind = ?, actor_name = ?
-        WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND cause = 'human_flagged' AND status = 'open'`,
+        WHERE project_id = ? AND subject_type = ? AND subject_id = ?
+          AND cause IN ('human_flagged', 'code_assessment_stale') AND status = 'open'`,
     ).bind(validatedAt, actor.kind, actor.name, projectId, input.subjectType, input.subjectId),
   ]);
 

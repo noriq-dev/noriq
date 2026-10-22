@@ -103,8 +103,50 @@ export type StoredCauseRow = {
 };
 
 /**
+ * Agent-declared current VCS revision for comparing stored code assessments.
+ * Noriq does not fetch or index repos — staleness is declared, not discovered.
+ */
+export type DeclaredCodeRevision = {
+  repositoryKey?: string | null;
+  branch?: string | null;
+  baseId?: string | null;
+};
+
+/**
+ * Compare agent-declared current baseId to stored assessments.
+ * Returns detail when stale; null when fresh or not evaluable (no declaration / no match scope).
+ */
+export function codeAssessmentStaleDetail(
+  assessments: ValidationBaselines['codeAssessments'],
+  declared: DeclaredCodeRevision | null | undefined,
+): string | null {
+  if (!declared) return null;
+  const declaredBaseId = declared.baseId?.trim();
+  if (!declaredBaseId || !assessments.length) return null;
+
+  const repoKey = declared.repositoryKey?.trim() || null;
+  const branch = declared.branch?.trim() || null;
+  const scoped = assessments.filter((a) => {
+    if (repoKey && a.repositoryKey !== repoKey) return false;
+    if (branch && a.branch !== branch) return false;
+    return true;
+  });
+  // Declared a repo/branch with no matching assessment → not "stale"; caller still sees impact_unknown
+  // only when *no* assessments exist at all. Scoped miss is not code_assessment_stale.
+  if (!scoped.length) return null;
+
+  const drifted = scoped.filter((a) => a.baseId !== declaredBaseId);
+  if (!drifted.length) return null;
+
+  return drifted
+    .map((a) => `${a.repositoryKey}@${a.branch} assessed=${a.baseId} declared=${declaredBaseId}`)
+    .join(', ');
+}
+
+/**
  * Compute freshness for a subject given its current fingerprint, latest matching
  * validation, doc pins, supersession, and stored cause rows (human_flagged / dismissals).
+ * Pass `declaredRevision` (agent-reported baseId) to derive `code_assessment_stale`.
  */
 export function computeFreshness(input: {
   subjectType: ValidationSubjectType;
@@ -115,6 +157,7 @@ export function computeFreshness(input: {
   docPins: DocPinRow[];
   supersededById: string | null;
   storedCauses: StoredCauseRow[];
+  declaredRevision?: DeclaredCodeRevision | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
   const dismissed = new Set(
@@ -165,24 +208,36 @@ export function computeFreshness(input: {
     push('superseded', `Replaced by ${input.supersededById}`);
   }
 
-  for (const row of input.storedCauses) {
-    if (row.status !== 'open') continue;
-    if (row.cause === 'human_flagged') push('human_flagged', row.detail);
-    // dormant / code_assessment_stale stubs: only if explicitly stored open
-    if (row.cause === 'dormant' || row.cause === 'code_assessment_stale') {
-      push(row.cause as ReviewCause, row.detail);
-    }
-  }
-
   const baselines = input.latestMatching
     ? parseBaselines(input.latestMatching.baselinesJson)
     : input.latestAny
       ? parseBaselines(input.latestAny.baselinesJson)
       : null;
 
-  const hasAssessment = (baselines?.codeAssessments?.length ?? 0) > 0;
+  const assessments = baselines?.codeAssessments ?? [];
+  const hasAssessment = assessments.length > 0;
   const impactUnknown = !hasAssessment;
   if (impactUnknown) push('impact_unknown');
+
+  // P1-F: agent-declared baseId drift vs stored assessments (advisory; no repo fetch).
+  const staleDetail = codeAssessmentStaleDetail(assessments, input.declaredRevision);
+  let assessedStaleDerived = false;
+  if (staleDetail) {
+    push('code_assessment_stale', staleDetail);
+    assessedStaleDerived = true;
+  }
+
+  for (const row of input.storedCauses) {
+    if (row.status !== 'open') continue;
+    if (row.cause === 'human_flagged') push('human_flagged', row.detail);
+    // dormant: only if explicitly stored open (P1-G later)
+    if (row.cause === 'dormant') push('dormant', row.detail);
+    // Manual code_assessment_stale only when we could not evaluate declaration (no baseId passed).
+    // When declaration matches assessments, derived freshness wins over a leftover stored flag.
+    if (row.cause === 'code_assessment_stale' && !assessedStaleDerived && !input.declaredRevision?.baseId) {
+      push('code_assessment_stale', row.detail);
+    }
+  }
 
   // Deduplicate by code (first wins)
   const seen = new Set<string>();

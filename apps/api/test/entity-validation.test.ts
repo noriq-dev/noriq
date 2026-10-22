@@ -209,4 +209,113 @@ describe('review inbox (PLNR-580)', () => {
     const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
     expect(fresh.body.criticalCauses).not.toContain('content_changed');
   });
+
+  it('does not flood inbox with impact_unknown-only subjects', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'never validated flood', body: 'quiet', tags: ['lifecycle'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'impact_unknown')).toBe(true);
+    expect(fresh.body.criticalCauses).toEqual([]);
+
+    const inbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId });
+    expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(false);
+  });
+});
+
+describe('code assessments (PLNR-584 / P1-F)', () => {
+  const assessment = {
+    repositoryKey: 'github.com/noriq-dev/noriq',
+    branch: 'main',
+    baseId: 'abc123base',
+    summary: 'Assumed auth helpers stable',
+  };
+
+  it('stores baselines.codeAssessments on record_validation', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess store', body: 'with assessment', tags: ['schema'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    const rec = await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: { codeAssessments: [assessment] },
+    });
+    expect(rec.isError).toBeFalsy();
+    expect(rec.body.baselines.codeAssessments).toEqual([
+      expect.objectContaining(assessment),
+    ]);
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(fresh.body.impactUnknown).toBe(false);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'impact_unknown')).toBe(false);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(false);
+  });
+
+  it('opens code_assessment_stale when declared baseId differs; matching baseId stays fresh', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess drift', body: 'stable body', tags: ['mcp'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: { codeAssessments: [assessment] },
+    });
+
+    const stale = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'zzz999new',
+    });
+    expect(stale.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+    expect(stale.body.criticalCauses).not.toContain('code_assessment_stale');
+    expect(stale.body.impactUnknown).toBe(false);
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: assessment.baseId,
+    });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(false);
+    expect(fresh.body.criticalCauses).toEqual([]);
+  });
+
+  it('get_task_context derives stale from caller baseId; claim still allowed (advisory)', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess context', body: 'ctx', tags: ['claims'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: { codeAssessments: [assessment] },
+    });
+
+    const ctx = await mcpCall(agent.apiKey, 'get_task_context', {
+      projectId,
+      taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'drifted-base',
+    });
+    expect(ctx.body.taskFacts.freshness.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+    expect(ctx.body.taskFacts.freshness.criticalCauses).not.toContain('code_assessment_stale');
+
+    const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(claim.isError).toBeFalsy();
+    await mcpCall(agent.apiKey, 'release_task', { projectId, taskId, toStatus: 'todo' });
+  });
 });
