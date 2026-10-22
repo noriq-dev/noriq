@@ -7,6 +7,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
+  "alias": { "zod/v4": "zod" },
+
 
   // Your custom domain (zone must be on your Cloudflare account). Wrangler
   // creates the DNS record + certificate on deploy. Delete to use workers.dev.

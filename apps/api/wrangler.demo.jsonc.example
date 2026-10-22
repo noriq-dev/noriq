@@ -23,6 +23,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
+  "alias": { "zod/v4": "zod" },
+
 
   // The demo hostname. The noriq.dev zone must be on your Cloudflare account; wrangler
   // creates the DNS record + cert on deploy. Delete to use noriq-demo.workers.dev instead.
