@@ -2197,13 +2197,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'record_validation',
-    'Write a validation record for a task, plan, or doc (humans and copilots). Binds the current content fingerprint (task: body+executionSpec; plan: body+phase intent; doc: version) plus optional baselines (doc pins / code assessments). Renews lastValidatedAt only for the matching fingerprint — comments/title/tags/priority do not. Use after confirming assumptions still hold, or when attaching baselines after re-review.',
+    'Write a validation record for a task, plan, or doc (humans and copilots). Binds the current content fingerprint (task: body+executionSpec; plan: body+phase intent; doc: version) plus optional baselines (doc pins / code assessments). Renews lastValidatedAt only for the matching fingerprint — comments/title/tags/priority do not. Use after confirming assumptions still hold, or when attaching baselines after re-review. Noriq does NOT index repos: attach baselines.codeAssessments with the repositoryKey/branch/baseId YOU reasoned against so later get_freshness/get_task_context can detect code_assessment_stale when your declared baseId drifts. Missing assessments surface impact_unknown (advisory; inbox does not flood on it).',
     {
       projectId: z.string(),
       subjectType: ValidationSubjectType.describe('task | plan | doc'),
       subjectId: z.string().describe('Subject id (task id/key, plan id, or doc id)'),
       note: z.string().max(2000).optional().describe('Optional note, max 2000 chars'),
-      baselines: ValidationBaselines.optional().describe('Optional doc pins and/or code assessments stored with the record'),
+      baselines: ValidationBaselines.optional().describe(
+        'Optional doc pins and/or agent-declared code assessments ({repositoryKey, branch, baseId, summary?, paths?}). Assessments are stored as-is — Noriq never fetches git to invent them.',
+      ),
     },
     tool(async ({ projectId, subjectType, subjectId, note, baselines }) =>
       room(env, projectId).recordValidation(projectId, actor, { subjectType, subjectId, note, baselines })),
@@ -2211,17 +2213,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_validation',
-    'List recent validation records for a task, plan, or doc (newest first), plus current freshness.',
+    'List recent validation records for a task, plan, or doc (newest first), plus current freshness. Pass repositoryKey/branch/baseId to evaluate code_assessment_stale against stored assessments.',
     {
       projectId: z.string(),
       subjectType: ValidationSubjectType.describe('task | plan | doc'),
       subjectId: z.string().describe('Subject id'),
       limit: z.number().int().positive().max(100).optional().describe('Max records to return, 1-100 (default 20)'),
+      repositoryKey: z.string().optional().describe('Your current canonical repository key'),
+      branch: z.string().optional().describe('Your current branch'),
+      baseId: z.string().optional().describe('Your current opaque VCS revision for assessment drift check'),
     },
-    tool(async ({ projectId, subjectType, subjectId, limit }) => {
+    tool(async ({ projectId, subjectType, subjectId, limit, repositoryKey, branch, baseId }) => {
       const [records, freshness] = await Promise.all([
         room(env, projectId).listValidations(projectId, subjectType, subjectId, limit),
-        subjectFreshness(env.DB, projectId, subjectType, subjectId),
+        subjectFreshness(env.DB, projectId, subjectType, subjectId, { repositoryKey, branch, baseId }),
       ]);
       return { records, freshness };
     }),
@@ -2229,14 +2234,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_freshness',
-    'Pre-start freshness for a task, plan, or doc: causes (critical vs advisory), lastValidatedAt, doc pins vs current, impact unknown when no code assessment. Critical causes (content_changed, doc_baseline_moved) hard-block claim_task.',
+    'Pre-start freshness for a task, plan, or doc: causes (critical vs advisory), lastValidatedAt, doc pins vs current, impact_unknown when no code assessment, and code_assessment_stale when you pass a current baseId that differs from a stored assessment (agent-declared — Noriq does not fetch git). Critical causes (content_changed, doc_baseline_moved) hard-block claim_task; code_assessment_stale and impact_unknown are advisory only.',
     {
       projectId: z.string(),
       subjectType: ValidationSubjectType.describe('task | plan | doc'),
       subjectId: z.string().describe('Subject id'),
+      repositoryKey: z.string().optional().describe('Your current canonical repository key — scopes which stored code assessment to compare'),
+      branch: z.string().optional().describe('Your current branch — optional scope for assessment match'),
+      baseId: z.string().optional().describe('Your current opaque VCS revision — when present and differing from a stored assessment baseId, opens advisory code_assessment_stale'),
     },
-    tool(async ({ projectId, subjectType, subjectId }) =>
-      subjectFreshness(env.DB, projectId, subjectType, subjectId)),
+    tool(async ({ projectId, subjectType, subjectId, repositoryKey, branch, baseId }) =>
+      subjectFreshness(env.DB, projectId, subjectType, subjectId, { repositoryKey, branch, baseId })),
   );
 
   defineTool(
