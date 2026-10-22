@@ -739,7 +739,7 @@ export function useAppStore() {
 
     async submitProjectMeta(meta: {
       name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number;
-      public?: boolean; dormancyQuietSeconds?: number | null;
+      public?: boolean; dormancyQuietSeconds?: number | null; inboxIncludeNeverValidated?: boolean;
     }) {
       if (!pidRef.current || !permissions.canManage) return;
       await api.setProjectMeta(pidRef.current, meta);

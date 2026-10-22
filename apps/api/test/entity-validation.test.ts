@@ -20,6 +20,19 @@ beforeAll(async () => {
   milestoneId = proj.body.milestones[0].id;
 }, 60000);
 
+describe('entity validation playbook (PLNR-596)', () => {
+  it('get_briefing playbook teaches validate-after-edit, claim gate, and baseId', async () => {
+    const briefing = await mcpCall(agent.apiKey, 'get_briefing', {});
+    const text = JSON.stringify(briefing.body.playbook);
+    expect(text).toMatch(/record_validation/);
+    expect(text).toMatch(/content_changed/);
+    expect(text).toMatch(/doc_baseline_moved/);
+    expect(text).toMatch(/baseId/);
+    expect(text).toMatch(/get_plans/);
+    expect(text).toMatch(/get_doc/);
+  });
+});
+
 describe('entity validation (PLNR-576)', () => {
   it('records validation for task/plan/doc; fingerprint ignores title/tags/priority', async () => {
     const task = await mcpCall(agent.apiKey, 'create_tasks', {
@@ -269,6 +282,54 @@ describe('review inbox (PLNR-580)', () => {
     const inbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId });
     expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(false);
   });
+
+  it('opt-in inboxIncludeNeverValidated surfaces pure never_validated; impact_unknown stays omitted (PLNR-597)', async () => {
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'NVIN', name: 'never-validated-inbox' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    expect(proj.body.project.inboxIncludeNeverValidated).toBe(false);
+    const ms = proj.body.milestones[0].id as string;
+
+    const created = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { title: 'pure never validated', body: 'nv', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'validated impact unknown only', body: 'iu', tags: ['lifecycle'], milestoneId: ms },
+      ],
+    });
+    const [neverId, impactId] = (created.body.created as Array<{ id: string }>).map((t) => t.id);
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId: pid, subjectType: 'task', subjectId: impactId, note: 'validated, no assessments',
+    });
+
+    const offInbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId: pid, cause: 'never_validated' });
+    expect(offInbox.body.items.some((i: { subjectId: string }) => i.subjectId === neverId)).toBe(false);
+
+    const patch = await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inboxIncludeNeverValidated: true }),
+    });
+    expect(patch.status).toBe(200);
+
+    const onProj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    expect(onProj.body.project.inboxIncludeNeverValidated).toBe(true);
+
+    const onInbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId: pid, cause: 'never_validated' });
+    const neverItem = onInbox.body.items.find((i: { subjectId: string }) => i.subjectId === neverId);
+    expect(neverItem).toBeTruthy();
+    expect(neverItem.causes).toContain('never_validated');
+    expect(neverItem.causes).not.toContain('impact_unknown');
+
+    const impactOnly = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId: pid });
+    expect(impactOnly.body.items.some((i: { subjectId: string }) => i.subjectId === impactId)).toBe(false);
+
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inboxIncludeNeverValidated: false }),
+    });
+  });
 });
 
 describe('code assessments (PLNR-584 / P1-F)', () => {
@@ -363,6 +424,32 @@ describe('code assessments (PLNR-584 / P1-F)', () => {
 
     const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
     expect(claim.isError).toBeFalsy();
+    await mcpCall(agent.apiKey, 'release_task', { projectId, taskId, toStatus: 'todo' });
+  });
+
+  it('claim_task accepts baseId and surfaces advisory code_assessment_stale without blocking (PLNR-596)', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess claim baseId', body: 'claim base', tags: ['claims'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: { codeAssessments: [assessment] },
+    });
+
+    const claim = await mcpCall(agent.apiKey, 'claim_task', {
+      projectId,
+      taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'claim-drifted-base',
+    });
+    expect(claim.isError).toBeFalsy();
+    expect(claim.body.freshness).toBeTruthy();
+    expect(claim.body.freshness.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+    expect(claim.body.freshness.criticalCauses).not.toContain('code_assessment_stale');
     await mcpCall(agent.apiKey, 'release_task', { projectId, taskId, toStatus: 'todo' });
   });
 

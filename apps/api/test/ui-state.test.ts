@@ -41,7 +41,12 @@ describe('surface-scoped UI state (PLNR-400)', () => {
 
     const state = await response.json() as {
       surface: string;
-      project: { reviewTasks: number; eventSeq: number; dormancyQuietSeconds: number | null };
+      project: {
+        reviewTasks: number;
+        eventSeq: number;
+        dormancyQuietSeconds: number | null;
+        inboxIncludeNeverValidated?: number | boolean;
+      };
       tasks: unknown[]; plans: unknown[]; planDocs: unknown[]; events: unknown[];
     };
     expect(state.surface).toBe('project-settings');
@@ -50,6 +55,9 @@ describe('surface-scoped UI state (PLNR-400)', () => {
     // PLNR-595: project-settings surface carries dormancy config (null = off).
     expect(state.project).toHaveProperty('dormancyQuietSeconds');
     expect(state.project.dormancyQuietSeconds == null || typeof state.project.dormancyQuietSeconds === 'number').toBe(true);
+    // PLNR-597: never_validated inbox opt-in (default off / 0).
+    expect(state.project).toHaveProperty('inboxIncludeNeverValidated');
+    expect(!!state.project.inboxIncludeNeverValidated).toBe(false);
     expect(state.tasks).toEqual([]);
     expect(state.plans).toEqual([]);
     expect(state.planDocs).toEqual([]);

@@ -869,7 +869,8 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
   const project = await c.env.DB.prepare(
     `SELECT p.id, p.key, p.name, p.description, p.claim_ttl_seconds AS claimTtlSeconds,
             p.lock_ttl_seconds AS lockTtlSeconds, p.file_locking_enabled AS fileLockingEnabled,
-            p.dormancy_quiet_seconds AS dormancyQuietSeconds, p.repo_url AS repoUrl,
+            p.dormancy_quiet_seconds AS dormancyQuietSeconds,
+            p.inbox_include_never_validated AS inboxIncludeNeverValidated, p.repo_url AS repoUrl,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'review' AND t.archived_at IS NULL) AS reviewTasks,
             (SELECT COALESCE(MAX(e.seq), 0) FROM events e WHERE e.project_id = p.id) AS eventSeq
        FROM projects p WHERE p.id = ?`,
@@ -1026,7 +1027,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
   await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
   const [project, tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
-    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, dormancy_quiet_seconds AS dormancyQuietSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
+    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, dormancy_quiet_seconds AS dormancyQuietSeconds, inbox_include_never_validated AS inboxIncludeNeverValidated, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
     // display* concern — filtering it out here silently drained every derived aggregate
@@ -3142,6 +3143,8 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
     fileLocking?: boolean; lockTtlSeconds?: number | null;
     /** PLNR-585: null clears (off); positive seconds enables opt-in dormancy. */
     dormancyQuietSeconds?: number | null;
+    /** PLNR-597: include pure never_validated subjects in the review inbox (default false). */
+    inboxIncludeNeverValidated?: boolean;
   }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
@@ -3212,6 +3215,10 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
       }
       sets.push('dormancy_quiet_seconds = ?'); binds.push(n);
     }
+  }
+  if (body.inboxIncludeNeverValidated !== undefined) {
+    sets.push('inbox_include_never_validated = ?');
+    binds.push(body.inboxIncludeNeverValidated ? 1 : 0);
   }
   if (sets.length) {
     binds.push(pid);
