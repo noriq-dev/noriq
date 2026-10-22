@@ -102,6 +102,25 @@ export type StoredCauseRow = {
   detail: string;
 };
 
+/**
+ * Options bag for subjectFreshness / computeFreshness.
+ * Single object so P1-F (#19 declaredRevision) and P1-G (dormancy `now`) merge cleanly —
+ * do not reintroduce a positional 5th arg that would clobber either shape.
+ */
+export type SubjectFreshnessOptions = {
+  /** Injectable clock for dormancy comparison (PLNR-585). */
+  now?: string | null;
+  /**
+   * Agent-declared code revision for code_assessment_stale (PLNR-584 / P1-F).
+   * Accepted here for merge compatibility with #19; wiring lives in that PR.
+   */
+  declaredRevision?: {
+    repositoryKey?: string | null;
+    branch?: string | null;
+    baseId?: string | null;
+  } | null;
+};
+
 /** Later of ISO timestamps; ignores null/invalid. */
 export function laterIso(...candidates: Array<string | null | undefined>): string | null {
   let best: string | null = null;

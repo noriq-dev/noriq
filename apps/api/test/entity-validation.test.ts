@@ -330,4 +330,159 @@ describe('opt-in dormancy (PLNR-585 / P1-G)', () => {
     const v = proj.body.project.dormancyQuietSeconds;
     expect(v === null || typeof v === 'number').toBe(true);
   });
+
+  it('reviewInbox includes never-validated dormant task/plan/doc when project threshold is set', async () => {
+    const old = '2018-06-01T00:00:00.000Z';
+
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'never validated dormant', body: 'old backlog', tags: ['lifecycle'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    // No validation, no pins, no flags — Codex repro for missing inbox candidates.
+    await env.DB.prepare(
+      'UPDATE tasks SET content_activity_at = ?, created_at = ? WHERE id = ?',
+    ).bind(old, old, taskId).run();
+
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId,
+      title: 'dormant plan',
+      body: 'plan body',
+      phases: [{ title: 'P1', newTasks: [{ title: 'plan dormant task', tags: ['lifecycle'], milestoneId }] }],
+    });
+    const planId = plan.body.id as string;
+    await env.DB.prepare(
+      'UPDATE plans SET content_activity_at = ?, created_at = ? WHERE id = ?',
+    ).bind(old, old, planId).run();
+
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Dormant settled fact', description: 'old', body: 'Settled long ago.',
+    });
+    const docId = doc.body.id as string;
+    await env.DB.prepare(
+      'UPDATE docs SET content_activity_at = ?, created_at = ? WHERE id = ?',
+    ).bind(old, old, docId).run();
+
+    // Off: freshness has no dormant, inbox must not list these.
+    const offFresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(offFresh.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(false);
+    const offInbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId, cause: 'dormant' });
+    expect(offInbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(false);
+
+    const meta = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+    expect(meta.status).toBe(200);
+
+    const onFresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    expect(onFresh.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(true);
+
+    const inbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId, cause: 'dormant' });
+    const ids = inbox.body.items.map((i: { subjectId: string }) => i.subjectId);
+    expect(ids).toContain(taskId);
+    expect(ids).toContain(planId);
+    expect(ids).toContain(docId);
+
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: null }),
+    });
+  });
+
+  it('idempotent body/spec resubmit does not advance content_activity_at; real change does', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{
+        title: 'idempotent content clock',
+        body: 'stable-body',
+        tags: ['lifecycle'],
+        milestoneId,
+        executionSpec: {
+          acceptance: { observableTruths: ['clock only moves on real change'] },
+        },
+      }],
+    });
+    const taskId = task.body.created[0].id as string;
+    const frozen = '2020-02-02T00:00:00.000Z';
+    await env.DB.prepare('UPDATE tasks SET content_activity_at = ? WHERE id = ?').bind(frozen, taskId).run();
+
+    // Resubmit identical body + executionSpec — must not bump the dormancy clock.
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId,
+      tasks: [{
+        taskId,
+        set: {
+          body: 'stable-body',
+          executionSpec: {
+            acceptance: { observableTruths: ['clock only moves on real change'] },
+          },
+        },
+      }],
+    });
+    const afterSame = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM tasks WHERE id = ?',
+    ).bind(taskId).first<{ at: string }>();
+    expect(afterSame?.at).toBe(frozen);
+
+    // Genuine body change advances the clock.
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId, tasks: [{ taskId, set: { body: 'changed-body' } }],
+    });
+    const afterChange = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM tasks WHERE id = ?',
+    ).bind(taskId).first<{ at: string }>();
+    expect(afterChange?.at).not.toBe(frozen);
+
+    // Plan: identical body resubmit vs real change.
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId,
+      title: 'clock plan',
+      body: 'plan-stable',
+      phases: [{ title: 'P1', body: 'phase-stable', newTasks: [{ title: 'clock plan task', tags: ['lifecycle'], milestoneId }] }],
+    });
+    const planId = plan.body.id as string;
+    const phaseId = plan.body.phases[0].id as string;
+    await env.DB.prepare('UPDATE plans SET content_activity_at = ? WHERE id = ?').bind(frozen, planId).run();
+
+    await mcpCall(agent.apiKey, 'update_plan', {
+      projectId, planId, body: 'plan-stable',
+    });
+    const planSame = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM plans WHERE id = ?',
+    ).bind(planId).first<{ at: string }>();
+    expect(planSame?.at).toBe(frozen);
+
+    await mcpCall(agent.apiKey, 'update_plan', {
+      projectId, planId, body: 'plan-changed',
+    });
+    const planChanged = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM plans WHERE id = ?',
+    ).bind(planId).first<{ at: string }>();
+    expect(planChanged?.at).not.toBe(frozen);
+
+    // Phase: identical title/body resubmit vs real change.
+    await env.DB.prepare('UPDATE plans SET content_activity_at = ? WHERE id = ?').bind(frozen, planId).run();
+    await mcpCall(agent.apiKey, 'update_plan', {
+      projectId, planId, phaseId, phaseTitle: 'P1', phaseBody: 'phase-stable',
+    });
+    const phaseSame = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM plans WHERE id = ?',
+    ).bind(planId).first<{ at: string }>();
+    expect(phaseSame?.at).toBe(frozen);
+
+    await mcpCall(agent.apiKey, 'update_plan', {
+      projectId, planId, phaseId, phaseBody: 'phase-changed',
+    });
+    const phaseChanged = await env.DB.prepare(
+      'SELECT content_activity_at AS at FROM plans WHERE id = ?',
+    ).bind(planId).first<{ at: string }>();
+    expect(phaseChanged?.at).not.toBe(frozen);
+  });
 });

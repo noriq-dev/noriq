@@ -20,10 +20,32 @@ import {
   type DocPinRow,
   type ReviewInboxItem,
   type StoredCauseRow,
+  type SubjectFreshnessOptions,
   type ValidationRow,
 } from './entity-validation';
 
 type Actor = { kind: 'agent' | 'human' | 'system'; id: string; name: string };
+
+export type { SubjectFreshnessOptions };
+
+/**
+ * SQL predicate: subject has an effective dormancy quiet threshold (entity override → project)
+ * and its quiet clock (content_activity_at, else created_at) already exceeds that threshold.
+ * Approximation only — subjectFreshness still derives the real dormant cause (incl. lastValidated).
+ * Alias `$alias` must be the subject table (t/p/d); `$type` is the validation subject_type literal.
+ */
+function dormancyCandidateSql(alias: string, type: 'task' | 'plan' | 'doc'): string {
+  const quiet = `COALESCE(
+    (SELECT edo.quiet_seconds FROM entity_dormancy_overrides edo
+      WHERE edo.project_id = ${alias}.project_id AND edo.subject_type = '${type}' AND edo.subject_id = ${alias}.id),
+    (SELECT pr.dormancy_quiet_seconds FROM projects pr WHERE pr.id = ${alias}.project_id)
+  )`;
+  return `(
+    ${quiet} IS NOT NULL
+    AND (julianday('now') - julianday(COALESCE(${alias}.content_activity_at, ${alias}.created_at))) * 86400.0
+      >= ${quiet}
+  )`;
+}
 
 async function latestValidations(
   db: D1Database,
@@ -226,7 +248,7 @@ export async function subjectFreshness(
   projectId: string,
   subjectType: ValidationSubjectType,
   subjectId: string,
-  opts?: { now?: string },
+  opts?: SubjectFreshnessOptions,
 ): Promise<SubjectFreshness> {
   const { latestAny, latestMatching, fingerprint } = await latestValidations(db, projectId, subjectType, subjectId);
   const [docPins, replacedBy, storedCauses, dormancy, activity] = await Promise.all([
@@ -249,6 +271,7 @@ export async function subjectFreshness(
     contentActivityAt: activity.contentActivityAt,
     createdAt: activity.createdAt,
     now: opts?.now ?? null,
+    // declaredRevision reserved for P1-F (#19) merge — optional field on the same bag.
   });
 }
 
@@ -519,9 +542,9 @@ export async function reviewInbox(
   const offset = Math.max(0, opts.offset ?? 0);
   const now = Date.now();
 
-  // Candidate subjects: anything with a validation, a pin, a supersession edge, or a stored cause —
-  // plus never_validated is too broad for "all tasks". Inbox focuses on subjects that already
-  // participated in validation OR have stored flags / supersession / drifted pins.
+  // Candidate subjects: validation / open cause / supersession / drifted pins —
+  // OR dormancy-eligible (effective threshold + quiet clock exceeded). never_validated alone
+  // is still omitted unless another actionable cause (e.g. dormant) surfaces.
   const taskCandidates = await db.prepare(
     `SELECT DISTINCT t.id AS id, t.key AS key, t.title AS title, 'task' AS subjectType
        FROM tasks t
@@ -535,6 +558,7 @@ export async function reviewInbox(
              WHERE td.task_id = t.id AND td.pinned_version IS NOT NULL
                AND d.current_version IS NOT NULL AND td.pinned_version != d.current_version
           )
+          OR ${dormancyCandidateSql('t', 'task')}
         )`,
   ).bind(projectId).all<{ id: string; key: string; title: string; subjectType: 'task' }>();
 
@@ -551,6 +575,7 @@ export async function reviewInbox(
              WHERE pdr.plan_id = p.id AND pdr.pinned_version IS NOT NULL
                AND d.current_version IS NOT NULL AND pdr.pinned_version != d.current_version
           )
+          OR ${dormancyCandidateSql('p', 'plan')}
         )`,
   ).bind(projectId).all<{ id: string; key: string | null; title: string; subjectType: 'plan' }>();
 
@@ -562,6 +587,7 @@ export async function reviewInbox(
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = d.id AND ev.subject_type = 'doc')
           OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = d.id AND erc.subject_type = 'doc' AND erc.status = 'open')
           OR EXISTS (SELECT 1 FROM docs s WHERE s.supersedes_doc_id = d.id)
+          OR ${dormancyCandidateSql('d', 'doc')}
         )`,
   ).bind(projectId).all<{ id: string; key: string | null; title: string; subjectType: 'doc' }>();
 
