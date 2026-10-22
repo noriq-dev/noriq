@@ -8,6 +8,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
+  "alias": { "zod/v4": "zod" },
+
 
   // Ask answer budget and actor-lifecycle retention policy. Lifecycle numeric values are parsed,
   // clamped, and reported by the sweep. Scheduled mutation is deliberately opt-in; operators can
