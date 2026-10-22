@@ -12,15 +12,18 @@ export function openReviewMemoryTab(setView: (view: 'review') => void) {
   setView('review');
 }
 
+/** Read-only: safe under React StrictMode's double useState initializer. */
 export function readReviewShellTab(): ReviewShellTab {
   try {
     const raw = sessionStorage.getItem(REVIEW_TAB_KEY);
-    if (raw === 'work' || raw === 'validity' || raw === 'memory') {
-      sessionStorage.removeItem(REVIEW_TAB_KEY);
-      return raw;
-    }
+    if (raw === 'work' || raw === 'validity' || raw === 'memory') return raw;
   } catch { /* optional */ }
   return 'work';
+}
+
+/** Consume the one-shot nav hint after mount (not during state init). */
+export function clearReviewShellTabHint(): void {
+  try { sessionStorage.removeItem(REVIEW_TAB_KEY); } catch { /* optional */ }
 }
 
 export type InboxFilterOption<T extends string> = {

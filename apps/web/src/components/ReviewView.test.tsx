@@ -1,6 +1,6 @@
 // PLNR-583: Validity inbox group-by toggle + Supersede… action (no auto-close).
 // PLNR-588: Memory tab shares Review chrome without merging authority models.
-import { act } from 'react';
+import { act, StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiEntityReviewInboxItem } from '../api';
@@ -187,7 +187,15 @@ describe('ReviewView shared chrome', () => {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
-    await act(async () => { root!.render(<ReviewView store={store()} />); });
+    // StrictMode double-inits useState (matches apps/web/src/main.tsx). Hint must
+    // be read without mutation; clear happens after mount.
+    await act(async () => {
+      root!.render(
+        <StrictMode>
+          <ReviewView store={store()} />
+        </StrictMode>,
+      );
+    });
     await act(async () => { await Promise.resolve(); });
 
     expect(text()).toContain('Memory review');

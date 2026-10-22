@@ -29,6 +29,7 @@ import { MonoTag, SectionLabel } from './bits';
 import { MemoryReview } from './MemoryReview';
 import { PlanSearchSelect } from './PlanSearchSelect';
 import {
+  clearReviewShellTabHint,
   InboxEmptyState,
   InboxFilterChips,
   InboxLoading,
@@ -63,11 +64,17 @@ const emptyInbox = (groupBy: ApiEntityReviewGroupBy = 'cause'): ApiEntityReviewI
 
 export function ReviewView({ store }: { store: AppStore }) {
   const { currentPid, helpers } = store;
+  // Peek only here — StrictMode double-inits useState; mutating sessionStorage
+  // in the initializer drops the Memory cross-link on the second call (Codex P2).
   const [tab, setTab] = useState<Tab>(readReviewShellTab);
   const [memoryCount, setMemoryCount] = useState<number | null>(null);
   const queue = helpers
     .tasksOf(currentPid)
     .filter((t) => t.status === 'review' && !t.archivedAt);
+
+  useEffect(() => {
+    clearReviewShellTabHint();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
