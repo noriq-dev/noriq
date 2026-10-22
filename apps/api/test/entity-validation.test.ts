@@ -759,7 +759,8 @@ describe('reviewInbox batched freshness (PLNR-585 scale)', () => {
       projectId: pid,
       tasks: [{ title: 'window restore', body: 'content-A', tags: ['lifecycle'], milestoneId: ms }],
     });
-    const taskId = (created.body.created as Array<{ id: string }>)[0].id;
+    expect(created.body.failed).toBe(0);
+    const taskId = (created.body.created as Array<{ id: string }>)[0]!.id;
 
     await mcpCall(agent.apiKey, 'record_validation', {
       projectId: pid, subjectType: 'task', subjectId: taskId, note: 'A',
