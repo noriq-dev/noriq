@@ -40,17 +40,12 @@ import {
 import { TaskSearchSelect } from './TaskSearchSelect';
 import { Button } from './ui';
 import { Markdown } from './Markdown';
+import { causeMeta, VALIDITY_CAUSES } from './ValidityStrip';
 
 type Tab = ReviewShellTab;
 
-const CAUSES: Array<{ id: ApiReviewCause; label: string; detail: string; color: string }> = [
-  { id: 'content_changed', label: 'Content changed', detail: 'Fingerprint moved past last validation', color: 'var(--red-soft)' },
-  { id: 'doc_baseline_moved', label: 'Doc pin drifted', detail: 'Linked settled doc advanced past pin', color: 'var(--red-soft)' },
-  { id: 'superseded', label: 'Superseded', detail: 'Replaced by another entity', color: 'var(--amber)' },
-  { id: 'human_flagged', label: 'Human flagged', detail: 'Marked for check', color: 'var(--amber)' },
-  { id: 'code_assessment_stale', label: 'Code assessment stale', detail: 'Agent-declared base drift (P1)', color: 'var(--blue)' },
-  { id: 'dormant', label: 'Dormant', detail: 'Opt-in quiet period (P1)', color: 'var(--text-dim)' },
-];
+/** Inbox filter chips — omits never_validated / impact_unknown (flood policy). */
+const CAUSES = VALIDITY_CAUSES.filter((c) => c.id !== 'never_validated' && c.id !== 'impact_unknown');
 
 const ENTITY_TYPES: Array<{ id: ApiValidationSubjectType; label: string; detail: string; color: string }> = [
   { id: 'task', label: 'Tasks', detail: 'Task fingerprints and pins', color: 'var(--blue)' },
@@ -382,7 +377,7 @@ function ValidityRow({
   onDismiss: (cause: ApiReviewCause) => void;
   onSupersede: (replacementId: string) => void;
 }) {
-  const primary = CAUSES.find((c) => c.id === item.primaryCause);
+  const primary = causeMeta(item.primaryCause);
   const [superseding, setSuperseding] = useState(false);
   const [replacementId, setReplacementId] = useState('');
   const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
@@ -418,7 +413,7 @@ function ValidityRow({
         <span style={{ fontSize: 13, fontWeight: 600 }}>{item.title}</span>
         <span style={{ flex: 1 }} />
         {item.causes.map((c) => {
-          const meta = CAUSES.find((x) => x.id === c);
+          const meta = causeMeta(c);
           return (
             <MonoTag key={c} color={meta?.color ?? 'var(--text-dim)'} bg="var(--w-05)" size={8.5}>
               {(meta?.label ?? c).toUpperCase()}

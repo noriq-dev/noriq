@@ -185,6 +185,51 @@ describe('hard claim gate (PLNR-579)', () => {
     expect(ctx.body.taskFacts.freshness).toBeTruthy();
     expect(ctx.body.taskFacts.freshness.impactUnknown).toBe(true);
   });
+
+  it('get_plans and get_doc embed freshness and supersession (P2-A)', async () => {
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId,
+      title: 'surface plan',
+      body: 'plan body for freshness',
+      phases: [{ title: 'One', newTasks: [{ title: 'plan surface task', tags: ['mcp'], milestoneId }] }],
+    });
+    const planId = plan.body.id as string;
+
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Surface settled fact', description: 'embed check', body: 'A settled decision.',
+    });
+    const docId = doc.body.id as string;
+
+    const plans = await mcpCall(agent.apiKey, 'get_plans', { projectId });
+    const listed = plans.body.plans.find((p: { id: string }) => p.id === planId);
+    expect(listed).toBeTruthy();
+    expect(listed.freshness).toBeTruthy();
+    expect(listed.freshness.subjectType).toBe('plan');
+    expect(listed.freshness.subjectId).toBe(planId);
+    expect(listed.freshness.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(true);
+    expect(listed.supersession).toEqual({ supersedesId: null, supersededById: null });
+    expect(listed.lastValidatedAt).toBe(listed.freshness.lastValidatedAt);
+
+    const got = await mcpCall(agent.apiKey, 'get_doc', { projectId, docId });
+    expect(got.body.freshness).toBeTruthy();
+    expect(got.body.freshness.subjectType).toBe('doc');
+    expect(got.body.freshness.subjectId).toBe(docId);
+    expect(got.body.freshness.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(true);
+    expect(got.body.supersession).toEqual({ supersedesId: null, supersededById: null });
+    expect(got.body.lastValidatedAt).toBe(got.body.freshness.lastValidatedAt);
+
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'plan', subjectId: planId });
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'doc', subjectId: docId });
+
+    const plans2 = await mcpCall(agent.apiKey, 'get_plans', { projectId });
+    const listed2 = plans2.body.plans.find((p: { id: string }) => p.id === planId);
+    expect(listed2.lastValidatedAt).toBeTruthy();
+    expect(listed2.freshness.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(false);
+
+    const got2 = await mcpCall(agent.apiKey, 'get_doc', { projectId, docId });
+    expect(got2.body.lastValidatedAt).toBeTruthy();
+    expect(got2.body.freshness.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(false);
+  });
 });
 
 describe('review inbox (PLNR-580)', () => {
