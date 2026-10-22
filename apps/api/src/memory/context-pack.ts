@@ -537,11 +537,11 @@ export async function assembleContextPack(
   // PLNR-579/584: freshness is required task fact for pre-start — never displaced by budget.
   // Pass caller baseId so code_assessment_stale can be derived from agent-declared drift.
   const { subjectFreshness } = await import('../lib/entity-validation-store');
-  const freshness = await subjectFreshness(env.DB, projectId, 'task', row.id, {
+  const freshness = await subjectFreshness(env.DB, projectId, 'task', row.id, { declaredRevision: {
     repositoryKey: input.repositoryKey ?? null,
     branch: input.branch ?? null,
     baseId: input.baseId ?? null,
-  }).catch(() => null);
+  } }).catch(() => null);
 
   const taskFacts: ContextPackTaskFacts = {
     taskId: row.id,

@@ -1096,7 +1096,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt, description FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
-        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking FROM projects WHERE id = ?')
+        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking, dormancy_quiet_seconds AS dormancyQuietSeconds FROM projects WHERE id = ?')
           .bind(projectId).first<Record<string, unknown>>(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name, description, current_version AS version, updated_at AS updatedAt FROM docs WHERE project_id = ? AND archived_at IS NULL ORDER BY updated_at DESC').bind(projectId).all(),
@@ -1114,6 +1114,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (!project) throw new Error(`project ${projectId} not found`);
       // D1 stores the flag as 0/1 — hand the agent a real boolean.
       project.fileLocking = !!project.fileLocking;
+      // PLNR-585: null = dormancy OFF until configured.
+      project.dormancyQuietSeconds = project.dormancyQuietSeconds == null
+        ? null
+        : Number(project.dormancyQuietSeconds);
       const activePlans = plans.results.filter((p) => p.tasksTotal === 0 || p.tasksDone < p.tasksTotal);
       return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results, plans: activePlans, docs: docs.results };
     }),
@@ -2226,7 +2230,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, subjectType, subjectId, limit, repositoryKey, branch, baseId }) => {
       const [records, freshness] = await Promise.all([
         room(env, projectId).listValidations(projectId, subjectType, subjectId, limit),
-        subjectFreshness(env.DB, projectId, subjectType, subjectId, { repositoryKey, branch, baseId }),
+        subjectFreshness(env.DB, projectId, subjectType, subjectId, { declaredRevision: { repositoryKey, branch, baseId } }),
       ]);
       return { records, freshness };
     }),
@@ -2244,7 +2248,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       baseId: z.string().optional().describe('Your current opaque VCS revision — when present and differing from a stored assessment baseId, opens advisory code_assessment_stale'),
     },
     tool(async ({ projectId, subjectType, subjectId, repositoryKey, branch, baseId }) =>
-      subjectFreshness(env.DB, projectId, subjectType, subjectId, { repositoryKey, branch, baseId })),
+      subjectFreshness(env.DB, projectId, subjectType, subjectId, { declaredRevision: { repositoryKey, branch, baseId } })),
   );
 
   defineTool(

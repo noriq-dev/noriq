@@ -103,6 +103,49 @@ export type StoredCauseRow = {
 };
 
 /**
+ * Options bag for subjectFreshness / computeFreshness.
+ * Single object so P1-F (#19 declaredRevision) and P1-G (dormancy `now`) merge cleanly —
+ * do not reintroduce a positional 5th arg that would clobber either shape.
+ */
+export type SubjectFreshnessOptions = {
+  /** Injectable clock for dormancy comparison (PLNR-585). */
+  now?: string | null;
+  /** Agent-declared code revision for code_assessment_stale. */
+  declaredRevision?: DeclaredCodeRevision | null;
+};
+
+/** Later of ISO timestamps; ignores null/invalid. */
+export function laterIso(...candidates: Array<string | null | undefined>): string | null {
+  let best: string | null = null;
+  let bestMs = -Infinity;
+  for (const c of candidates) {
+    if (!c) continue;
+    const ms = Date.parse(c);
+    if (!Number.isFinite(ms)) continue;
+    if (ms >= bestMs) {
+      bestMs = ms;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * Quiet-period anchor: later of matching lastValidated and last fingerprint-affecting
+ * content activity. `createdAt` is fallback only when both are missing (should not win
+ * over an older explicit content_activity_at). Age alone never invalidates.
+ */
+export function dormancyActivityAt(input: {
+  lastValidatedAt: string | null;
+  contentActivityAt: string | null;
+  createdAt?: string | null;
+}): string {
+  return laterIso(input.lastValidatedAt, input.contentActivityAt)
+    ?? input.createdAt
+    ?? new Date(0).toISOString();
+}
+
+/**
  * Agent-declared current VCS revision for comparing stored code assessments.
  * Noriq does not fetch or index repos — staleness is declared, not discovered.
  */
@@ -192,6 +235,9 @@ export function codeAssessmentStaleDetail(
 /**
  * Compute freshness for a subject given its current fingerprint, latest matching
  * validation, doc pins, supersession, and stored cause rows (human_flagged / dismissals).
+ *
+ * Dormancy (P1-G): when `dormancyQuietSeconds` is null/≤0 the clock is OFF. When set,
+ * quiet since lastValidated/content activity opens advisory `dormant` only — never auto-close.
  * Pass `declaredRevision` (agent-reported baseId) to derive `code_assessment_stale`.
  */
 export function computeFreshness(input: {
@@ -203,6 +249,14 @@ export function computeFreshness(input: {
   docPins: DocPinRow[];
   supersededById: string | null;
   storedCauses: StoredCauseRow[];
+  /** null / ≤0 = dormancy OFF (default). */
+  dormancyQuietSeconds?: number | null;
+  /** Last fingerprint-affecting content write (not claim/title/tag churn). */
+  contentActivityAt?: string | null;
+  /** Fallback when content_activity_at is unset (legacy rows). */
+  createdAt?: string | null;
+  /** Clock for dormancy comparison (injectable in tests). */
+  now?: string | null;
   declaredRevision?: DeclaredCodeRevision | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
@@ -256,6 +310,23 @@ export function computeFreshness(input: {
     push('superseded', `Replaced by ${input.supersededById}`);
   }
 
+  const quietSeconds = input.dormancyQuietSeconds != null && input.dormancyQuietSeconds > 0
+    ? input.dormancyQuietSeconds
+    : null;
+  if (quietSeconds != null) {
+    const activityAt = dormancyActivityAt({
+      lastValidatedAt: input.latestMatching?.validatedAt ?? null,
+      contentActivityAt: input.contentActivityAt ?? null,
+      createdAt: input.createdAt ?? null,
+    });
+    const nowMs = Date.parse(input.now ?? new Date().toISOString());
+    const activityMs = Date.parse(activityAt);
+    if (Number.isFinite(nowMs) && Number.isFinite(activityMs) && nowMs - activityMs >= quietSeconds * 1000) {
+      const quietFor = Math.floor((nowMs - activityMs) / 1000);
+      push('dormant', `Quiet for ${quietFor}s (threshold ${quietSeconds}s since lastValidated/content activity)`);
+    }
+  }
+
   const baselines = input.latestMatching
     ? parseBaselines(input.latestMatching.baselinesJson)
     : input.latestAny
@@ -278,7 +349,7 @@ export function computeFreshness(input: {
   for (const row of input.storedCauses) {
     if (row.status !== 'open') continue;
     if (row.cause === 'human_flagged') push('human_flagged', row.detail);
-    // dormant: only if explicitly stored open (P1-G later)
+    // Dormancy may also be explicitly force-opened.
     if (row.cause === 'dormant') push('dormant', row.detail);
     // Preserve stored open code_assessment_stale when declaration cannot be evaluated
     // (no baseId, no assessments, or mismatched repo/branch). Matching-scope eval wins.
