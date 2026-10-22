@@ -1,7 +1,7 @@
 {
   "name": "@noriq-dev/web",
   "private": true,
-  "version": "0.79.2",
+  "version": "0.79.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
