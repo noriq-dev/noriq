@@ -29,22 +29,175 @@ type Actor = { kind: 'agent' | 'human' | 'system'; id: string; name: string };
 export type { SubjectFreshnessOptions };
 
 /**
- * SQL predicate: subject has an effective dormancy quiet threshold (entity override → project)
- * and its quiet clock (content_activity_at, else created_at) already exceeds that threshold.
- * Approximation only — subjectFreshness still derives the real dormant cause (incl. lastValidated).
- * Alias `$alias` must be the subject table (t/p/d); `$type` is the validation subject_type literal.
+ * D1 allows at most 100 bound parameters per statement. Chunk IN-lists so
+ * projectId (+ optional subject_type) leave headroom.
  */
-function dormancyCandidateSql(alias: string, type: 'task' | 'plan' | 'doc'): string {
-  const quiet = `COALESCE(
-    (SELECT edo.quiet_seconds FROM entity_dormancy_overrides edo
-      WHERE edo.project_id = ${alias}.project_id AND edo.subject_type = '${type}' AND edo.subject_id = ${alias}.id),
-    (SELECT pr.dormancy_quiet_seconds FROM projects pr WHERE pr.id = ${alias}.project_id)
-  )`;
+const D1_IN_CHUNK = 90;
+
+function chunkIds(ids: string[], size = D1_IN_CHUNK): string[][] {
+  if (!ids.length) return [];
+  const out: string[][] = [];
+  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
+  return out;
+}
+
+/**
+ * SQL predicate using LEFT JOIN alias `edo` (entity_dormancy_overrides) and two
+ * bound `?` placeholders for the project-level quiet seconds (may be NULL).
+ * Approximation only — computeFreshness still derives the real dormant cause (incl. lastValidated).
+ */
+function dormancyCandidateSql(alias: string): string {
   return `(
-    ${quiet} IS NOT NULL
+    COALESCE(edo.quiet_seconds, ?) IS NOT NULL
     AND (julianday('now') - julianday(COALESCE(${alias}.content_activity_at, ${alias}.created_at))) * 86400.0
-      >= ${quiet}
+      >= COALESCE(edo.quiet_seconds, ?)
   )`;
+}
+
+type InboxCandidate = {
+  id: string;
+  key: string | null;
+  title: string;
+  subjectType: ValidationSubjectType;
+  contentActivityAt: string | null;
+  createdAt: string | null;
+  overrideQuiet: number | null;
+  body: string | null;
+  executionSpec: string | null;
+  currentVersion: number | null;
+};
+
+async function batchValidationsBySubject(
+  db: D1Database,
+  projectId: string,
+  subjectType: ValidationSubjectType,
+  subjectIds: string[],
+): Promise<Map<string, ValidationRow[]>> {
+  const map = new Map<string, ValidationRow[]>();
+  for (const chunk of chunkIds(subjectIds)) {
+    const { results } = await db.prepare(
+      `SELECT id, project_id, subject_type, subject_id, content_fingerprint, validated_at,
+              actor_kind, actor_id, actor_name, baselines_json, note
+         FROM entity_validations
+        WHERE project_id = ? AND subject_type = ? AND subject_id IN (${chunk.map(() => '?').join(',')})
+        ORDER BY validated_at DESC`,
+    ).bind(projectId, subjectType, ...chunk).all();
+    for (const raw of results ?? []) {
+      const row = validationFromRow(raw as Parameters<typeof validationFromRow>[0]);
+      const list = map.get(row.subjectId) ?? [];
+      list.push(row);
+      map.set(row.subjectId, list);
+    }
+  }
+  return map;
+}
+
+async function batchTaskDocPins(
+  db: D1Database,
+  taskIds: string[],
+): Promise<Map<string, DocPinRow[]>> {
+  const map = new Map<string, DocPinRow[]>();
+  for (const chunk of chunkIds(taskIds)) {
+    const { results } = await db.prepare(
+      `SELECT td.task_id AS subjectId, td.doc_id AS docId, td.pinned_version AS pinnedVersion,
+              d.current_version AS currentVersion, d.name AS name
+         FROM task_docs td JOIN docs d ON d.id = td.doc_id
+        WHERE td.task_id IN (${chunk.map(() => '?').join(',')}) AND d.archived_at IS NULL`,
+    ).bind(...chunk).all<DocPinRow & { subjectId: string }>();
+    for (const r of results ?? []) {
+      const list = map.get(r.subjectId) ?? [];
+      list.push({ docId: r.docId, pinnedVersion: r.pinnedVersion, currentVersion: r.currentVersion, name: r.name });
+      map.set(r.subjectId, list);
+    }
+  }
+  return map;
+}
+
+async function batchPlanDocPins(
+  db: D1Database,
+  planIds: string[],
+): Promise<Map<string, DocPinRow[]>> {
+  const map = new Map<string, DocPinRow[]>();
+  for (const chunk of chunkIds(planIds)) {
+    const { results } = await db.prepare(
+      `SELECT pdr.plan_id AS subjectId, pdr.doc_id AS docId, pdr.pinned_version AS pinnedVersion,
+              d.current_version AS currentVersion, d.name AS name
+         FROM plan_doc_refs pdr JOIN docs d ON d.id = pdr.doc_id
+        WHERE pdr.plan_id IN (${chunk.map(() => '?').join(',')}) AND d.archived_at IS NULL`,
+    ).bind(...chunk).all<DocPinRow & { subjectId: string }>();
+    for (const r of results ?? []) {
+      const list = map.get(r.subjectId) ?? [];
+      list.push({ docId: r.docId, pinnedVersion: r.pinnedVersion, currentVersion: r.currentVersion, name: r.name });
+      map.set(r.subjectId, list);
+    }
+  }
+  return map;
+}
+
+async function batchSupersededBy(
+  db: D1Database,
+  subjectType: ValidationSubjectType,
+  subjectIds: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (!subjectIds.length) return map;
+  const col =
+    subjectType === 'task' ? 'supersedes_task_id'
+      : subjectType === 'plan' ? 'supersedes_plan_id'
+        : 'supersedes_doc_id';
+  const table = subjectType === 'task' ? 'tasks' : subjectType === 'plan' ? 'plans' : 'docs';
+  for (const chunk of chunkIds(subjectIds)) {
+    const { results } = await db.prepare(
+      `SELECT id AS replacerId, ${col} AS priorId FROM ${table}
+        WHERE ${col} IN (${chunk.map(() => '?').join(',')})`,
+    ).bind(...chunk).all<{ replacerId: string; priorId: string }>();
+    for (const r of results ?? []) {
+      // First replacer wins — matches LIMIT 1 in per-subject supersededById.
+      if (!map.has(r.priorId)) map.set(r.priorId, r.replacerId);
+    }
+  }
+  return map;
+}
+
+async function batchStoredCauses(
+  db: D1Database,
+  projectId: string,
+  subjectType: ValidationSubjectType,
+  subjectIds: string[],
+): Promise<Map<string, StoredCauseRow[]>> {
+  const map = new Map<string, StoredCauseRow[]>();
+  for (const chunk of chunkIds(subjectIds)) {
+    const { results } = await db.prepare(
+      `SELECT subject_id AS subjectId, cause, status, detail FROM entity_review_causes
+        WHERE project_id = ? AND subject_type = ? AND subject_id IN (${chunk.map(() => '?').join(',')})`,
+    ).bind(projectId, subjectType, ...chunk).all<StoredCauseRow & { subjectId: string }>();
+    for (const r of results ?? []) {
+      const list = map.get(r.subjectId) ?? [];
+      list.push({ cause: r.cause, status: r.status, detail: r.detail });
+      map.set(r.subjectId, list);
+    }
+  }
+  return map;
+}
+
+async function batchPlanPhases(
+  db: D1Database,
+  planIds: string[],
+): Promise<Map<string, Array<{ order: number; title: string; body: string | null }>>> {
+  const map = new Map<string, Array<{ order: number; title: string; body: string | null }>>();
+  for (const chunk of chunkIds(planIds)) {
+    const { results } = await db.prepare(
+      `SELECT plan_id AS planId, "order" AS "order", title, body FROM phases
+        WHERE plan_id IN (${chunk.map(() => '?').join(',')})
+        ORDER BY "order"`,
+    ).bind(...chunk).all<{ planId: string; order: number; title: string; body: string | null }>();
+    for (const r of results ?? []) {
+      const list = map.get(r.planId) ?? [];
+      list.push({ order: r.order, title: r.title, body: r.body });
+      map.set(r.planId, list);
+    }
+  }
+  return map;
 }
 
 async function latestValidations(
@@ -523,7 +676,9 @@ export async function getSupersession(
 
 /**
  * Project review inbox spanning tasks + plans + docs, grouped by primary cause.
- * Derives causes live (same as subjectFreshness) — no denormalized queue table.
+ * Derives causes live via computeFreshness (same evaluator as subjectFreshness) —
+ * no denormalized queue table. Related facts are batch-loaded (D1 ≤100 binds/statement)
+ * so pagination after evaluation stays exact without an N×queries-per-candidate loop.
  */
 export async function reviewInbox(
   db: D1Database,
@@ -542,12 +697,25 @@ export async function reviewInbox(
   const offset = Math.max(0, opts.offset ?? 0);
   const now = Date.now();
 
+  // Project dormancy once — entity overrides come in on the candidate rows.
+  const projectRow = await db.prepare(
+    'SELECT dormancy_quiet_seconds AS quietSeconds FROM projects WHERE id = ?',
+  ).bind(projectId).first<{ quietSeconds: number | null }>();
+  const projectQuiet = parseDormancyQuietSeconds(projectRow?.quietSeconds);
+
   // Candidate subjects: validation / open cause / supersession / drifted pins —
   // OR dormancy-eligible (effective threshold + quiet clock exceeded). never_validated alone
   // is still omitted unless another actionable cause (e.g. dormant) surfaces.
+  // Content timestamps + override quiet + fingerprint fields ride along so evaluation
+  // needs no per-subject subject/activity round-trips.
   const taskCandidates = await db.prepare(
-    `SELECT DISTINCT t.id AS id, t.key AS key, t.title AS title, 'task' AS subjectType
+    `SELECT DISTINCT t.id AS id, t.key AS key, t.title AS title, 'task' AS subjectType,
+            t.content_activity_at AS contentActivityAt, t.created_at AS createdAt,
+            edo.quiet_seconds AS overrideQuiet,
+            t.body AS body, t.execution_spec AS executionSpec, NULL AS currentVersion
        FROM tasks t
+       LEFT JOIN entity_dormancy_overrides edo
+         ON edo.project_id = t.project_id AND edo.subject_type = 'task' AND edo.subject_id = t.id
       WHERE t.project_id = ? AND t.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = t.id AND ev.subject_type = 'task')
@@ -558,13 +726,18 @@ export async function reviewInbox(
              WHERE td.task_id = t.id AND td.pinned_version IS NOT NULL
                AND d.current_version IS NOT NULL AND td.pinned_version != d.current_version
           )
-          OR ${dormancyCandidateSql('t', 'task')}
+          OR ${dormancyCandidateSql('t')}
         )`,
-  ).bind(projectId).all<{ id: string; key: string; title: string; subjectType: 'task' }>();
+  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const planCandidates = await db.prepare(
-    `SELECT DISTINCT p.id AS id, NULL AS key, p.title AS title, 'plan' AS subjectType
+    `SELECT DISTINCT p.id AS id, NULL AS key, p.title AS title, 'plan' AS subjectType,
+            p.content_activity_at AS contentActivityAt, p.created_at AS createdAt,
+            edo.quiet_seconds AS overrideQuiet,
+            p.body AS body, NULL AS executionSpec, NULL AS currentVersion
        FROM plans p
+       LEFT JOIN entity_dormancy_overrides edo
+         ON edo.project_id = p.project_id AND edo.subject_type = 'plan' AND edo.subject_id = p.id
       WHERE p.project_id = ? AND p.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = p.id AND ev.subject_type = 'plan')
@@ -575,21 +748,26 @@ export async function reviewInbox(
              WHERE pdr.plan_id = p.id AND pdr.pinned_version IS NOT NULL
                AND d.current_version IS NOT NULL AND pdr.pinned_version != d.current_version
           )
-          OR ${dormancyCandidateSql('p', 'plan')}
+          OR ${dormancyCandidateSql('p')}
         )`,
-  ).bind(projectId).all<{ id: string; key: string | null; title: string; subjectType: 'plan' }>();
+  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const docCandidates = await db.prepare(
-    `SELECT DISTINCT d.id AS id, NULL AS key, d.name AS title, 'doc' AS subjectType
+    `SELECT DISTINCT d.id AS id, NULL AS key, d.name AS title, 'doc' AS subjectType,
+            d.content_activity_at AS contentActivityAt, d.created_at AS createdAt,
+            edo.quiet_seconds AS overrideQuiet,
+            NULL AS body, NULL AS executionSpec, d.current_version AS currentVersion
        FROM docs d
+       LEFT JOIN entity_dormancy_overrides edo
+         ON edo.project_id = d.project_id AND edo.subject_type = 'doc' AND edo.subject_id = d.id
       WHERE d.project_id = ? AND d.archived_at IS NULL
         AND (
           EXISTS (SELECT 1 FROM entity_validations ev WHERE ev.subject_id = d.id AND ev.subject_type = 'doc')
           OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = d.id AND erc.subject_type = 'doc' AND erc.status = 'open')
           OR EXISTS (SELECT 1 FROM docs s WHERE s.supersedes_doc_id = d.id)
-          OR ${dormancyCandidateSql('d', 'doc')}
+          OR ${dormancyCandidateSql('d')}
         )`,
-  ).bind(projectId).all<{ id: string; key: string | null; title: string; subjectType: 'doc' }>();
+  ).bind(projectId, projectQuiet, projectQuiet).all<InboxCandidate>();
 
   const candidates = [
     ...(taskCandidates.results ?? []),
@@ -597,11 +775,85 @@ export async function reviewInbox(
     ...(docCandidates.results ?? []),
   ].filter((c) => !opts.subjectType || c.subjectType === opts.subjectType);
 
+  const taskIds = candidates.filter((c) => c.subjectType === 'task').map((c) => c.id);
+  const planIds = candidates.filter((c) => c.subjectType === 'plan').map((c) => c.id);
+  const docIds = candidates.filter((c) => c.subjectType === 'doc').map((c) => c.id);
+
+  const [
+    taskValidations,
+    planValidations,
+    docValidations,
+    taskPins,
+    planPins,
+    taskSuperseded,
+    planSuperseded,
+    docSuperseded,
+    taskCauses,
+    planCauses,
+    docCauses,
+    planPhases,
+  ] = await Promise.all([
+    batchValidationsBySubject(db, projectId, 'task', taskIds),
+    batchValidationsBySubject(db, projectId, 'plan', planIds),
+    batchValidationsBySubject(db, projectId, 'doc', docIds),
+    batchTaskDocPins(db, taskIds),
+    batchPlanDocPins(db, planIds),
+    batchSupersededBy(db, 'task', taskIds),
+    batchSupersededBy(db, 'plan', planIds),
+    batchSupersededBy(db, 'doc', docIds),
+    batchStoredCauses(db, projectId, 'task', taskIds),
+    batchStoredCauses(db, projectId, 'plan', planIds),
+    batchStoredCauses(db, projectId, 'doc', docIds),
+    batchPlanPhases(db, planIds),
+  ]);
+
   const items: ReviewInboxItem[] = [];
   const counts: Record<string, number> = {};
 
   for (const c of candidates) {
-    const freshness = await subjectFreshness(db, projectId, c.subjectType, c.id);
+    let fingerprint: string;
+    if (c.subjectType === 'task') {
+      fingerprint = await taskContentFingerprint(c.body, c.executionSpec);
+    } else if (c.subjectType === 'plan') {
+      fingerprint = await planContentFingerprint(c.body, planPhases.get(c.id) ?? []);
+    } else {
+      fingerprint = docFingerprint(c.currentVersion ?? 0);
+    }
+
+    const vals =
+      c.subjectType === 'task' ? (taskValidations.get(c.id) ?? [])
+        : c.subjectType === 'plan' ? (planValidations.get(c.id) ?? [])
+          : (docValidations.get(c.id) ?? []);
+    const latestAny = vals[0] ?? null;
+    const latestMatching = vals.find((r) => r.contentFingerprint === fingerprint) ?? null;
+    const docPins =
+      c.subjectType === 'task' ? (taskPins.get(c.id) ?? [])
+        : c.subjectType === 'plan' ? (planPins.get(c.id) ?? [])
+          : [];
+    const replacedBy =
+      c.subjectType === 'task' ? (taskSuperseded.get(c.id) ?? null)
+        : c.subjectType === 'plan' ? (planSuperseded.get(c.id) ?? null)
+          : (docSuperseded.get(c.id) ?? null);
+    const storedCauses =
+      c.subjectType === 'task' ? (taskCauses.get(c.id) ?? [])
+        : c.subjectType === 'plan' ? (planCauses.get(c.id) ?? [])
+          : (docCauses.get(c.id) ?? []);
+    const quietSeconds = parseDormancyQuietSeconds(c.overrideQuiet) ?? projectQuiet;
+
+    const freshness = computeFreshness({
+      subjectType: c.subjectType,
+      subjectId: c.id,
+      contentFingerprint: fingerprint,
+      latestMatching,
+      latestAny,
+      docPins,
+      supersededById: replacedBy,
+      storedCauses,
+      dormancyQuietSeconds: quietSeconds,
+      contentActivityAt: c.contentActivityAt,
+      createdAt: c.createdAt,
+    });
+
     // Inbox excludes pure never_validated+impact_unknown with no other signal — those flood.
     // Keep subjects that have content_changed, doc_baseline_moved, superseded, human_flagged,
     // or code_assessment_stale/dormant. never_validated alone is omitted unless human_flagged.

@@ -3,6 +3,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import { computeFreshness, dormancyActivityAt } from '../src/lib/entity-validation';
+import { reviewInbox, subjectFreshness } from '../src/lib/entity-validation-store';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
@@ -484,5 +485,265 @@ describe('opt-in dormancy (PLNR-585 / P1-G)', () => {
       'SELECT content_activity_at AS at FROM plans WHERE id = ?',
     ).bind(planId).first<{ at: string }>();
     expect(phaseChanged?.at).not.toBe(frozen);
+  });
+});
+
+/** Count D1 statement executions (prepare→all/first/run and each batch item). */
+function countingDb(db: D1Database): { db: D1Database; statements: () => number } {
+  let n = 0;
+  const wrapStmt = (stmt: D1PreparedStatement): D1PreparedStatement => new Proxy(stmt, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver);
+      if (prop === 'bind') {
+        return (...args: unknown[]) => wrapStmt((v as (...a: unknown[]) => D1PreparedStatement).apply(target, args));
+      }
+      if (prop === 'all' || prop === 'first' || prop === 'run' || prop === 'raw') {
+        return (...args: unknown[]) => {
+          n += 1;
+          return (v as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const wrapped = new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === 'prepare') {
+        return (sql: string) => wrapStmt(target.prepare(sql));
+      }
+      if (prop === 'batch') {
+        return (stmts: D1PreparedStatement[]) => {
+          n += stmts.length;
+          return target.batch(stmts);
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  return { db: wrapped, statements: () => n };
+}
+
+describe('reviewInbox batched freshness (PLNR-585 scale)', () => {
+  it('130 dormant tasks with limit:1 stays well under the D1 per-invocation query budget', async () => {
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BINB', name: 'inbox-batch-budget' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    const ms = proj.body.milestones[0].id as string;
+    const old = '2018-01-01T00:00:00.000Z';
+
+    // create_tasks max 100/call
+    for (const batch of [65, 65]) {
+      const created = await mcpCall(agent.apiKey, 'create_tasks', {
+        projectId: pid,
+        tasks: Array.from({ length: batch }, (_, i) => ({
+          title: `dormant backlog ${batch}-${i}`,
+          body: `body-${batch}-${i}`,
+          tags: ['lifecycle'],
+          milestoneId: ms,
+        })),
+      });
+      expect(created.body.failed).toBe(0);
+      const ids = (created.body.created as Array<{ id: string }>).map((t) => t.id);
+      for (const id of ids) {
+        await env.DB.prepare(
+          'UPDATE tasks SET content_activity_at = ?, created_at = ? WHERE id = ?',
+        ).bind(old, old, id).run();
+      }
+    }
+
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+
+    const { db, statements } = countingDb(env.DB);
+    const page = await reviewInbox(db, pid, { limit: 1 });
+    expect(page.items).toHaveLength(1);
+    expect(page.overallTotal).toBe(130);
+    // Pre-fix: ~3 + 8×130 ≈ 1043 (over paid D1 limit of 1000). Batched path must stay
+    // comfortably below that — a few dozen statements, not hundreds.
+    expect(statements()).toBeLessThan(80);
+    expect(statements()).toBeLessThan(1000);
+  }, 120000);
+
+  it('paginates mixed tasks/plans/docs without missing or duplicate subjects', async () => {
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BPAGE', name: 'inbox-batch-pages' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    const ms = proj.body.milestones[0].id as string;
+    const old = '2017-03-01T00:00:00.000Z';
+
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { title: 'page task a', body: 'a', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'page task b', body: 'b', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'page task c', body: 'c', tags: ['lifecycle'], milestoneId: ms },
+      ],
+    });
+    const taskIds = (task.body.created as Array<{ id: string }>).map((t) => t.id);
+    for (const id of taskIds) {
+      await env.DB.prepare('UPDATE tasks SET content_activity_at = ?, created_at = ? WHERE id = ?')
+        .bind(old, old, id).run();
+    }
+
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId: pid,
+      title: 'page plan',
+      body: 'plan',
+      phases: [{ title: 'P1', newTasks: [{ title: 'page plan task', tags: ['lifecycle'], milestoneId: ms }] }],
+    });
+    const planId = plan.body.id as string;
+    await env.DB.prepare('UPDATE plans SET content_activity_at = ?, created_at = ? WHERE id = ?')
+      .bind(old, old, planId).run();
+
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId: pid, name: 'Page settled fact', description: 'd', body: 'Settled.',
+    });
+    const docId = doc.body.id as string;
+    await env.DB.prepare('UPDATE docs SET content_activity_at = ?, created_at = ? WHERE id = ?')
+      .bind(old, old, docId).run();
+
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+
+    const seen = new Set<string>();
+    let offset = 0;
+    let pages = 0;
+    let overall = -1;
+    for (;;) {
+      const page = await reviewInbox(env.DB, pid, { cause: 'dormant', limit: 2, offset });
+      if (overall < 0) overall = page.overallTotal;
+      expect(page.overallTotal).toBe(overall);
+      for (const item of page.items) {
+        const key = `${item.subjectType}:${item.subjectId}`;
+        expect(seen.has(key)).toBe(false);
+        seen.add(key);
+      }
+      pages += 1;
+      if (page.nextOffset == null) break;
+      offset = page.nextOffset;
+      expect(pages).toBeLessThan(20);
+    }
+
+    expect(seen.size).toBe(overall);
+    expect(seen.has(`task:${taskIds[0]}`)).toBe(true);
+    expect(seen.has(`task:${taskIds[1]}`)).toBe(true);
+    expect(seen.has(`task:${taskIds[2]}`)).toBe(true);
+    expect(seen.has(`plan:${planId}`)).toBe(true);
+    expect(seen.has(`doc:${docId}`)).toBe(true);
+    // 3 aged tasks + plan + doc (phase-created task stays fresh — not aged).
+    expect(overall).toBe(5);
+    expect(pages).toBe(3); // limit 2 → 2+2+1
+  });
+
+  it('honors entity overrides, dismissed dormant, and recent validation that clears dormancy', async () => {
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BOVR', name: 'inbox-batch-overrides' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    const ms = proj.body.milestones[0].id as string;
+    const old = '2016-01-01T00:00:00.000Z';
+
+    const created = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { title: 'entity override dormant', body: 'ovr', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'dismissed dormant', body: 'dis', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'recently validated', body: 'val', tags: ['lifecycle'], milestoneId: ms },
+      ],
+    });
+    const [overrideId, dismissId, validatedId] = (created.body.created as Array<{ id: string }>).map((t) => t.id);
+    for (const id of [overrideId, dismissId, validatedId]) {
+      await env.DB.prepare('UPDATE tasks SET content_activity_at = ?, created_at = ? WHERE id = ?')
+        .bind(old, old, id).run();
+    }
+
+    // Project OFF — only entity override should surface dormant for overrideId.
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/dormancy/task/${overrideId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quietSeconds: 3600 }),
+    });
+
+    let inbox = await reviewInbox(env.DB, pid, { cause: 'dormant' });
+    expect(inbox.items.map((i) => i.subjectId)).toContain(overrideId);
+    expect(inbox.items.map((i) => i.subjectId)).not.toContain(dismissId);
+    expect(inbox.items.map((i) => i.subjectId)).not.toContain(validatedId);
+
+    // Enable project threshold; dismiss dormant on dismissId; validate validatedId freshly.
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId: pid, subjectType: 'task', subjectId: dismissId, cause: 'dormant', status: 'dismissed',
+    });
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId: pid, subjectType: 'task', subjectId: validatedId, note: 'fresh',
+    });
+
+    inbox = await reviewInbox(env.DB, pid, { cause: 'dormant' });
+    const ids = inbox.items.map((i) => i.subjectId);
+    expect(ids).toContain(overrideId);
+    expect(ids).not.toContain(dismissId);
+    expect(ids).not.toContain(validatedId);
+  });
+
+  it('batched inbox actionable causes match individual subjectFreshness for the same subjects', async () => {
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BEQ', name: 'inbox-batch-equiv' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    const ms = proj.body.milestones[0].id as string;
+    const old = '2015-05-05T00:00:00.000Z';
+
+    const tasks = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { title: 'eq dormant', body: 'd', tags: ['lifecycle'], milestoneId: ms },
+        { title: 'eq changed', body: 'before', tags: ['lifecycle'], milestoneId: ms },
+      ],
+    });
+    const [dormantId, changedId] = (tasks.body.created as Array<{ id: string }>).map((t) => t.id);
+    await env.DB.prepare('UPDATE tasks SET content_activity_at = ?, created_at = ? WHERE id = ?')
+      .bind(old, old, dormantId).run();
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId: pid, subjectType: 'task', subjectId: changedId, note: 'was good',
+    });
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId: pid, tasks: [{ taskId: changedId, set: { body: 'after' } }],
+    });
+
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId: pid,
+      title: 'eq plan',
+      body: 'p',
+      phases: [{ title: 'P1', newTasks: [{ title: 'eq plan task', tags: ['lifecycle'], milestoneId: ms }] }],
+    });
+    const planId = plan.body.id as string;
+    await env.DB.prepare('UPDATE plans SET content_activity_at = ?, created_at = ? WHERE id = ?')
+      .bind(old, old, planId).run();
+
+    await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+
+    const inbox = await reviewInbox(env.DB, pid, { limit: 100 });
+    expect(inbox.items.length).toBeGreaterThan(0);
+    for (const item of inbox.items) {
+      const fresh = await subjectFreshness(env.DB, pid, item.subjectType, item.subjectId);
+      const actionable = fresh.causes
+        .filter((c) => c.code !== 'never_validated' && c.code !== 'impact_unknown')
+        .map((c) => c.code)
+        .sort();
+      expect([...item.causes].sort()).toEqual(actionable);
+    }
   });
 });
