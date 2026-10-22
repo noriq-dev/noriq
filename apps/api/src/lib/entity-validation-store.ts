@@ -757,20 +757,33 @@ export async function reviewInbox(
   const clockIso = nowIso();
   const now = Date.parse(clockIso);
 
-  // Project dormancy once — entity overrides come in on the candidate rows.
+  // Project dormancy + inbox policy once — entity overrides come in on the candidate rows.
   const projectRow = await db.prepare(
-    'SELECT dormancy_quiet_seconds AS quietSeconds FROM projects WHERE id = ?',
-  ).bind(projectId).first<{ quietSeconds: number | null }>();
+    `SELECT dormancy_quiet_seconds AS quietSeconds,
+            inbox_include_never_validated AS includeNeverValidated
+       FROM projects WHERE id = ?`,
+  ).bind(projectId).first<{ quietSeconds: number | null; includeNeverValidated: number | null }>();
   const projectQuiet = parseDormancyQuietSeconds(projectRow?.quietSeconds);
+  // PLNR-597 / P2-F: opt-in (default off) so pure never_validated can enter the inbox.
+  const includeNeverValidated = !!projectRow?.includeNeverValidated;
 
   // Candidate subjects: validation / open|expired-snooze cause / supersession / drifted pins —
   // OR dormancy-eligible (effective threshold + quiet clock exceeded). never_validated alone
-  // is still omitted unless another actionable cause (e.g. dormant) surfaces.
+  // is still omitted unless the project opts in (or another actionable cause surfaces).
   // Content timestamps + override quiet + fingerprint fields ride along so evaluation
   // needs no per-subject subject/activity round-trips.
   // Active snoozes are omitted here; expired snoozes re-enter so causes resurface without
   // a new validation record (P2-C / PLNR-594).
   const causeActive = reviewCauseActiveSql('erc', '?');
+  // When opted in, also pull subjects with no validation row (pure never_validated).
+  const neverValidatedCandidate = (alias: string, subjectType: string) => (
+    includeNeverValidated
+      ? `OR NOT EXISTS (
+           SELECT 1 FROM entity_validations ev
+            WHERE ev.subject_id = ${alias}.id AND ev.subject_type = '${subjectType}'
+         )`
+      : ''
+  );
   const taskCandidates = await db.prepare(
     `SELECT DISTINCT t.id AS id, t.key AS key, t.title AS title, 'task' AS subjectType,
             t.content_activity_at AS contentActivityAt, t.created_at AS createdAt,
@@ -790,6 +803,7 @@ export async function reviewInbox(
                AND d.current_version IS NOT NULL AND td.pinned_version != d.current_version
           )
           OR ${dormancyCandidateSql('t')}
+          ${neverValidatedCandidate('t', 'task')}
         )`,
   ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
@@ -812,6 +826,7 @@ export async function reviewInbox(
                AND d.current_version IS NOT NULL AND pdr.pinned_version != d.current_version
           )
           OR ${dormancyCandidateSql('p')}
+          ${neverValidatedCandidate('p', 'plan')}
         )`,
   ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
@@ -829,6 +844,7 @@ export async function reviewInbox(
           OR EXISTS (SELECT 1 FROM entity_review_causes erc WHERE erc.subject_id = d.id AND erc.subject_type = 'doc' AND ${causeActive})
           OR EXISTS (SELECT 1 FROM docs s WHERE s.supersedes_doc_id = d.id)
           OR ${dormancyCandidateSql('d')}
+          ${neverValidatedCandidate('d', 'doc')}
         )`,
   ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
@@ -920,9 +936,13 @@ export async function reviewInbox(
 
     // Inbox excludes pure never_validated+impact_unknown with no other signal — those flood.
     // Keep subjects that have content_changed, doc_baseline_moved, superseded, human_flagged,
-    // or code_assessment_stale/dormant. never_validated alone is omitted unless human_flagged.
-    const actionable = freshness.causes.filter((x) =>
-      x.code !== 'never_validated' && x.code !== 'impact_unknown');
+    // or code_assessment_stale/dormant. never_validated alone is omitted unless the project
+    // opts in (PLNR-597 / inboxIncludeNeverValidated). impact_unknown stays omitted either way.
+    const actionable = freshness.causes.filter((x) => {
+      if (x.code === 'impact_unknown') return false;
+      if (x.code === 'never_validated') return includeNeverValidated;
+      return true;
+    });
     if (!actionable.length) continue;
 
     for (const cause of actionable) {

@@ -1,5 +1,6 @@
 // Project-local settings (PLNR-401). Account settings remain in SettingsView.
 // PLNR-595: dormancyQuietSeconds control (opt-in dormant review cause — never auto-close).
+// PLNR-597: inboxIncludeNeverValidated toggle (opt-in never_validated inbox — impact_unknown stays out).
 import { useEffect, useState, type ReactNode } from 'react';
 import { DORMANCY_QUIET_SECONDS_MAX, DORMANCY_QUIET_SECONDS_MIN } from '@noriq-dev/shared';
 import { api, type ApiUser } from '../api';
@@ -51,6 +52,7 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
   const project = store.data.projects.find((item) => item.id === store.currentPid);
   const claimTtlSeconds = store.snapshot?.project.claimTtlSeconds ?? 1800;
   const snapshotDormancy = store.snapshot?.project.dormancyQuietSeconds ?? null;
+  const snapshotIncludeNeverValidated = !!store.snapshot?.project.inboxIncludeNeverValidated;
   const [name, setName] = useState(project?.name ?? '');
   const [description, setDescription] = useState(project?.phase ?? '');
   const [groupId, setGroupId] = useState(project?.groupId ?? '');
@@ -60,6 +62,7 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
   const [dormancyCustomDays, setDormancyCustomDays] = useState(() => (
     snapshotDormancy != null && snapshotDormancy > 0 ? daysFromSeconds(snapshotDormancy) : '30'
   ));
+  const [includeNeverValidated, setIncludeNeverValidated] = useState(snapshotIncludeNeverValidated);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -69,6 +72,9 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
   const [dormancySaving, setDormancySaving] = useState(false);
   const [dormancySaved, setDormancySaved] = useState(false);
   const [dormancyError, setDormancyError] = useState<string | null>(null);
+  const [inboxPolicySaving, setInboxPolicySaving] = useState(false);
+  const [inboxPolicySaved, setInboxPolicySaved] = useState(false);
+  const [inboxPolicyError, setInboxPolicyError] = useState<string | null>(null);
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [access, setAccess] = useState<ProjectAccess | null>(null);
   const [accessLoading, setAccessLoading] = useState(false);
@@ -111,6 +117,12 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
     setDormancySaved(false);
     setDormancyError(null);
   }, [project?.id, snapshotDormancy]);
+
+  useEffect(() => {
+    setIncludeNeverValidated(snapshotIncludeNeverValidated);
+    setInboxPolicySaved(false);
+    setInboxPolicyError(null);
+  }, [project?.id, snapshotIncludeNeverValidated]);
 
   if (!project) return null;
 
@@ -205,6 +217,21 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
     }
   };
 
+  const saveInboxPolicy = async () => {
+    if (!canManage) return;
+    setInboxPolicySaving(true);
+    setInboxPolicySaved(false);
+    setInboxPolicyError(null);
+    try {
+      await store.actions.submitProjectMeta({ inboxIncludeNeverValidated: includeNeverValidated });
+      setInboxPolicySaved(true);
+    } catch (error) {
+      setInboxPolicyError(error instanceof Error ? error.message : 'Could not save inbox policy.');
+    } finally {
+      setInboxPolicySaving(false);
+    }
+  };
+
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '24px 26px 48px' }}>
       <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -255,6 +282,38 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
               {saved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Saved</span>}
               <ErrorNote>{saveError}</ErrorNote>
               <Button disabled={saving || !name.trim()} onClick={saveGeneral}>{saving ? 'Saving…' : 'Save changes'}</Button>
+            </div>
+          )}
+        </SettingsSection>
+
+        <SettingsSection
+          title="Validity inbox"
+          description="By default the Review → Validity inbox omits subjects whose only signals are never_validated or impact_unknown (flood control). Opt in to surface pure never_validated; impact_unknown stays omitted."
+        >
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, color: 'var(--text-soft)', cursor: canManage ? 'pointer' : 'default' }}>
+            <input
+              aria-label="Include never_validated in Validity inbox"
+              type="checkbox"
+              checked={includeNeverValidated}
+              disabled={!canManage}
+              onChange={(event) => {
+                setIncludeNeverValidated(event.target.checked);
+                setInboxPolicySaved(false);
+              }}
+              style={{ width: 'auto', marginTop: 2 }}
+            />
+            <span style={{ fontSize: 12.5, lineHeight: 1.45 }}>
+              Include never_validated subjects
+              <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', marginTop: 2 }}>
+                Off by default. Does not change the hard claim gate — never_validated stays advisory.
+              </span>
+            </span>
+          </label>
+          {canManage && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
+              {inboxPolicySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Inbox policy saved</span>}
+              <ErrorNote>{inboxPolicyError}</ErrorNote>
+              <Button disabled={inboxPolicySaving} onClick={() => void saveInboxPolicy()}>{inboxPolicySaving ? 'Saving…' : 'Save inbox policy'}</Button>
             </div>
           )}
         </SettingsSection>

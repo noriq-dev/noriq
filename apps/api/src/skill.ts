@@ -99,7 +99,7 @@ Noriq reuses one \`session_copilot\` per agent run.
 ## Tool availability
 
 Every OAuth copilot session receives the full coordination catalog on every connection — catalog
-revision 4 contains 64 tools. There are no optional packs to enable, and \`configure_agent\`
+revision 5 contains 64 tools. There are no optional packs to enable, and \`configure_agent\`
 never changes tool availability. Do not reconnect just to expand the catalog. A visible tool is
 capability, not authorization; project roles, token scope, and server-side validation still
 govern each call.
@@ -116,12 +116,16 @@ govern each call.
    re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
    Identify the task by either its opaque \`task_…\` id or its \`PLN-##\` display key (both
    resolve), and pass \`projectId\` on every call. The response includes any open comments —
-   read them first.
+   read them first. Critical freshness causes (\`content_changed\`, \`doc_baseline_moved\`)
+   hard-block the claim; optionally pass \`repositoryKey\`/\`branch\`/\`baseId\` so the claim
+   response can include advisory \`code_assessment_stale\` without blocking.
    Then call \`get_task_context\` before non-trivial work so the task, settled docs, relevant
    memory, prior episodes, graph neighborhood, and uncertainty arrive as one bounded pack. Pass
    the canonical \`repositoryKey\`, current \`branch\`, and current opaque \`baseId\` when known;
    without them, source excerpts and citation verification may truthfully report incomplete
-   coverage.
+   coverage. After you change subject content (task body/executionSpec, plan body/phases, doc
+   body), call \`record_validation\` once you re-confirm it still holds — comments/title/tags
+   do not renew validity. \`get_plans\` / \`get_doc\` already embed freshness like \`get_task\`.
 4. If the project has file locking on (\`get_project\` → \`project.fileLocking\`),
    \`acquire_lock\` every path your edit touches **before** you touch it — see the file-locks
    reference (\`GET /skill/file-locks.md\` or \`noriq://skill/file-locks\`). On a locking

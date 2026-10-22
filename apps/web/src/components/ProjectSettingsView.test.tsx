@@ -23,14 +23,19 @@ const access = {
   canTransferOwnership: true,
 };
 
-function fakeStore({ canManage = true, canOwn = true, dormancyQuietSeconds = null as number | null } = {}) {
+function fakeStore({
+  canManage = true,
+  canOwn = true,
+  dormancyQuietSeconds = null as number | null,
+  inboxIncludeNeverValidated = false,
+} = {}) {
   return {
     currentPid: 'prj_alpha',
     data: { projects: [{
       id: 'prj_alpha', key: 'ALPHA', name: 'Alpha Project', phase: 'Initial description', groupId: 'grp_1',
       isPublic: false, effectiveRole: canOwn ? 'owner' : canManage ? 'manager' : 'viewer',
     }] },
-    snapshot: { project: { claimTtlSeconds: 1800, dormancyQuietSeconds } },
+    snapshot: { project: { claimTtlSeconds: 1800, dormancyQuietSeconds, inboxIncludeNeverValidated } },
     groups: [{ id: 'grp_1', name: 'Product', canEdit: 1 }],
     permissions: {
       canManage, canOwn, canCreateGroups: false,
@@ -154,6 +159,26 @@ describe('ProjectSettingsView (PLNR-401)', () => {
     expect(container.textContent).toContain('Dormancy saved');
   });
 
+  it('saves inboxIncludeNeverValidated via the existing meta PATCH (PLNR-597)', async () => {
+    vi.spyOn(api, 'projectAccess').mockResolvedValue(access);
+    vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
+    const store = fakeStore();
+    render(<ProjectSettingsView store={store} />);
+    await tick();
+
+    expect(container.textContent).toContain('Validity inbox');
+    const toggle = container.querySelector<HTMLInputElement>('[aria-label="Include never_validated in Validity inbox"]')!;
+    expect(toggle.checked).toBe(false);
+    act(() => toggle.click());
+
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Save inbox policy')!;
+    await act(async () => { save.click(); });
+
+    expect(store.actions.submitProjectMeta).toHaveBeenCalledWith({ inboxIncludeNeverValidated: true });
+    expect(container.textContent).toContain('Inbox policy saved');
+  });
+
   it('clears dormancy back to null (off) when Off is selected', async () => {
     vi.spyOn(api, 'projectAccess').mockResolvedValue(access);
     vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
@@ -183,8 +208,10 @@ describe('ProjectSettingsView (PLNR-401)', () => {
     expect(container.querySelector<HTMLInputElement>('[aria-label="Project name"]')!.disabled).toBe(true);
     expect(container.querySelector<HTMLInputElement>('[aria-label="Public read-only page"]')!.disabled).toBe(true);
     expect(container.querySelector<HTMLButtonElement>('[aria-label="Dormancy quiet period"]')!.disabled).toBe(true);
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Include never_validated in Validity inbox"]')!.disabled).toBe(true);
     expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'Save changes')).toBe(false);
     expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'Save dormancy')).toBe(false);
+    expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'Save inbox policy')).toBe(false);
     expect(container.textContent).not.toContain('Danger zone');
     expect(accessSpy).not.toHaveBeenCalled();
     expect(usersSpy).not.toHaveBeenCalled();
