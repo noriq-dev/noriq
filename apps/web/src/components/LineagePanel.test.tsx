@@ -69,7 +69,7 @@ describe('contextual Lineage', () => {
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
     act(() => root!.render(<LineagePanel projectId="project_1" orchestrationId="orc_1" onOpenJob={openJob} />));
     await tick();
-    const button = [...container.querySelectorAll('button')].find((candidate) => candidate.textContent === 'Open job')!;
+    const button = [...container.querySelectorAll('button')].find((candidate) => candidate.textContent === 'Search archived job')!;
     act(() => button.click());
     expect(openJob).toHaveBeenCalledWith('job_1');
   });

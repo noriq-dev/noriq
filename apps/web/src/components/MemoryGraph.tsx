@@ -245,10 +245,10 @@ function CoverageNote({ coverage }: { coverage: ApiGraphCoverage }) {
   if (coverage.complete) return null;
   const lines: string[] = [];
   if (coverage.reasons.includes('seed-not-found')) {
-    lines.push('No node matches this seed yet — it may not have been indexed or created in the graph.');
+    lines.push('No node matches this seed yet — it may not exist in the Project Memory graph.');
   }
   if (coverage.reasons.includes('code-graph-empty')) {
-    lines.push('This project has no repository index yet (the common case today). This graph cannot answer that yet — that is not the same claim as "nothing is related".');
+    lines.push('No repository file/symbol entities in this graph — Noriq does not ingest git checkouts; local agents own code understanding. This graph cannot answer that yet — that is not the same claim as "nothing is related".');
   }
   if (coverage.reasons.includes('no-writer-yet')) {
     lines.push(`No relationship of type ${coverage.edgeTypesWithNoWriter?.join(', ') ?? '(unknown)'} has ever been recorded in this project — absence here is not evidence of absence.`);

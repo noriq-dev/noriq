@@ -78,7 +78,7 @@ describe('the four honest states', () => {
     }));
     mount();
     await tick();
-    expect(text()).toMatch(/no repository index yet/i);
+    expect(text()).toMatch(/does not ingest git checkouts/i);
     expect(text()).not.toMatch(/nothing has been recorded/i);
   });
 

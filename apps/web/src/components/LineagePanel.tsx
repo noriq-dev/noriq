@@ -177,7 +177,7 @@ function LineageDetail({ tree, mode, setMode, selectedExecutionId, onSelectExecu
         <div className="lineage-list-meta">{tree.orchestration.id} · {tree.nodes.length} canonical nodes · created by {tree.orchestration.createdByName ?? tree.orchestration.createdById}</div>
       </div>
       <div style={{ flex: 1 }} />
-      {tree.orchestration.runnerJobId && onOpenJob && <Button variant="ghost" onClick={() => onOpenJob(tree.orchestration.runnerJobId!)}>Open job</Button>}
+      {tree.orchestration.runnerJobId && onOpenJob && <Button variant="ghost" onClick={() => onOpenJob(tree.orchestration.runnerJobId!)}>Search archived job</Button>}
       <Button variant={mode === 'hierarchy' ? 'primary' : 'ghost'} onClick={() => setMode('hierarchy')}>Hierarchy</Button>
       <Button variant={mode === 'timeline' ? 'primary' : 'ghost'} onClick={() => setMode('timeline')}>Audit timeline</Button>
     </div>

@@ -119,9 +119,12 @@ describe('Project Intelligence surface (PLNR-302)', () => {
     expect(container.textContent).toContain('insufficient evidence');
     expect(container.textContent).toContain('fewer than two comparable strategy cohorts');
     expect(api.projectIntelligence).toHaveBeenCalledWith('prj_1', expect.objectContaining({
-      caseLimit: 24, groupBy: 'executed_workflow', scope: 'runner_job_tasks',
+      caseLimit: 24, groupBy: 'executed_workflow', scope: 'copilot_claims',
       comparison: { dimension: 'workflow', metric: 'run_success' },
     }));
+    expect(container.textContent).toContain('ARCHIVED RUNNER CAPACITY');
+    expect(container.textContent).toContain('Historical RunnerJob summaries');
+    expect(container.textContent).not.toMatch(/(?<!ARCHIVED )RUNNER CAPACITY/);
   });
 
   it('opens canonical lineage inside Intelligence and restores it in query state', async () => {

@@ -844,7 +844,7 @@ export function MemoryStarMap({
               <div style={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 380, padding: '9px 12px', borderRadius: 10, background: 'rgba(245,166,35,.08)', border: '1px solid rgba(245,166,35,.3)' }}>
                 {isUnindexed && (
                   <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5 }}>
-                    No repository index yet — this map shows coordination and memory entities only. That is not the same claim as "nothing is related".
+                    No repository file/symbol entities here — Noriq does not ingest git checkouts; this map shows coordination and Project Memory only. That is not the same claim as "nothing is related".
                   </div>
                 )}
                 {isTruncated && (

@@ -29,7 +29,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const pid = store.currentPid;
   const [days, setDays] = useState(30);
   const [groupBy, setGroupBy] = useState<ApiIntelligenceDimension>('executed_workflow');
-  const [scope, setScope] = useState<ApiIntelligenceScope>('runner_job_tasks');
+  const [scope, setScope] = useState<ApiIntelligenceScope>('copilot_claims');
   const [dimension, setDimension] = useState<ApiStrategyDimension>('workflow');
   const [metric, setMetric] = useState<ApiComparisonMetric>('run_success');
   const [packet, setPacket] = useState<ApiProjectIntelligence | null>(null);
@@ -108,8 +108,8 @@ export function IntelligenceView({ store }: { store: AppStore }) {
       <header style={{ display: 'flex', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 16 }}>
         <div style={{ flex: 1, minWidth: phone ? '100%' : 260 }}>
           <SectionLabel>Project Intelligence</SectionLabel>
-          <h1 style={{ fontSize: 22, margin: '5px 0 4px' }}>Execution evidence, live flow, and capacity</h1>
-          <div style={{ ...mono, lineHeight: 1.5 }}>Live coordination and historical evidence are shown on separate clocks. Values marked unavailable are never inferred as zero.</div>
+          <h1 style={{ fontSize: 22, margin: '5px 0 4px' }}>Coordination evidence and live flow</h1>
+          <div style={{ ...mono, lineHeight: 1.5 }}>Live coordination and historical Copilot/claim evidence are shown on separate clocks. Archived runner history stays readable but is not a live dispatch surface. Values marked unavailable are never inferred as zero.</div>
         </div>
         <label style={{ ...mono, flex: phone ? 1 : undefined }}>Range
           <Select variant={phone ? 'micro' : undefined} aria-label="Analytics range" value={days} onChange={(e) => setDays(Number(e.target.value))} style={{ marginTop: 5, minWidth: phone ? 0 : 110, width: phone ? '100%' : undefined }}>
@@ -124,10 +124,10 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         </label>
         <label style={{ ...mono, flex: phone ? '1 1 100%' : undefined }}>Evidence scope
           <Select variant={phone ? 'micro' : undefined} aria-label="Evidence scope" value={scope} onChange={(e) => setScope(e.target.value as ApiIntelligenceScope)} style={{ marginTop: 5, minWidth: phone ? 0 : 180, width: phone ? '100%' : undefined }}>
-            <option value="runner_job_tasks">RunnerJob tasks</option>
-            <option value="runner_runs">Legacy Runs</option>
             <option value="copilot_claims">Copilot claims</option>
             <option value="all">All task episodes</option>
+            <option value="runner_job_tasks">Historical RunnerJob tasks</option>
+            <option value="runner_runs">Legacy Runs</option>
           </Select>
         </label>
       </header>
@@ -161,7 +161,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           <EvidenceCard title="Task readiness" primary={`${packet.live.readiness.readyTasks} ready`} details={`${packet.live.readiness.inProgressTasks} active · ${packet.live.readiness.blockedTasks} blocked · ${packet.live.readiness.reviewTasks} review`} />
           <EvidenceCard title="Execution flow" primary={`${packet.live.execution.activeNodes} live nodes`} details={`${packet.live.execution.parkedNodes} parked · ${sum(packet.live.execution.runStatuses)} runs`} action={<Button variant="ghost" onClick={() => openLineage(null, null)}>Open lineage</Button>} />
           <EvidenceCard title="Coordination" primary={`${packet.live.coordination.activeClaims} claims`} details={`${packet.live.coordination.activeLocks} active file locks`} />
-          <EvidenceCard title="Runner capacity" primary={packet.live.runners.capacity.freeSlots == null ? 'unavailable' : `${packet.live.runners.capacity.freeSlots} free slots`} details={packet.live.runners.capacity.maxConcurrency == null ? `${packet.live.runners.capacity.reportedRunners} reporting runners` : `${packet.live.runners.capacity.busySlots} busy of ${packet.live.runners.capacity.maxConcurrency} · ${packet.live.runners.capacity.completeness}`} />
+          <EvidenceCard title="Archived runner capacity" primary={packet.live.runners.capacity.freeSlots == null ? 'unavailable' : `${packet.live.runners.capacity.freeSlots} free slots`} details={packet.live.runners.capacity.maxConcurrency == null ? `${packet.live.runners.capacity.reportedRunners} historical runner row(s) — dispatch UI removed` : `${packet.live.runners.capacity.busySlots} busy of ${packet.live.runners.capacity.maxConcurrency} · ${packet.live.runners.capacity.completeness} · archived`} />
           <EvidenceCard title="Plan gates" primary={`${packet.live.plans.phaseGateStatuses.pending ?? 0} pending`} details={`${packet.live.plans.phasesWithoutGate} phases without gate · ${packet.live.plans.landings.owed} landings owed`} />
           <EvidenceCard title="Analytics freshness" primary={packet.analytics.freshness.state.replace('_', ' ')} details={`${packet.analytics.freshness.label}. Generation: ${fmtDate(packet.analytics.freshness.generationCompletedAt)}`} />
         </div>
@@ -169,17 +169,17 @@ export function IntelligenceView({ store }: { store: AppStore }) {
 
       <section aria-labelledby="runner-job-intelligence" style={{ marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-          <h2 id="runner-job-intelligence" style={{ fontSize: 14, margin: 0 }}>RunnerJob permanent summaries</h2>
-          <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8}>JOB + TASK DENOMINATORS</MonoTag>
-          <span style={mono}>job overhead is never allocated to tasks</span>
+          <h2 id="runner-job-intelligence" style={{ fontSize: 14, margin: 0 }}>Historical RunnerJob summaries</h2>
+          <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={8}>ARCHIVED</MonoTag>
+          <span style={mono}>read-only history — runner dispatch is not a live product surface</span>
         </div>
         {!runnerHistory || !runnerHistory.jobs.length
-          ? <State inline title="No RunnerJob summaries in this range" detail="Summaries appear after a terminal job projects its task episodes." />
+          ? <State inline title="No historical RunnerJob summaries in this range" detail="Runner dispatch is archived. New execution evidence comes from Copilot claims and Project Memory episodes." />
           : <>
             <div className="intelligence-grid" style={{ marginBottom: 10 }}>
-              <EvidenceCard title="Jobs" primary={`${runnerHistory.jobs.length}`} details="One permanent record per dispatched task or plan job." />
-              <EvidenceCard title="Task episodes" primary={`${runnerHistory.tasks.length}`} details="One task-scoped historical case per RunnerJob snapshot task." />
-              <EvidenceCard title="Projection coverage" primary={`${runnerHistory.jobs.reduce((sum, job) => sum + job.taskEpisodeCount, 0)}/${runnerHistory.jobs.reduce((sum, job) => sum + job.taskCount, 0)}`} details={runnerHistory.truncated ? 'Latest 100 jobs shown; range is truncated.' : 'Projected task episodes / commissioned tasks.'} />
+              <EvidenceCard title="Historical jobs" primary={`${runnerHistory.jobs.length}`} details="One permanent record per formerly dispatched task or plan job." />
+              <EvidenceCard title="Task episodes" primary={`${runnerHistory.tasks.length}`} details="One task-scoped historical case per archived RunnerJob snapshot task." />
+              <EvidenceCard title="Projection coverage" primary={`${runnerHistory.jobs.reduce((sum, job) => sum + job.taskEpisodeCount, 0)}/${runnerHistory.jobs.reduce((sum, job) => sum + job.taskCount, 0)}`} details={runnerHistory.truncated ? 'Latest 100 historical jobs shown; range is truncated.' : 'Projected task episodes / commissioned tasks.'} />
             </div>
             <div className="intelligence-groups">
               {runnerHistory.jobs.slice(0, 8).map((job) => {
@@ -215,7 +215,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           ? <State inline title="No complete analytics generation" detail={`${historical.reason}. Live coordination above remains available.`} />
           : <>
             {!historical.result.coverage.complete && <Coverage reasons={historical.result.coverage.reasons} />}
-            {!groups.length ? <State inline title="No historical cases in this range" detail="The dashboard remains useful for live readiness and capacity while execution evidence accumulates." />
+            {!groups.length ? <State inline title="No historical cases in this range" detail="The dashboard remains useful for live readiness while Copilot claim and Project Memory evidence accumulates." />
               : <div className="intelligence-groups">{groups.map((group) => <GroupCard key={`${group.dimension}:${group.value}`} group={group} onOpen={(item) => openLineage(item.orchestrationId, item.executionId) } />)}</div>}
           </>}
       </section>
@@ -240,7 +240,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         <h2 id="case-intelligence" style={{ fontSize: 14, margin: '0 0 8px' }}>Canonical case drill-down</h2>
         <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
           {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => { const runnerJobId = item.runId.startsWith('runner_job:') ? item.runId.split(':')[1] ?? null : null; return <div key={item.episodeId} className="intelligence-case">
-            <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>{runnerJobId ? 'RunnerJob task episode' : `Run ${item.runId} · sitting ${item.sitting}`}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
+            <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>{runnerJobId ? 'Historical RunnerJob episode' : `Task episode · ${item.runId} · sitting ${item.sitting}`}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
             {item.orchestrationId && <Button variant="ghost" onClick={() => openLineage(item.orchestrationId, item.executionId)}>Lineage</Button>}
             <Button variant="ghost" onClick={() => openMemory({ q: runnerJobId ?? item.episodeId })}>Evidence</Button>
           </div>; })}
