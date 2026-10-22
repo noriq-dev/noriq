@@ -6,6 +6,10 @@
 // PLNR-580 / PLNR-583: also hosts the validity / decay inbox (tasks + plans + docs).
 // Group by cause (default) or entity type; Validate, dismiss cause, Supersede…
 // via existing REST. No auto-close.
+//
+// PLNR-588 / P1-I: Memory review embeds under the same Review chrome (shared tabs +
+// filter chips). Memory authority / approve-reject stay on the memory APIs — no
+// schema merge with entity validation.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api,
@@ -22,12 +26,21 @@ import { SpecView } from './ExecutionSpec';
 import type { AppStore } from '../store';
 import type { TaskVM } from '../types';
 import { MonoTag, SectionLabel } from './bits';
+import { MemoryReview } from './MemoryReview';
 import { PlanSearchSelect } from './PlanSearchSelect';
+import {
+  InboxEmptyState,
+  InboxFilterChips,
+  InboxLoading,
+  readReviewShellTab,
+  ReviewTabButton,
+  type ReviewShellTab,
+} from './ReviewInboxChrome';
 import { TaskSearchSelect } from './TaskSearchSelect';
 import { Button } from './ui';
 import { Markdown } from './Markdown';
 
-type Tab = 'work' | 'validity';
+type Tab = ReviewShellTab;
 
 const CAUSES: Array<{ id: ApiReviewCause; label: string; detail: string; color: string }> = [
   { id: 'content_changed', label: 'Content changed', detail: 'Fingerprint moved past last validation', color: 'var(--red-soft)' },
@@ -50,21 +63,40 @@ const emptyInbox = (groupBy: ApiEntityReviewGroupBy = 'cause'): ApiEntityReviewI
 
 export function ReviewView({ store }: { store: AppStore }) {
   const { currentPid, helpers } = store;
-  const [tab, setTab] = useState<Tab>('work');
+  const [tab, setTab] = useState<Tab>(readReviewShellTab);
+  const [memoryCount, setMemoryCount] = useState<number | null>(null);
   const queue = helpers
     .tasksOf(currentPid)
     .filter((t) => t.status === 'review' && !t.archivedAt);
 
+  useEffect(() => {
+    let cancelled = false;
+    setMemoryCount(null);
+    void api.memoryReviewQueue(currentPid, { limit: 1 }).then((q) => {
+      if (!cancelled) setMemoryCount(q.overallTotal);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [currentPid]);
+
+  const openMemoryInspector = (uri: string) => {
+    const id = uri.startsWith('noriq://memory/') ? uri.slice('noriq://memory/'.length) : uri;
+    try { sessionStorage.setItem('noriq.openMemory', id); } catch { /* optional */ }
+    store.actions.setView('memory');
+  };
+
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '18px 22px' }}>
       <div style={{ maxWidth: 920, margin: '0 auto' }}>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-          <TabButton active={tab === 'work'} onClick={() => setTab('work')}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 16 }} role="tablist" aria-label="Review queues">
+          <ReviewTabButton active={tab === 'work'} onClick={() => setTab('work')}>
             Work review · {queue.length}
-          </TabButton>
-          <TabButton active={tab === 'validity'} onClick={() => setTab('validity')}>
+          </ReviewTabButton>
+          <ReviewTabButton active={tab === 'validity'} onClick={() => setTab('validity')}>
             Validity
-          </TabButton>
+          </ReviewTabButton>
+          <ReviewTabButton active={tab === 'memory'} onClick={() => setTab('memory')}>
+            Memory{memoryCount != null && memoryCount > 0 ? ` · ${memoryCount}` : ''}
+          </ReviewTabButton>
         </div>
 
         {tab === 'work' && (
@@ -80,34 +112,24 @@ export function ReviewView({ store }: { store: AppStore }) {
                 <ReviewRow key={t.id} task={t} store={store} />
               ))}
               {!queue.length && (
-                <div style={{ padding: 48, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                  queue clear — nothing waiting on you
-                </div>
+                <InboxEmptyState>queue clear — nothing waiting on you</InboxEmptyState>
               )}
             </div>
           </>
         )}
 
         {tab === 'validity' && <ValidityInbox store={store} />}
+        {tab === 'memory' && (
+          <MemoryReview
+            pid={currentPid}
+            store={store}
+            chrome="review"
+            onOpenInspector={openMemoryInspector}
+            onQueueChange={setMemoryCount}
+          />
+        )}
       </div>
     </div>
-  );
-}
-
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        cursor: 'pointer', padding: '7px 14px', borderRadius: 8, fontSize: 12.5, fontWeight: 600,
-        background: active ? 'var(--w-1)' : 'var(--w-04)',
-        border: `1px solid ${active ? 'var(--accent)' : 'var(--w-08)'}`,
-        color: active ? 'var(--text)' : 'var(--text-dim)',
-      }}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -262,58 +284,28 @@ function ValidityInbox({ store }: { store: AppStore }) {
       </div>
 
       {groupBy === 'cause' ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 18 }}>
-          {CAUSES.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setCause(cause === item.id ? undefined : item.id)}
-              style={{
-                cursor: 'pointer', textAlign: 'left', padding: '11px 12px', borderRadius: 10,
-                background: cause === item.id ? 'var(--w-1)' : 'var(--w-04)',
-                border: `1px solid ${cause === item.id ? item.color : 'var(--w-08)'}`,
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
-                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 15 }}>{inbox.counts[item.id] ?? 0}</span>
-              </div>
-              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
-            </button>
-          ))}
-        </div>
+        <InboxFilterChips
+          options={CAUSES}
+          selected={cause}
+          counts={inbox.counts}
+          onSelect={setCause}
+        />
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 18 }}>
-          {ENTITY_TYPES.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setSubjectType(subjectType === item.id ? undefined : item.id)}
-              style={{
-                cursor: 'pointer', textAlign: 'left', padding: '11px 12px', borderRadius: 10,
-                background: subjectType === item.id ? 'var(--w-1)' : 'var(--w-04)',
-                border: `1px solid ${subjectType === item.id ? item.color : 'var(--w-08)'}`,
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
-                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 15 }}>
-                  {entityCounts[item.id]}
-                </span>
-              </div>
-              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
-            </button>
-          ))}
-        </div>
+        <InboxFilterChips
+          options={ENTITY_TYPES}
+          selected={subjectType}
+          counts={entityCounts}
+          onSelect={setSubjectType}
+        />
       )}
 
       {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: 12 }}>{error}</div>}
       {!loading && inbox.items.length === 0 && (
-        <div style={{ padding: 40, border: '1px dashed var(--w-12)', borderRadius: 12, textAlign: 'center', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 11 }}>
+        <InboxEmptyState>
           nothing needs validity review
           {groupBy === 'cause' && cause ? ' for this cause' : ''}
           {groupBy === 'entity' && subjectType ? ` for ${subjectType}s` : ''}
-        </div>
+        </InboxEmptyState>
       )}
 
       <div style={{ display: 'grid', gap: 16 }}>
@@ -344,11 +336,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
           </div>
         ))}
       </div>
-      {loading && (
-        <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 11 }}>
-          Loading validity inbox…
-        </div>
-      )}
+      {loading && <InboxLoading label="Loading validity inbox…" />}
       {!loading && inbox.nextOffset != null && (
         <div style={{ textAlign: 'center', marginTop: 16 }}>
           <Button variant="ghost" onClick={() => void load(true)}>Load more</Button>

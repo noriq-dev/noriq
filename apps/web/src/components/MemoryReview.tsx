@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, type ApiMemoryReviewQueue, type ApiMemoryReviewQueueItem, type ApiMemoryReviewReason } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
+import { InboxEmptyState, InboxFilterChips, InboxLoading, type InboxFilterOption } from './ReviewInboxChrome';
 import { Button, TextArea } from './ui';
 
-const REASONS: Array<{ id: ApiMemoryReviewReason; label: string; detail: string; color: string }> = [
+export const MEMORY_REVIEW_REASONS: Array<InboxFilterOption<ApiMemoryReviewReason>> = [
   { id: 'proposed_decision', label: 'Proposed decisions', detail: 'Awaiting a manager decision', color: 'var(--purple)' },
   { id: 'contradiction', label: 'Contradictions', detail: 'Claims disagree and need resolution', color: 'var(--red-soft)' },
   { id: 'stale_invalid', label: 'Stale or invalid', detail: 'Known not to represent current truth', color: 'var(--amber)' },
@@ -12,14 +13,20 @@ const REASONS: Array<{ id: ApiMemoryReviewReason; label: string; detail: string;
   { id: 'low_authority', label: 'Low authority', detail: 'Still provisional agent evidence', color: 'var(--blue)' },
 ];
 
-const EMPTY_COUNTS = Object.fromEntries(REASONS.map(({ id }) => [id, 0])) as Record<ApiMemoryReviewReason, number>;
+const EMPTY_COUNTS = Object.fromEntries(MEMORY_REVIEW_REASONS.map(({ id }) => [id, 0])) as Record<ApiMemoryReviewReason, number>;
 const emptyQueue = (): ApiMemoryReviewQueue => ({ items: [], counts: EMPTY_COUNTS, overallTotal: 0, total: 0, offset: 0, nextOffset: null });
 
-export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
+export type MemoryReviewChrome = 'standalone' | 'review';
+
+export function MemoryReview({ pid, store, onOpenInspector, onQueueChange, chrome = 'standalone', onOpenInReview }: {
   pid: string;
   store: AppStore;
   onOpenInspector: (uri: string) => void;
   onQueueChange?: (total: number) => void;
+  /** `review` = embedded under Review → Memory (shared chrome). Authority actions unchanged. */
+  chrome?: MemoryReviewChrome;
+  /** Standalone Memory → Review cross-link (entry-point alignment). */
+  onOpenInReview?: () => void;
 }) {
   const [reason, setReason] = useState<ApiMemoryReviewReason | undefined>();
   const [queue, setQueue] = useState<ApiMemoryReviewQueue>(emptyQueue);
@@ -27,6 +34,7 @@ export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
   const [error, setError] = useState('');
   const [acting, setActing] = useState<string | null>(null);
   const [decision, setDecision] = useState<{ id: string; action: 'approve' | 'reject'; note: string } | null>(null);
+  const embedded = chrome === 'review';
 
   const load = useCallback(async (append = false) => {
     setLoading(true);
@@ -61,62 +69,84 @@ export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
     }
   };
 
+  const header = (
+    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 20, marginBottom: embedded ? 14 : 20 }}>
+      <div style={{ flex: 1 }}>
+        <SectionLabel>
+          {embedded ? `Memory review · ${queue.overallTotal}` : 'Human governance'}
+        </SectionLabel>
+        {!embedded && <h2 style={{ fontSize: 22, margin: '5px 0 7px' }}>Memory review queue</h2>}
+        <div style={{ color: 'var(--text-dim)', fontSize: 12.5, lineHeight: 1.55, marginTop: embedded ? 6 : 0 }}>
+          {embedded
+            ? 'Same Review chrome as Validity — memory authority, approve/reject, and evidence stay on the memory model. Nothing merges into entity validation.'
+            : 'Resolve proposed decisions and inspect memories whose authority, validity, feedback, or contradictions need human judgement.'}
+        </div>
+        {!embedded && onOpenInReview && (
+          <button
+            type="button"
+            onClick={onOpenInReview}
+            style={{
+              marginTop: 10, cursor: 'pointer', background: 'transparent', border: 'none', padding: 0,
+              color: 'var(--blue)', fontFamily: 'var(--mono)', fontSize: 11,
+            }}
+          >
+            Also under Review → Memory
+          </button>
+        )}
+      </div>
+      {!store.permissions.canManage && (
+        <MonoTag color="var(--text-dim)" bg="var(--w-05)" size={9}>READ-ONLY REVIEW</MonoTag>
+      )}
+    </div>
+  );
+
+  const body = (
+    <>
+      {header}
+      <InboxFilterChips
+        options={MEMORY_REVIEW_REASONS}
+        selected={reason}
+        counts={queue.counts}
+        onSelect={setReason}
+        minWidth={embedded ? 150 : 165}
+      />
+      {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: 14 }}>{error}</div>}
+      {!loading && queue.items.length === 0 && (
+        <InboxEmptyState>
+          No memories currently need review{reason ? ' for this reason' : ''}.
+        </InboxEmptyState>
+      )}
+      <div style={{ display: 'grid', gap: 10 }}>
+        {queue.items.map((item) => (
+          <ReviewCard
+            key={item.id}
+            item={item}
+            canManage={store.permissions.canManage}
+            acting={acting === item.id}
+            decision={decision?.id === item.id ? decision : null}
+            onDecision={(action) => setDecision({ id: item.id, action, note: '' })}
+            onNote={(note) => setDecision((current) => current?.id === item.id ? { ...current, note } : current)}
+            onCancel={() => setDecision(null)}
+            onConfirm={() => void settleDecision()}
+            onInspect={() => onOpenInspector(`noriq://memory/${item.id}`)}
+          />
+        ))}
+      </div>
+      {loading && <InboxLoading label="Loading review queue…" />}
+      {!loading && queue.nextOffset != null && (
+        <div style={{ textAlign: 'center', marginTop: 16 }}>
+          <Button variant="ghost" onClick={() => void load(true)}>Load more</Button>
+        </div>
+      )}
+    </>
+  );
+
+  if (embedded) return body;
+
   return (
     <div style={{ height: '100%', overflowY: 'auto', padding: '20px clamp(18px, 4vw, 54px) 48px' }}>
       <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 20, marginBottom: 20 }}>
-          <div style={{ flex: 1 }}>
-            <SectionLabel>Human governance</SectionLabel>
-            <h2 style={{ fontSize: 22, margin: '5px 0 7px' }}>Memory review queue</h2>
-            <div style={{ color: 'var(--text-dim)', fontSize: 12.5, lineHeight: 1.55 }}>
-              Resolve proposed decisions and inspect memories whose authority, validity, feedback, or contradictions need human judgement.
-            </div>
-          </div>
-          {!store.permissions.canManage && (
-            <MonoTag color="var(--text-dim)" bg="var(--w-05)" size={9}>READ-ONLY REVIEW</MonoTag>
-          )}
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(165px, 1fr))', gap: 8, marginBottom: 22 }}>
-          {REASONS.map((item) => (
-            <button key={item.id} onClick={() => setReason(reason === item.id ? undefined : item.id)} style={{
-              cursor: 'pointer', textAlign: 'left', padding: '12px 13px', borderRadius: 10,
-              background: reason === item.id ? 'var(--w-1)' : 'var(--w-04)',
-              border: `1px solid ${reason === item.id ? item.color : 'var(--w-08)'}`,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
-                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 16 }}>{queue.counts[item.id] ?? 0}</span>
-              </div>
-              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
-            </button>
-          ))}
-        </div>
-
-        {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: 14 }}>{error}</div>}
-        {!loading && queue.items.length === 0 && (
-          <div style={{ padding: 40, border: '1px dashed var(--w-12)', borderRadius: 12, textAlign: 'center', color: 'var(--text-dim)' }}>
-            No memories currently need review{reason ? ' for this reason' : ''}.
-          </div>
-        )}
-        <div style={{ display: 'grid', gap: 10 }}>
-          {queue.items.map((item) => (
-            <ReviewCard
-              key={item.id}
-              item={item}
-              canManage={store.permissions.canManage}
-              acting={acting === item.id}
-              decision={decision?.id === item.id ? decision : null}
-              onDecision={(action) => setDecision({ id: item.id, action, note: '' })}
-              onNote={(note) => setDecision((current) => current?.id === item.id ? { ...current, note } : current)}
-              onCancel={() => setDecision(null)}
-              onConfirm={() => void settleDecision()}
-              onInspect={() => onOpenInspector(`noriq://memory/${item.id}`)}
-            />
-          ))}
-        </div>
-        {loading && <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 11 }}>Loading review queue…</div>}
-        {!loading && queue.nextOffset != null && <div style={{ textAlign: 'center', marginTop: 16 }}><Button variant="ghost" onClick={() => void load(true)}>Load more</Button></div>}
+        {body}
       </div>
     </div>
   );
@@ -138,7 +168,14 @@ function ReviewCard({ item, canManage, acting, decision, onDecision, onNote, onC
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 9 }}>
         <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={8.5}>{item.kind.toUpperCase()}</MonoTag>
         <MonoTag color={item.authority <= 2 ? 'var(--amber)' : 'var(--blue)'} bg="var(--w-05)" size={8.5}>AUTH {item.authority}/5</MonoTag>
-        {item.reasons.map((reason) => <MonoTag key={reason} color={REASONS.find((entry) => entry.id === reason)!.color} bg="var(--w-05)" size={8.5}>{REASONS.find((entry) => entry.id === reason)!.label.toUpperCase()}</MonoTag>)}
+        {item.reasons.map((reason) => {
+          const meta = MEMORY_REVIEW_REASONS.find((entry) => entry.id === reason);
+          return (
+            <MonoTag key={reason} color={meta?.color ?? 'var(--text-dim)'} bg="var(--w-05)" size={8.5}>
+              {(meta?.label ?? reason).toUpperCase()}
+            </MonoTag>
+          );
+        })}
         <span style={{ flex: 1 }} />
         <span style={{ color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>{new Date(item.recordedAt).toLocaleDateString()}</span>
       </div>

@@ -25,6 +25,7 @@ import { MemoryOps } from './MemoryOps';
 import { MemoryReview } from './MemoryReview';
 import { MemoryStarMap } from './MemoryStarMap';
 import { MemoryConstellationV2 } from './MemoryConstellationV2';
+import { openReviewMemoryTab } from './ReviewInboxChrome';
 import { Button, Select, TextArea, TextInput } from './ui';
 import { TaskSearchSelect } from './TaskSearchSelect';
 
@@ -145,7 +146,15 @@ export function MemoryView({ store }: { store: AppStore }) {
         {tab === 'map' && (mapMode === 'v2'
           ? <MemoryConstellationV2 pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} onFallback={useCompatibilityMap} />
           : <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />)}
-        {tab === 'review' && <MemoryReview pid={store.currentPid} store={store} onOpenInspector={openInspector} onQueueChange={setReviewCount} />}
+        {tab === 'review' && (
+          <MemoryReview
+            pid={store.currentPid}
+            store={store}
+            onOpenInspector={openInspector}
+            onQueueChange={setReviewCount}
+            onOpenInReview={() => openReviewMemoryTab(store.actions.setView)}
+          />
+        )}
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} onOpenEgoNetwork={openEgoNetwork} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}
         {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}
