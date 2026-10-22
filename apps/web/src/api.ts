@@ -644,11 +644,18 @@ export const api = {
     return req<ApiMemoryReviewQueue>('GET', `/api/projects/${pid}/memory/review-queue${query}`);
   },
 
-  // Entity validation / decay inbox (PLNR-576..580)
-  reviewInbox: (pid: string, input: { cause?: ApiReviewCause; subjectType?: ApiValidationSubjectType; limit?: number; offset?: number } = {}) => {
+  // Entity validation / decay inbox (PLNR-576..580 / PLNR-583)
+  reviewInbox: (pid: string, input: {
+    cause?: ApiReviewCause;
+    subjectType?: ApiValidationSubjectType;
+    groupBy?: ApiEntityReviewGroupBy;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
     const params = new URLSearchParams();
     if (input.cause) params.set('cause', input.cause);
     if (input.subjectType) params.set('subjectType', input.subjectType);
+    if (input.groupBy) params.set('groupBy', input.groupBy);
     if (input.limit != null) params.set('limit', String(input.limit));
     if (input.offset != null) params.set('offset', String(input.offset));
     const query = params.size ? `?${params}` : '';
@@ -1892,6 +1899,8 @@ export interface ApiEntityReviewInboxItem {
   ageSinceValidationSeconds: number | null;
 }
 
+export type ApiEntityReviewGroupBy = 'cause' | 'entity';
+
 export interface ApiEntityReviewInbox {
   items: ApiEntityReviewInboxItem[];
   counts: Record<string, number>;
@@ -1899,7 +1908,7 @@ export interface ApiEntityReviewInbox {
   total: number;
   offset: number;
   nextOffset: number | null;
-  groupBy: 'cause';
+  groupBy: ApiEntityReviewGroupBy;
 }
 
 export interface ApiMemoryReviewQueue {

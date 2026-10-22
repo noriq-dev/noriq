@@ -1,0 +1,209 @@
+// PLNR-583: Validity inbox group-by toggle + Supersede… action (no auto-close).
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api, type ApiEntityReviewInboxItem } from '../api';
+import type { AppStore } from '../store';
+import { ReviewView } from './ReviewView';
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+let container: HTMLDivElement;
+let root: Root | null = null;
+
+const item = (partial: Partial<ApiEntityReviewInboxItem> & Pick<ApiEntityReviewInboxItem, 'subjectId' | 'subjectType' | 'title' | 'primaryCause'>): ApiEntityReviewInboxItem => ({
+  key: null,
+  causes: [partial.primaryCause],
+  lastValidatedAt: null,
+  ageSinceValidationSeconds: null,
+  ...partial,
+});
+
+const inboxItems: ApiEntityReviewInboxItem[] = [
+  item({
+    subjectType: 'task',
+    subjectId: 'task_old',
+    key: 'PLNR-1',
+    title: 'Old task needing supersession',
+    primaryCause: 'content_changed',
+    causes: ['content_changed'],
+  }),
+  item({
+    subjectType: 'plan',
+    subjectId: 'plan_a',
+    title: 'Drifted plan',
+    primaryCause: 'doc_baseline_moved',
+    causes: ['doc_baseline_moved'],
+  }),
+  item({
+    subjectType: 'doc',
+    subjectId: 'doc_a',
+    title: 'Superseded doc',
+    primaryCause: 'superseded',
+    causes: ['superseded'],
+  }),
+];
+
+function store(): AppStore {
+  return {
+    currentPid: 'prj_1',
+    helpers: {
+      tasksOf: () => [],
+    },
+    actions: {
+      openTask: vi.fn(),
+      setView: vi.fn(),
+      moveTask: vi.fn(),
+    },
+  } as unknown as AppStore;
+}
+
+function mockInbox(items = inboxItems) {
+  return vi.spyOn(api, 'reviewInbox').mockResolvedValue({
+    items,
+    counts: {
+      content_changed: 1,
+      doc_baseline_moved: 1,
+      superseded: 1,
+    },
+    overallTotal: items.length,
+    total: items.length,
+    offset: 0,
+    nextOffset: null,
+    groupBy: 'cause',
+  });
+}
+
+async function mount() {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+  await act(async () => {
+    root!.render(<ReviewView store={store()} />);
+  });
+  const validity = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Validity'));
+  expect(validity).toBeDefined();
+  await act(async () => { validity!.click(); });
+  await act(async () => { await Promise.resolve(); });
+}
+
+const text = () => container.textContent ?? '';
+const button = (label: string) => [...container.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
+
+afterEach(() => {
+  act(() => root?.unmount());
+  container?.remove();
+  root = null;
+  vi.restoreAllMocks();
+});
+
+describe('ReviewView Validity inbox', () => {
+  it('defaults to group-by-cause and toggles to entity type sections', async () => {
+    const review = mockInbox();
+    await mount();
+
+    expect(review).toHaveBeenCalledWith('prj_1', expect.objectContaining({ groupBy: 'cause' }));
+    expect(button('By cause')?.getAttribute('aria-pressed')).toBe('true');
+    expect(text()).toContain('Content changed');
+    expect(text()).toContain('Old task needing supersession');
+
+    await act(async () => { button('By entity type')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(review).toHaveBeenCalledWith('prj_1', expect.objectContaining({ groupBy: 'entity' }));
+    expect(button('By entity type')?.getAttribute('aria-pressed')).toBe('true');
+    expect(text()).toMatch(/Tasks\s*·\s*1/);
+    expect(text()).toMatch(/Plans\s*·\s*1/);
+    expect(text()).toMatch(/Docs\s*·\s*1/);
+  });
+
+  it('wires Supersede… to setSupersedes without inventing auto-close', async () => {
+    mockInbox([inboxItems[0]!]);
+    const supersede = vi.spyOn(api, 'setSupersedes').mockResolvedValue({ ok: true });
+    const moveTask = vi.fn();
+    vi.spyOn(api, 'searchTasks').mockResolvedValue({
+      tasks: [{
+        id: 'task_new',
+        key: 'PLNR-2',
+        title: 'Replacement task',
+        status: 'todo',
+        priority: 2,
+        type: 'feature',
+        projectId: 'prj_1',
+        projectKey: 'PLNR',
+        boardId: 'board_1',
+        updatedAt: '2026-10-22T00:00:00.000Z',
+      }],
+      matched: 1,
+      returned: 1,
+    });
+
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const s = store();
+    (s.actions as { moveTask: ReturnType<typeof vi.fn> }).moveTask = moveTask;
+    await act(async () => { root!.render(<ReviewView store={s} />); });
+    const validity = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Validity'));
+    await act(async () => { validity!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => { button('Supersede…')!.click(); });
+    expect(text()).toContain('new current');
+    expect(text()).toContain('status is not auto-closed');
+
+    const input = container.querySelector<HTMLInputElement>('[role="combobox"]');
+    expect(input).toBeTruthy();
+    await act(async () => {
+      input!.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input!, 'PLNR-2');
+      input!.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { await new Promise((r) => setTimeout(r, 220)); });
+
+    const option = container.querySelector<HTMLElement>('[role="option"]');
+    expect(option?.textContent).toContain('PLNR-2');
+    await act(async () => { option!.click(); });
+    await act(async () => { button('link supersedes')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(supersede).toHaveBeenCalledWith('prj_1', {
+      subjectType: 'task',
+      subjectId: 'task_new',
+      priorId: 'task_old',
+    });
+    expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps mark validated and dismiss cause actions', async () => {
+    mockInbox([inboxItems[0]!]);
+    const validate = vi.spyOn(api, 'recordValidation').mockResolvedValue({
+      id: 'val_1',
+      projectId: 'prj_1',
+      subjectType: 'task',
+      subjectId: 'task_old',
+      contentFingerprint: 'fp',
+      validatedAt: '2026-10-22T00:00:00.000Z',
+      actorKind: 'human',
+      actorId: 'u_1',
+      actorName: 'Montana',
+      baselines: { docPins: [], codeAssessments: [] },
+      note: '',
+    });
+    const dismiss = vi.spyOn(api, 'setReviewCause').mockResolvedValue({ ok: true });
+    await mount();
+
+    await act(async () => { button('mark validated')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(validate).toHaveBeenCalledWith('prj_1', { subjectType: 'task', subjectId: 'task_old' });
+
+    await act(async () => { button('dismiss cause')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(dismiss).toHaveBeenCalledWith('prj_1', {
+      subjectType: 'task',
+      subjectId: 'task_old',
+      cause: 'content_changed',
+      status: 'dismissed',
+    });
+  });
+});
