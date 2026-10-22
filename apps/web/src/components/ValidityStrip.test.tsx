@@ -57,13 +57,14 @@ afterEach(() => {
 });
 
 describe('ValidityStrip', () => {
-  it('renders causes and Validate / Flag / Supersede / Open in Review', () => {
+  it('renders causes and Validate / Flag / Snooze / Supersede / Open in Review', () => {
     mount();
     const text = container.textContent ?? '';
     expect(text).toContain('Validity');
     expect(text).toContain('NEVER VALIDATED');
     expect(text).toContain('Validate');
     expect(text).toContain('Flag');
+    expect(text).toContain('Snooze');
     expect(text).toContain('Supersede');
     expect(text).toContain('Open in Review');
   });
@@ -117,5 +118,37 @@ describe('ValidityStrip', () => {
     act(() => { btn!.click(); });
     expect(sessionStorage.getItem(REVIEW_TAB_KEY)).toBe('validity');
     expect(setView).toHaveBeenCalledWith('review');
+  });
+
+  it('Snooze posts status=snoozed with durationSeconds for the primary cause', async () => {
+    const snooze = vi.spyOn(api, 'setReviewCause').mockResolvedValue({
+      ok: true,
+      snoozedUntil: '2026-10-23T00:00:00.000Z',
+    });
+    vi.spyOn(api, 'subjectFreshness').mockResolvedValue(freshness({
+      causes: [{ code: 'content_changed', severity: 'critical' }],
+      criticalCauses: ['content_changed'],
+      impactUnknown: false,
+    }));
+    mount({
+      initialFreshness: freshness({
+        causes: [{ code: 'content_changed', severity: 'critical' }],
+        criticalCauses: ['content_changed'],
+        impactUnknown: false,
+      }),
+    });
+    const open = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Snooze…');
+    expect(open).toBeTruthy();
+    await act(async () => { open!.click(); });
+    const oneDay = [...container.querySelectorAll('button')].find((b) => b.textContent === '1d');
+    expect(oneDay).toBeTruthy();
+    await act(async () => { oneDay!.click(); });
+    expect(snooze).toHaveBeenCalledWith('prj_1', {
+      subjectType: 'task',
+      subjectId: 'task_1',
+      cause: 'content_changed',
+      status: 'snoozed',
+      durationSeconds: 86400,
+    });
   });
 });

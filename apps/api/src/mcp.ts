@@ -19,7 +19,7 @@ import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-o
 import {
   ExecutionEventType, ExecutionKind, ExecutionLineageStatus, ExecutionRelationType, ExecutionRole,
   ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole,
-  RepoPath, ReviewCause, ValidationSubjectType, ValidationBaselines,
+  RepoPath, ReviewCause, ReviewCauseStatus, ValidationSubjectType, ValidationBaselines,
 } from '@noriq-dev/shared';
 import { subjectFreshness, getSupersession } from './lib/entity-validation-store';
 import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
@@ -2273,17 +2273,27 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'set_review_cause',
-    'Open or dismiss a stored review cause on a subject (e.g. human_flagged open; dismiss a cause without inventing validity). Derived causes (content_changed, never_validated, impact_unknown) are computed live — dismissing them only hides them from the inbox until the underlying condition clears.',
+    'Open, dismiss, or timed-snooze a stored review cause on a subject (e.g. human_flagged open; dismiss permanently; snooze until a timestamp or duration). Does not invent validity. Derived causes (content_changed, never_validated, impact_unknown) are computed live — dismiss/snooze only hides them from the inbox/freshness until the condition clears (dismiss) or snoozedUntil expires (then the cause resurfaces without a new validation).',
     {
       projectId: z.string(),
       subjectType: ValidationSubjectType.describe('task | plan | doc'),
       subjectId: z.string().describe('Subject id'),
       cause: ReviewCause.describe('Stable cause code (e.g. human_flagged, content_changed)'),
-      status: z.enum(['open', 'dismissed']).describe('open = surface in inbox; dismissed = hide this cause only'),
+      status: ReviewCauseStatus.describe(
+        'open = surface in inbox; dismissed = permanently hide this cause instance; snoozed = omit until snoozedUntil (or durationSeconds→until)',
+      ),
       detail: z.string().max(1000).optional().describe('Optional detail, max 1000 chars'),
+      snoozedUntil: z.string().datetime().optional().describe(
+        'Absolute ISO-8601 until (required with status=snoozed unless durationSeconds is set); must be in the future',
+      ),
+      durationSeconds: z.number().int().positive().min(60).max(365 * 24 * 3600).optional().describe(
+        'Snooze duration in seconds (1 min … 1 year); alternative to snoozedUntil when status=snoozed',
+      ),
     },
-    tool(async ({ projectId, subjectType, subjectId, cause, status, detail }) =>
-      room(env, projectId).setReviewCause(projectId, actor, { subjectType, subjectId, cause, status, detail })),
+    tool(async ({ projectId, subjectType, subjectId, cause, status, detail, snoozedUntil, durationSeconds }) =>
+      room(env, projectId).setReviewCause(projectId, actor, {
+        subjectType, subjectId, cause, status, detail, snoozedUntil, durationSeconds,
+      })),
   );
 
   defineTool(

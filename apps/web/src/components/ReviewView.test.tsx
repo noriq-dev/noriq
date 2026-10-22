@@ -355,4 +355,25 @@ describe('ReviewView Validity inbox', () => {
       status: 'dismissed',
     });
   });
+
+  it('snooze presets post status=snoozed with durationSeconds', async () => {
+    mockInbox([inboxItems[0]!]);
+    const snooze = vi.spyOn(api, 'setReviewCause').mockResolvedValue({
+      ok: true,
+      snoozedUntil: '2026-10-22T18:00:00.000Z',
+    });
+    await mount();
+
+    await act(async () => { button('snooze…')!.click(); });
+    await act(async () => { button('1h')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(snooze).toHaveBeenCalledWith('prj_1', {
+      subjectType: 'task',
+      subjectId: 'task_old',
+      cause: 'content_changed',
+      status: 'snoozed',
+      durationSeconds: 3600,
+    });
+  });
 });

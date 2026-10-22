@@ -666,8 +666,16 @@ export const api = {
   subjectFreshness: (pid: string, subjectType: ApiValidationSubjectType, subjectId: string) =>
     req<ApiSubjectFreshness>('GET', `/api/projects/${pid}/freshness/${subjectType}/${encodeURIComponent(subjectId)}`),
   setReviewCause: (pid: string, body: {
-    subjectType: ApiValidationSubjectType; subjectId: string; cause: ApiReviewCause; status: 'open' | 'dismissed'; detail?: string;
-  }) => req<{ ok: true }>('POST', `/api/projects/${pid}/review-causes`, body),
+    subjectType: ApiValidationSubjectType;
+    subjectId: string;
+    cause: ApiReviewCause;
+    status: 'open' | 'dismissed' | 'snoozed';
+    detail?: string;
+    /** Absolute ISO until when status=snoozed (or pass durationSeconds). */
+    snoozedUntil?: string;
+    /** Duration → until when status=snoozed (1 min … 1 year). */
+    durationSeconds?: number;
+  }) => req<{ ok: true; snoozedUntil?: string | null }>('POST', `/api/projects/${pid}/review-causes`, body),
   setSupersedes: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; priorId: string | null }) =>
     req<{ ok: true }>('POST', `/api/projects/${pid}/supersedes`, body),
   /** Authority 5 is reachable ONLY through this path (§12) — never a direct authority write. */

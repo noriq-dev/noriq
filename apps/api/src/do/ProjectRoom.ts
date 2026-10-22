@@ -5930,8 +5930,10 @@ export class ProjectRoom extends DurableObject<Env> {
       subjectType: ValidationSubjectType;
       subjectId: string;
       cause: ReviewCause;
-      status: 'open' | 'dismissed';
+      status: 'open' | 'dismissed' | 'snoozed';
       detail?: string;
+      snoozedUntil?: string | null;
+      durationSeconds?: number | null;
     },
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {

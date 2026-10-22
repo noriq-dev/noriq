@@ -37,6 +37,103 @@ export function reviewCauseSeverity(cause: ReviewCause): ReviewCauseSeverity {
 }
 
 /**
+ * Stored review-cause lifecycle (P2-C / PLNR-594).
+ * - open: surface in inbox / freshness
+ * - dismissed: permanently hide this cause instance (does not invent validity)
+ * - snoozed: omit until `snoozedUntil`; after expiry the cause resurfaces without a new validation
+ */
+export const ReviewCauseStatus = z.enum(['open', 'dismissed', 'snoozed']);
+export type ReviewCauseStatus = z.infer<typeof ReviewCauseStatus>;
+
+/** Minimum / maximum snooze duration (1 minute … 1 year). */
+export const SNOOZE_DURATION_SECONDS_MIN = 60;
+export const SNOOZE_DURATION_SECONDS_MAX = 365 * 24 * 3600;
+
+/**
+ * Resolve absolute snooze-until from either an ISO timestamp or a duration.
+ * Requires status=snoozed callers to pass one of the two; returns null for open/dismissed.
+ */
+export function resolveSnoozedUntil(input: {
+  status: ReviewCauseStatus;
+  snoozedUntil?: string | null;
+  durationSeconds?: number | null;
+  now?: string | Date;
+}): string | null {
+  if (input.status !== 'snoozed') return null;
+  const nowMs = input.now instanceof Date
+    ? input.now.getTime()
+    : Date.parse(input.now ?? new Date().toISOString());
+  if (!Number.isFinite(nowMs)) {
+    throw new Error('Invalid now clock for snooze resolution');
+  }
+
+  if (input.snoozedUntil != null && String(input.snoozedUntil).trim() !== '') {
+    const untilMs = Date.parse(input.snoozedUntil);
+    if (!Number.isFinite(untilMs)) {
+      throw new Error('snoozedUntil must be a valid ISO-8601 timestamp');
+    }
+    if (untilMs <= nowMs) {
+      throw new Error('snoozedUntil must be in the future');
+    }
+    return new Date(untilMs).toISOString();
+  }
+
+  const duration = input.durationSeconds;
+  if (duration == null || !Number.isFinite(duration)) {
+    throw new Error('snoozed status requires snoozedUntil or durationSeconds');
+  }
+  const seconds = Math.round(duration);
+  if (seconds < SNOOZE_DURATION_SECONDS_MIN || seconds > SNOOZE_DURATION_SECONDS_MAX) {
+    throw new Error(
+      `durationSeconds must be between ${SNOOZE_DURATION_SECONDS_MIN} and ${SNOOZE_DURATION_SECONDS_MAX}`,
+    );
+  }
+  return new Date(nowMs + seconds * 1000).toISOString();
+}
+
+/** True while a snooze is still active (status=snoozed and until > now). */
+export function isSnoozeActive(
+  status: ReviewCauseStatus | string,
+  snoozedUntil: string | null | undefined,
+  now?: string | Date,
+): boolean {
+  if (status !== 'snoozed') return false;
+  if (!snoozedUntil) return false;
+  const untilMs = Date.parse(snoozedUntil);
+  if (!Number.isFinite(untilMs)) return false;
+  const nowMs = now instanceof Date
+    ? now.getTime()
+    : Date.parse(now ?? new Date().toISOString());
+  if (!Number.isFinite(nowMs)) return false;
+  return untilMs > nowMs;
+}
+
+/**
+ * True when a stored cause should surface: open, or snoozed past expiry.
+ * Dismissed never resurfaces for that cause instance.
+ */
+export function isReviewCauseEffectivelyOpen(
+  status: ReviewCauseStatus | string,
+  snoozedUntil: string | null | undefined,
+  now?: string | Date,
+): boolean {
+  if (status === 'open') return true;
+  if (status === 'dismissed') return false;
+  if (status === 'snoozed') return !isSnoozeActive(status, snoozedUntil, now);
+  return false;
+}
+
+/** True when a stored cause should suppress derived/inbox surfacing (dismissed or active snooze). */
+export function isReviewCauseSuppressed(
+  status: ReviewCauseStatus | string,
+  snoozedUntil: string | null | undefined,
+  now?: string | Date,
+): boolean {
+  if (status === 'dismissed') return true;
+  return isSnoozeActive(status, snoozedUntil, now);
+}
+
+/**
  * Agent-declared code assessment baseline. Noriq stores these; it does not index repos
  * or fetch git. Staleness (`code_assessment_stale`) is derived when a later call declares
  * a current baseId that differs from a stored assessment's baseId.
