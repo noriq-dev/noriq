@@ -321,7 +321,7 @@ export const api = {
   deletePlanDoc: (pid: string, planId: string, docId: string) =>
     req('DELETE', `/api/projects/${pid}/plans/${planId}/docs/${docId}`),
   publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
-  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; fileLocking?: boolean; lockTtlSeconds?: number | null }) =>
+  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; fileLocking?: boolean; lockTtlSeconds?: number | null; dormancyQuietSeconds?: number | null }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
   projectAccess: (pid: string) => req<{
     self: { effectiveRole: string | null; accessSource: string; cappedByReadOnly: boolean };
@@ -1542,6 +1542,8 @@ export interface ApiSnapshot {
   project: {
     id: string; key: string; name: string; description: string; claimTtlSeconds: number;
     lockTtlSeconds?: number | null; fileLockingEnabled?: number;
+    /** PLNR-585: null/undefined = dormancy off until configured. */
+    dormancyQuietSeconds?: number | null;
     reviewTasks?: number; eventSeq?: number;
     effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
     accessSource: string; canView: boolean; canContribute: boolean; canManage: boolean; canOwn: boolean;

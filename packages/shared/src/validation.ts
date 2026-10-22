@@ -113,3 +113,25 @@ export function parseDocRef(raw: string): { docId: string; version: number | nul
 export function formatDocRef(docId: string, version: number | null | undefined): string {
   return version != null ? `${docId}@${version}` : docId;
 }
+
+/**
+ * Opt-in dormancy (P1-G / PLNR-585).
+ * `quietSeconds: null` (or omitted) = OFF — no dormant cause is ever derived.
+ * When set (>0), quiet since lastValidated / content activity opens advisory `dormant` only.
+ */
+export const DormancyConfig = z.object({
+  quietSeconds: z.number().int().positive().nullable(),
+  source: z.enum(['off', 'project', 'entity']),
+});
+export type DormancyConfig = z.infer<typeof DormancyConfig>;
+
+/** Minimum / maximum allowed quiet thresholds (1 hour … 10 years). */
+export const DORMANCY_QUIET_SECONDS_MIN = 3600;
+export const DORMANCY_QUIET_SECONDS_MAX = 10 * 365 * 24 * 3600;
+
+export function parseDormancyQuietSeconds(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
+}

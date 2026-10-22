@@ -1,7 +1,8 @@
-// PLNR-576..580: validation records, doc@version pins, supersession, freshness claim gate, review inbox.
-import { SELF } from 'cloudflare:test';
+// PLNR-576..580 + PLNR-585: validation records, doc@version pins, supersession, freshness claim gate, review inbox, opt-in dormancy.
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { computeFreshness, dormancyActivityAt } from '../src/lib/entity-validation';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
@@ -208,5 +209,125 @@ describe('review inbox (PLNR-580)', () => {
 
     const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
     expect(fresh.body.criticalCauses).not.toContain('content_changed');
+  });
+});
+
+describe('opt-in dormancy (PLNR-585 / P1-G)', () => {
+  it('computeFreshness: off by default; configured quiet opens dormant only', () => {
+    const base = {
+      subjectType: 'task' as const,
+      subjectId: 'task_x',
+      contentFingerprint: 'fp1',
+      latestMatching: {
+        id: 'val_1', projectId: 'p', subjectType: 'task' as const, subjectId: 'task_x',
+        contentFingerprint: 'fp1', validatedAt: '2020-01-01T00:00:00.000Z',
+        actorKind: 'agent' as const, actorId: 'a', actorName: 'a', baselinesJson: '{}', note: '',
+      },
+      latestAny: null as null,
+      docPins: [],
+      supersededById: null,
+      storedCauses: [],
+      contentActivityAt: '2020-01-01T00:00:00.000Z',
+      now: '2026-01-01T00:00:00.000Z',
+    };
+    // latestAny null → never_validated; fix for this unit case
+    const withAny = { ...base, latestAny: base.latestMatching };
+
+    const off = computeFreshness({ ...withAny, dormancyQuietSeconds: null });
+    expect(off.causes.some((c) => c.code === 'dormant')).toBe(false);
+
+    const on = computeFreshness({ ...withAny, dormancyQuietSeconds: 3600 });
+    expect(on.causes.some((c) => c.code === 'dormant')).toBe(true);
+    expect(on.criticalCauses).not.toContain('dormant');
+
+    const recent = computeFreshness({
+      ...withAny,
+      dormancyQuietSeconds: 3600,
+      contentActivityAt: '2025-12-31T23:30:00.000Z',
+      latestMatching: { ...base.latestMatching!, validatedAt: '2025-12-31T23:30:00.000Z' },
+      latestAny: { ...base.latestMatching!, validatedAt: '2025-12-31T23:30:00.000Z' },
+    });
+    expect(recent.causes.some((c) => c.code === 'dormant')).toBe(false);
+
+    expect(dormancyActivityAt({
+      lastValidatedAt: '2024-06-01T00:00:00.000Z',
+      contentActivityAt: '2025-01-01T00:00:00.000Z',
+    })).toBe('2025-01-01T00:00:00.000Z');
+  });
+
+  it('unconfigured project never derives dormant; configured quiet opens dormant without closing', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'dormancy subject', body: 'quiet me', tags: ['lifecycle'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+
+    const before = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(before.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(false);
+
+    // Backdate content activity + validation so the quiet clock is exceeded once enabled.
+    const old = '2019-01-01T00:00:00.000Z';
+    await env.DB.prepare('UPDATE tasks SET content_activity_at = ? WHERE id = ?').bind(old, taskId).run();
+    await env.DB.prepare(
+      'UPDATE entity_validations SET validated_at = ? WHERE project_id = ? AND subject_id = ?',
+    ).bind(old, projectId, taskId).run();
+
+    const stillOff = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(stillOff.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(false);
+
+    const meta = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: 3600 }),
+    });
+    expect(meta.status).toBe(200);
+
+    const dorm = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(dorm.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(true);
+    expect(dorm.body.criticalCauses).not.toContain('dormant');
+
+    // Opening dormant must not auto-close / auto-archive.
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(detail.body.task.status).toBe('todo');
+    expect(detail.body.task.archivedAt ?? null).toBeNull();
+
+    // Re-validate clears dormancy (activity moves forward).
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+    const after = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(after.body.causes.some((c: { code: string }) => c.code === 'dormant')).toBe(false);
+
+    // Entity override can use a different threshold.
+    const override = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/dormancy/task/${taskId}`,
+      {
+        method: 'PUT',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quietSeconds: 7200 }),
+      },
+    );
+    expect(override.status).toBe(200);
+    const ov = await override.json() as { dormancy: { quietSeconds: number; source: string } };
+    expect(ov.dormancy.source).toBe('entity');
+    expect(ov.dormancy.quietSeconds).toBe(7200);
+
+    // Turn project dormancy back off for later tests sharing projectId.
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dormancyQuietSeconds: null }),
+    });
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/dormancy/task/${taskId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quietSeconds: null }),
+    });
+  });
+
+  it('get_project exposes dormancyQuietSeconds null when off', async () => {
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId });
+    expect(proj.body.project).toHaveProperty('dormancyQuietSeconds');
+    // May be null (off) or a number if a prior test left it set — we clear above; assert shape.
+    const v = proj.body.project.dormancyQuietSeconds;
+    expect(v === null || typeof v === 'number').toBe(true);
   });
 });

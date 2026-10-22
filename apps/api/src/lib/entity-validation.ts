@@ -102,9 +102,43 @@ export type StoredCauseRow = {
   detail: string;
 };
 
+/** Later of ISO timestamps; ignores null/invalid. */
+export function laterIso(...candidates: Array<string | null | undefined>): string | null {
+  let best: string | null = null;
+  let bestMs = -Infinity;
+  for (const c of candidates) {
+    if (!c) continue;
+    const ms = Date.parse(c);
+    if (!Number.isFinite(ms)) continue;
+    if (ms >= bestMs) {
+      bestMs = ms;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * Quiet-period anchor: later of matching lastValidated and last fingerprint-affecting
+ * content activity. `createdAt` is fallback only when both are missing (should not win
+ * over an older explicit content_activity_at). Age alone never invalidates.
+ */
+export function dormancyActivityAt(input: {
+  lastValidatedAt: string | null;
+  contentActivityAt: string | null;
+  createdAt?: string | null;
+}): string {
+  return laterIso(input.lastValidatedAt, input.contentActivityAt)
+    ?? input.createdAt
+    ?? new Date(0).toISOString();
+}
+
 /**
  * Compute freshness for a subject given its current fingerprint, latest matching
  * validation, doc pins, supersession, and stored cause rows (human_flagged / dismissals).
+ *
+ * Dormancy (P1-G): when `dormancyQuietSeconds` is null/≤0 the clock is OFF. When set,
+ * quiet since lastValidated/content activity opens advisory `dormant` only — never auto-close.
  */
 export function computeFreshness(input: {
   subjectType: ValidationSubjectType;
@@ -115,6 +149,14 @@ export function computeFreshness(input: {
   docPins: DocPinRow[];
   supersededById: string | null;
   storedCauses: StoredCauseRow[];
+  /** null / ≤0 = dormancy OFF (default). */
+  dormancyQuietSeconds?: number | null;
+  /** Last fingerprint-affecting content write (not claim/title/tag churn). */
+  contentActivityAt?: string | null;
+  /** Fallback when content_activity_at is unset (legacy rows). */
+  createdAt?: string | null;
+  /** Clock for dormancy comparison (injectable in tests). */
+  now?: string | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
   const dismissed = new Set(
@@ -165,11 +207,29 @@ export function computeFreshness(input: {
     push('superseded', `Replaced by ${input.supersededById}`);
   }
 
+  const quietSeconds = input.dormancyQuietSeconds != null && input.dormancyQuietSeconds > 0
+    ? input.dormancyQuietSeconds
+    : null;
+  if (quietSeconds != null) {
+    const activityAt = dormancyActivityAt({
+      lastValidatedAt: input.latestMatching?.validatedAt ?? null,
+      contentActivityAt: input.contentActivityAt ?? null,
+      createdAt: input.createdAt ?? null,
+    });
+    const nowMs = Date.parse(input.now ?? new Date().toISOString());
+    const activityMs = Date.parse(activityAt);
+    if (Number.isFinite(nowMs) && Number.isFinite(activityMs) && nowMs - activityMs >= quietSeconds * 1000) {
+      const quietFor = Math.floor((nowMs - activityMs) / 1000);
+      push('dormant', `Quiet for ${quietFor}s (threshold ${quietSeconds}s since lastValidated/content activity)`);
+    }
+  }
+
   for (const row of input.storedCauses) {
     if (row.status !== 'open') continue;
     if (row.cause === 'human_flagged') push('human_flagged', row.detail);
-    // dormant / code_assessment_stale stubs: only if explicitly stored open
-    if (row.cause === 'dormant' || row.cause === 'code_assessment_stale') {
+    // code_assessment_stale remains P1-F stub: only if explicitly stored open.
+    // dormant may also be force-opened via set_review_cause; derived path above is primary.
+    if (row.cause === 'code_assessment_stale' || row.cause === 'dormant') {
       push(row.cause as ReviewCause, row.detail);
     }
   }

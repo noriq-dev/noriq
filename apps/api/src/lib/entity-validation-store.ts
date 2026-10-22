@@ -1,9 +1,11 @@
 import type {
+  DormancyConfig,
   ReviewCause,
   SubjectFreshness,
   ValidationBaselines,
   ValidationSubjectType,
 } from '@noriq-dev/shared';
+import { parseDormancyQuietSeconds } from '@noriq-dev/shared';
 import { newId, nowIso } from './util';
 import {
   computeFreshness,
@@ -133,17 +135,106 @@ async function loadStoredCauses(
   return results ?? [];
 }
 
+/** Resolve effective dormancy quiet seconds: entity override → project → off (null). */
+export async function resolveDormancyConfig(
+  db: D1Database,
+  projectId: string,
+  subjectType?: ValidationSubjectType,
+  subjectId?: string,
+): Promise<DormancyConfig> {
+  if (subjectType && subjectId) {
+    const override = await db.prepare(
+      `SELECT quiet_seconds AS quietSeconds FROM entity_dormancy_overrides
+        WHERE project_id = ? AND subject_type = ? AND subject_id = ?`,
+    ).bind(projectId, subjectType, subjectId).first<{ quietSeconds: number }>();
+    if (override?.quietSeconds != null && override.quietSeconds > 0) {
+      return { quietSeconds: override.quietSeconds, source: 'entity' };
+    }
+  }
+  const proj = await db.prepare(
+    'SELECT dormancy_quiet_seconds AS quietSeconds FROM projects WHERE id = ?',
+  ).bind(projectId).first<{ quietSeconds: number | null }>();
+  const quiet = parseDormancyQuietSeconds(proj?.quietSeconds);
+  if (quiet != null) return { quietSeconds: quiet, source: 'project' };
+  return { quietSeconds: null, source: 'off' };
+}
+
+async function loadContentActivity(
+  db: D1Database,
+  projectId: string,
+  subjectType: ValidationSubjectType,
+  subjectId: string,
+): Promise<{ contentActivityAt: string | null; createdAt: string | null }> {
+  if (subjectType === 'task') {
+    const row = await db.prepare(
+      `SELECT content_activity_at AS contentActivityAt, created_at AS createdAt
+         FROM tasks WHERE id = ? AND project_id = ?`,
+    ).bind(subjectId, projectId).first<{ contentActivityAt: string | null; createdAt: string }>();
+    return { contentActivityAt: row?.contentActivityAt ?? null, createdAt: row?.createdAt ?? null };
+  }
+  if (subjectType === 'plan') {
+    const row = await db.prepare(
+      `SELECT content_activity_at AS contentActivityAt, created_at AS createdAt
+         FROM plans WHERE id = ? AND project_id = ?`,
+    ).bind(subjectId, projectId).first<{ contentActivityAt: string | null; createdAt: string }>();
+    return { contentActivityAt: row?.contentActivityAt ?? null, createdAt: row?.createdAt ?? null };
+  }
+  const row = await db.prepare(
+    `SELECT content_activity_at AS contentActivityAt, created_at AS createdAt
+       FROM docs WHERE id = ? AND project_id = ?`,
+  ).bind(subjectId, projectId).first<{ contentActivityAt: string | null; createdAt: string }>();
+  return { contentActivityAt: row?.contentActivityAt ?? null, createdAt: row?.createdAt ?? null };
+}
+
+export async function setProjectDormancyQuietSeconds(
+  db: D1Database,
+  projectId: string,
+  quietSeconds: number | null,
+): Promise<{ ok: true; dormancyQuietSeconds: number | null }> {
+  await db.prepare('UPDATE projects SET dormancy_quiet_seconds = ? WHERE id = ?')
+    .bind(quietSeconds, projectId).run();
+  return { ok: true, dormancyQuietSeconds: quietSeconds };
+}
+
+export async function setEntityDormancyOverride(
+  db: D1Database,
+  projectId: string,
+  subjectType: ValidationSubjectType,
+  subjectId: string,
+  quietSeconds: number | null,
+): Promise<{ ok: true; dormancy: DormancyConfig }> {
+  if (quietSeconds == null) {
+    await db.prepare(
+      `DELETE FROM entity_dormancy_overrides
+        WHERE project_id = ? AND subject_type = ? AND subject_id = ?`,
+    ).bind(projectId, subjectType, subjectId).run();
+  } else {
+    await db.prepare(
+      `INSERT INTO entity_dormancy_overrides
+        (project_id, subject_type, subject_id, quiet_seconds, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (project_id, subject_type, subject_id) DO UPDATE SET
+         quiet_seconds = excluded.quiet_seconds,
+         updated_at = excluded.updated_at`,
+    ).bind(projectId, subjectType, subjectId, quietSeconds, nowIso()).run();
+  }
+  return { ok: true, dormancy: await resolveDormancyConfig(db, projectId, subjectType, subjectId) };
+}
+
 export async function subjectFreshness(
   db: D1Database,
   projectId: string,
   subjectType: ValidationSubjectType,
   subjectId: string,
+  opts?: { now?: string },
 ): Promise<SubjectFreshness> {
   const { latestAny, latestMatching, fingerprint } = await latestValidations(db, projectId, subjectType, subjectId);
-  const [docPins, replacedBy, storedCauses] = await Promise.all([
+  const [docPins, replacedBy, storedCauses, dormancy, activity] = await Promise.all([
     loadDocPins(db, subjectType, subjectId),
     supersededById(db, subjectType, subjectId),
     loadStoredCauses(db, projectId, subjectType, subjectId),
+    resolveDormancyConfig(db, projectId, subjectType, subjectId),
+    loadContentActivity(db, projectId, subjectType, subjectId),
   ]);
   return computeFreshness({
     subjectType,
@@ -154,6 +245,10 @@ export async function subjectFreshness(
     docPins,
     supersededById: replacedBy,
     storedCauses,
+    dormancyQuietSeconds: dormancy.quietSeconds,
+    contentActivityAt: activity.contentActivityAt,
+    createdAt: activity.createdAt,
+    now: opts?.now ?? null,
   });
 }
 

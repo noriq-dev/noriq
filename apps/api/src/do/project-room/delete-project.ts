@@ -40,6 +40,7 @@ export const DELETE_PROJECT_BATCH_SQL: readonly string[] = [
   'DELETE FROM plan_doc_refs WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
   'DELETE FROM entity_validations WHERE project_id = ?',
   'DELETE FROM entity_review_causes WHERE project_id = ?',
+  'DELETE FROM entity_dormancy_overrides WHERE project_id = ?',
   'DELETE FROM doc_tags WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
   'DELETE FROM doc_versions WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)',
   `DELETE FROM comments WHERE task_id IN (${TASKS_SUBQUERY})`,

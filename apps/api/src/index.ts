@@ -1026,7 +1026,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
   await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
   const [project, tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
-    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, repo_url AS repoUrl FROM projects WHERE id = ?')
+    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, dormancy_quiet_seconds AS dormancyQuietSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
     // display* concern — filtering it out here silently drained every derived aggregate
@@ -1576,6 +1576,42 @@ app.post('/api/projects/:pid/supersedes', userAuth, async (c) => {
   }>();
   if (!body.subjectType || !body.subjectId) return c.json({ error: 'subjectType and subjectId required' }, 400);
   return c.json(await room(c.env, pid).setSupersedes(pid, humanActor(c), body.subjectType, body.subjectId, body.priorId ?? null));
+});
+
+/** PLNR-585: optional per-entity dormancy quiet override (null clears → inherit project / off). */
+app.put('/api/projects/:pid/dormancy/:subjectType/:subjectId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const subjectType = c.req.param('subjectType') as import('@noriq-dev/shared').ValidationSubjectType;
+  const subjectId = c.req.param('subjectId')!;
+  if (!['task', 'plan', 'doc'].includes(subjectType)) {
+    return c.json({ error: 'subjectType must be task, plan, or doc' }, 400);
+  }
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'manage')) {
+    return c.json({ error: 'project manager role required to change dormancy settings' }, 403);
+  }
+  const body = await c.req.json<{ quietSeconds?: number | null }>();
+  const { DORMANCY_QUIET_SECONDS_MIN, DORMANCY_QUIET_SECONDS_MAX } = await import('@noriq-dev/shared');
+  let quiet: number | null;
+  if (body.quietSeconds === null || body.quietSeconds === undefined) {
+    quiet = null;
+  } else {
+    const n = Math.round(body.quietSeconds);
+    if (!Number.isFinite(n) || n < DORMANCY_QUIET_SECONDS_MIN || n > DORMANCY_QUIET_SECONDS_MAX) {
+      return c.json({
+        error: `quietSeconds must be null (clear) or ${DORMANCY_QUIET_SECONDS_MIN}–${DORMANCY_QUIET_SECONDS_MAX} seconds`,
+      }, 400);
+    }
+    quiet = n;
+  }
+  const { setEntityDormancyOverride } = await import('./lib/entity-validation-store');
+  return c.json(await setEntityDormancyOverride(c.env.DB, pid, subjectType, subjectId, quiet));
+});
+
+app.get('/api/projects/:pid/dormancy', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const { resolveDormancyConfig } = await import('./lib/entity-validation-store');
+  return c.json({ dormancy: await resolveDormancyConfig(c.env.DB, pid) });
 });
 
 // Project memory (PLNR-251/252) — human-facing READS only; recording happens through the
@@ -3083,7 +3119,13 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   if (!projectRoleAllows(access.role, 'manage')) {
     return c.json({ error: 'project manager role required to change project settings' }, 403);
   }
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated'; fileLocking?: boolean; lockTtlSeconds?: number | null }>();
+  const body = await c.req.json<{
+    groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number;
+    ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated';
+    fileLocking?: boolean; lockTtlSeconds?: number | null;
+    /** PLNR-585: null clears (off); positive seconds enables opt-in dormancy. */
+    dormancyQuietSeconds?: number | null;
+  }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) {
@@ -3139,6 +3181,20 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
       return c.json({ error: 'only the project owner may change public visibility' }, 403);
     }
     sets.push('public = ?'); binds.push(body.public ? 1 : 0);
+  }
+  if (body.dormancyQuietSeconds !== undefined) {
+    const { DORMANCY_QUIET_SECONDS_MIN, DORMANCY_QUIET_SECONDS_MAX } = await import('@noriq-dev/shared');
+    if (body.dormancyQuietSeconds === null) {
+      sets.push('dormancy_quiet_seconds = ?'); binds.push(null);
+    } else {
+      const n = Math.round(body.dormancyQuietSeconds);
+      if (!Number.isFinite(n) || n < DORMANCY_QUIET_SECONDS_MIN || n > DORMANCY_QUIET_SECONDS_MAX) {
+        return c.json({
+          error: `dormancyQuietSeconds must be null (off) or ${DORMANCY_QUIET_SECONDS_MIN}–${DORMANCY_QUIET_SECONDS_MAX} seconds`,
+        }, 400);
+      }
+      sets.push('dormancy_quiet_seconds = ?'); binds.push(n);
+    }
   }
   if (sets.length) {
     binds.push(pid);

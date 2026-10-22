@@ -961,12 +961,12 @@ export class ProjectRoom extends DurableObject<Env> {
         // 'proposed' wire status and every agent-path gate key off that column, exactly the
         // failed_at pattern (tasks.status carries a CHECK D1 cannot widen).
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, proposed_at, spinoff_run_id, spinoff_source_task_id, spinoff_finding, proposal_actor_kind, proposal_actor_id, proposal_execution_id, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, proposed_at, spinoff_run_id, spinoff_source_task_id, spinoff_finding, proposal_actor_kind, proposal_actor_id, proposal_execution_id, "order", created_at, updated_at, content_activity_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(id, pid, key, milestoneId, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec,
           input.proposal ? now : null, input.proposal?.runId ?? null, input.proposal?.sourceTaskId ?? null, input.proposal?.finding ?? null,
           input.proposal?.actorKind ?? null, input.proposal?.actorId ?? null, input.proposal?.executionId ?? null,
-          proj.n, now, now),
+          proj.n, now, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of depIds) {
@@ -1296,8 +1296,16 @@ export class ProjectRoom extends DurableObject<Env> {
         }
       }
       if (!sets.length) return { ok: true, key: task.key };
+      const contentTouched = patch.body !== undefined || executionSpec !== undefined;
+      const touchAt = nowIso();
       sets.push('updated_at = ?');
-      binds.push(nowIso(), taskId);
+      binds.push(touchAt);
+      // Fingerprint-affecting writes advance the dormancy quiet clock (PLNR-585); claim/title/tag do not.
+      if (contentTouched) {
+        sets.push('content_activity_at = ?');
+        binds.push(touchAt);
+      }
+      binds.push(taskId);
       await this.env.DB.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       if (statusChanged) {
         // Any transition out of active work releases the task's file locks (§5 auto-release) — this
@@ -3165,10 +3173,11 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.setPid(projectId);
       requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
       const id = newId('doc');
+      const created = nowIso();
       await this.env.DB.prepare(
-        'INSERT INTO docs (id, project_id, name, description, body, folder, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO docs (id, project_id, name, description, body, folder, author_kind, author_name, created_at, updated_at, content_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '',
-        ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name).run();
+        ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name, created, created, created).run();
       if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags, input.allowNewTags);
       const version = await this.appendDocVersion(id, actor);
       await this.emit(actor, 'doc.created', 'doc', id, { name: input.name, version });
@@ -3215,18 +3224,20 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
       if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
       if (patch.folder !== undefined) { sets.push('folder = ?'); binds.push(ProjectRoom.normalizeFolder(patch.folder)); }
+      // Doc fingerprint is the version — any bump is content activity for dormancy (PLNR-585).
+      const bumpAt = nowIso();
       if (!sets.length) {
         if (!touched) return { ok: true };
-        sets.push('updated_at = ?', 'current_version = current_version + 1');
-        binds.push(nowIso(), docId);
+        sets.push('updated_at = ?', 'content_activity_at = ?', 'current_version = current_version + 1');
+        binds.push(bumpAt, bumpAt, docId);
         await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
         const version = await this.appendDocVersion(docId, actor);
         await this.emit(actor, 'doc.updated', 'doc', docId, { name: doc.name, fields: ['tags'], version });
         this.reindexSearch('doc', docId);
         return { ok: true, version };
       }
-      sets.push('updated_at = ?', 'current_version = current_version + 1');
-      binds.push(nowIso(), docId);
+      sets.push('updated_at = ?', 'content_activity_at = ?', 'current_version = current_version + 1');
+      binds.push(bumpAt, bumpAt, docId);
       await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       const version = await this.appendDocVersion(docId, actor);
       await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch), version });
@@ -5471,9 +5482,10 @@ export class ProjectRoom extends DurableObject<Env> {
       // under the serialization, so a throw below this line is infrastructure, not input.
       const planId = newId('pln');
       const status = input.proposed ? 'proposed' : 'active';
+      const planCreated = nowIso();
       await this.env.DB.prepare(
-        'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, nowIso()).run();
+        'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at, content_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, planCreated, planCreated).run();
   
       const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
       // PLNR-319: every task that lands in ANY phase of this plan, across the whole call —
@@ -5621,6 +5633,8 @@ export class ProjectRoom extends DurableObject<Env> {
         }
         out.push({ id: phaseId, title: p.title, taskIds: p.taskIds });
       });
+      // Phase intent is in the plan fingerprint — structural rewrite resets dormancy quiet clock.
+      stmts.push(this.env.DB.prepare('UPDATE plans SET content_activity_at = ? WHERE id = ?').bind(nowIso(), planId));
       await this.env.DB.batch(stmts);
 
       await this.emit(actor, 'plan.updated', 'plan', planId, {
@@ -5815,6 +5829,11 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
       if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
       if (!sets.length) return { ok: true };
+      // Plan fingerprint includes body (not title/description) — advance dormancy clock only then.
+      if (patch.body !== undefined) {
+        sets.push('content_activity_at = ?');
+        binds.push(nowIso());
+      }
       binds.push(planId);
       await this.env.DB.prepare(`UPDATE plans SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       await this.emit(actor, 'plan.updated', 'plan', planId, { title: patch.title ?? plan.title, fields: Object.keys(patch) });
@@ -5837,7 +5856,12 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
       if (!sets.length) return { ok: true };
       binds.push(phaseId);
-      await this.env.DB.prepare(`UPDATE phases SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      const stmts = [
+        this.env.DB.prepare(`UPDATE phases SET ${sets.join(', ')} WHERE id = ?`).bind(...binds),
+        // Phase title/body are in the plan fingerprint — bump the plan's content activity.
+        this.env.DB.prepare('UPDATE plans SET content_activity_at = ? WHERE id = ?').bind(nowIso(), row.planId),
+      ];
+      await this.env.DB.batch(stmts);
       await this.emit(actor, 'plan.updated', 'plan', row.planId, { title: patch.title ?? row.title, fields: ['phase'] });
       return { ok: true };
     
