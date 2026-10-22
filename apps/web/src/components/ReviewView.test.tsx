@@ -174,6 +174,50 @@ describe('ReviewView Validity inbox', () => {
     expect(moveTask).not.toHaveBeenCalled();
   });
 
+  it('keeps a multi-cause subject under a non-primary cause filter', async () => {
+    // Codex P2: primaryCause=content_changed but causes also includes doc_baseline_moved —
+    // filtering "Doc pin drifted" must still render the subject (badge vs blank list).
+    const multi = item({
+      subjectType: 'task',
+      subjectId: 'task_multi',
+      key: 'PLNR-9',
+      title: 'Multi-cause subject',
+      primaryCause: 'content_changed',
+      causes: ['content_changed', 'doc_baseline_moved'],
+    });
+    vi.spyOn(api, 'reviewInbox').mockImplementation(async (_pid, opts) => {
+      const cause = opts?.cause;
+      const items = !cause || multi.causes.includes(cause) ? [multi] : [];
+      return {
+        items,
+        counts: {
+          content_changed: 1,
+          doc_baseline_moved: 1,
+        },
+        overallTotal: 1,
+        total: items.length,
+        offset: 0,
+        nextOffset: null,
+        groupBy: 'cause',
+      };
+    });
+    await mount();
+
+    expect(text()).toContain('Multi-cause subject');
+    expect(text()).toContain('Content changed');
+    expect(text()).toContain('Doc pin drifted');
+
+    const docPinChip = [...container.querySelectorAll('button')].find((b) =>
+      b.textContent?.includes('Doc pin drifted'),
+    );
+    expect(docPinChip).toBeDefined();
+    await act(async () => { docPinChip!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(text()).toContain('Multi-cause subject');
+    expect(text()).not.toContain('nothing needs validity review');
+  });
+
   it('keeps mark validated and dismiss cause actions', async () => {
     mockInbox([inboxItems[0]!]);
     const validate = vi.spyOn(api, 'recordValidation').mockResolvedValue({

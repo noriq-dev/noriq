@@ -163,13 +163,16 @@ function ValidityInbox({ store }: { store: AppStore }) {
         }))
         .filter((section) => section.items.length > 0 || !!subjectType);
     }
+    // Match any listed cause, not primaryCause alone — a subject with
+    // primaryCause=content_changed and causes including doc_baseline_moved must
+    // still appear under the Doc-pin filter (and in that cause section unfiltered).
     const order = CAUSES.map((c) => c.id);
     return order
       .filter((id) => !cause || cause === id)
       .map((id) => ({
         id,
         label: CAUSES.find((c) => c.id === id)?.label ?? id,
-        items: inbox.items.filter((item) => item.primaryCause === id),
+        items: inbox.items.filter((item) => item.causes.includes(id)),
       }))
       .filter((section) => section.items.length > 0 || !!cause);
   }, [cause, groupBy, inbox.items, subjectType]);
