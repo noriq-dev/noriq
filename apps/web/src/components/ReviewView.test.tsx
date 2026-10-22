@@ -1,8 +1,9 @@
 // PLNR-583: Validity inbox group-by toggle + Supersede… action (no auto-close).
+// PLNR-588: Memory review tab shares Review chrome without merging authority schemas.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiEntityReviewInboxItem } from '../api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api, type ApiEntityReviewInboxItem, type ApiMemoryReviewQueue } from '../api';
 import type { AppStore } from '../store';
 import { ReviewView } from './ReviewView';
 
@@ -44,9 +45,25 @@ const inboxItems: ApiEntityReviewInboxItem[] = [
   }),
 ];
 
-function store(): AppStore {
+const emptyMemoryQueue: ApiMemoryReviewQueue = {
+  items: [],
+  counts: {
+    proposed_decision: 0,
+    contradiction: 0,
+    stale_invalid: 0,
+    recent_negative_feedback: 0,
+    low_authority: 0,
+  },
+  overallTotal: 0,
+  total: 0,
+  offset: 0,
+  nextOffset: null,
+};
+
+function store(canManage = true): AppStore {
   return {
     currentPid: 'prj_1',
+    permissions: { canManage },
     helpers: {
       tasksOf: () => [],
     },
@@ -73,6 +90,10 @@ function mockInbox(items = inboxItems) {
     groupBy: 'cause',
   });
 }
+
+beforeEach(() => {
+  vi.spyOn(api, 'memoryReviewQueue').mockResolvedValue(emptyMemoryQueue);
+});
 
 async function mount() {
   container = document.createElement('div');
@@ -248,5 +269,112 @@ describe('ReviewView Validity inbox', () => {
       cause: 'content_changed',
       status: 'dismissed',
     });
+  });
+});
+
+describe('ReviewView Memory tab (PLNR-588)', () => {
+  it('hosts memory review in the same chrome without calling entity review-inbox', async () => {
+    const pending: ApiMemoryReviewQueue['items'][number] = {
+      id: 'mem_pending',
+      kind: 'decision',
+      statement: 'Use a single retry budget.',
+      authority: 2,
+      validity: 'active',
+      recordedAt: '2026-08-09T12:00:00.000Z',
+      recordedByAgentId: 'agt_1',
+      proposedAt: '2026-08-09T12:00:00.000Z',
+      repositoryKey: 'repo',
+      branch: 'main',
+      baseId: 'abc123',
+      reasons: ['proposed_decision', 'low_authority'],
+      contradictionSetIds: [],
+      recentNegativeFeedbackCount: 0,
+      latestNegativeFeedbackAt: null,
+    };
+    const memoryQueue: ApiMemoryReviewQueue = {
+      items: [pending],
+      counts: {
+        proposed_decision: 1,
+        contradiction: 0,
+        stale_invalid: 0,
+        recent_negative_feedback: 0,
+        low_authority: 1,
+      },
+      overallTotal: 1,
+      total: 1,
+      offset: 0,
+      nextOffset: null,
+    };
+    vi.spyOn(api, 'memoryReviewQueue').mockResolvedValue(memoryQueue);
+    const reviewInbox = vi.spyOn(api, 'reviewInbox');
+
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const s = store();
+    await act(async () => { root!.render(<ReviewView store={s} />); });
+    await act(async () => { await Promise.resolve(); });
+
+    const memoryTab = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Memory'));
+    expect(memoryTab?.textContent).toMatch(/Memory\s*·\s*1/);
+    await act(async () => { memoryTab!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(text()).toContain('Memory review · separate authority');
+    expect(text()).toContain('Use a single retry budget.');
+    expect(text()).toContain('Proposed decisions');
+    expect(text()).toContain('Approve decision');
+    expect(text()).not.toContain('Needs review · tasks + plans + docs');
+    expect(reviewInbox).not.toHaveBeenCalled();
+  });
+
+  it('hands Inspect off to Memory view without merging schemas', async () => {
+    const pending: ApiMemoryReviewQueue['items'][number] = {
+      id: 'mem_pending',
+      kind: 'decision',
+      statement: 'Inspect me.',
+      authority: 2,
+      validity: 'active',
+      recordedAt: '2026-08-09T12:00:00.000Z',
+      recordedByAgentId: 'agt_1',
+      proposedAt: '2026-08-09T12:00:00.000Z',
+      repositoryKey: null,
+      branch: null,
+      baseId: null,
+      reasons: ['low_authority'],
+      contradictionSetIds: [],
+      recentNegativeFeedbackCount: 0,
+      latestNegativeFeedbackAt: null,
+    };
+    vi.spyOn(api, 'memoryReviewQueue').mockResolvedValue({
+      items: [pending],
+      counts: {
+        proposed_decision: 0,
+        contradiction: 0,
+        stale_invalid: 0,
+        recent_negative_feedback: 0,
+        low_authority: 1,
+      },
+      overallTotal: 1,
+      total: 1,
+      offset: 0,
+      nextOffset: null,
+    });
+
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const s = store();
+    await act(async () => { root!.render(<ReviewView store={s} />); });
+    await act(async () => { await Promise.resolve(); });
+    const memoryTab = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Memory'));
+    await act(async () => { memoryTab!.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    const inspect = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Inspect evidence & history');
+    expect(inspect).toBeDefined();
+    await act(async () => { inspect!.click(); });
+    expect(sessionStorage.getItem('noriq.openMemory')).toBe('mem_pending');
+    expect(s.actions.setView).toHaveBeenCalledWith('memory');
   });
 });

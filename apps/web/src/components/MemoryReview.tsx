@@ -2,6 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, type ApiMemoryReviewQueue, type ApiMemoryReviewQueueItem, type ApiMemoryReviewReason } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
+import {
+  ReviewEmptyState,
+  ReviewFilterChipGrid,
+  ReviewInboxIntro,
+  ReviewLoadingState,
+} from './ReviewInboxChrome';
 import { Button, TextArea } from './ui';
 
 const REASONS: Array<{ id: ApiMemoryReviewReason; label: string; detail: string; color: string }> = [
@@ -15,11 +21,13 @@ const REASONS: Array<{ id: ApiMemoryReviewReason; label: string; detail: string;
 const EMPTY_COUNTS = Object.fromEntries(REASONS.map(({ id }) => [id, 0])) as Record<ApiMemoryReviewReason, number>;
 const emptyQueue = (): ApiMemoryReviewQueue => ({ items: [], counts: EMPTY_COUNTS, overallTotal: 0, total: 0, offset: 0, nextOffset: null });
 
-export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
+export function MemoryReview({ pid, store, onOpenInspector, onQueueChange, chrome = 'standalone' }: {
   pid: string;
   store: AppStore;
   onOpenInspector: (uri: string) => void;
   onQueueChange?: (total: number) => void;
+  /** `shell` = Review page chrome (shared with Validity). `standalone` = Memory view tab. */
+  chrome?: 'standalone' | 'shell';
 }) {
   const [reason, setReason] = useState<ApiMemoryReviewReason | undefined>();
   const [queue, setQueue] = useState<ApiMemoryReviewQueue>(emptyQueue);
@@ -27,6 +35,7 @@ export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
   const [error, setError] = useState('');
   const [acting, setActing] = useState<string | null>(null);
   const [decision, setDecision] = useState<{ id: string; action: 'approve' | 'reject'; note: string } | null>(null);
+  const shell = chrome === 'shell';
 
   const load = useCallback(async (append = false) => {
     setLoading(true);
@@ -61,62 +70,90 @@ export function MemoryReview({ pid, store, onOpenInspector, onQueueChange }: {
     }
   };
 
-  return (
-    <div style={{ height: '100%', overflowY: 'auto', padding: '20px clamp(18px, 4vw, 54px) 48px' }}>
-      <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+  const chips = REASONS.map((item) => ({
+    id: item.id,
+    label: item.label,
+    detail: item.detail,
+    color: item.color,
+    count: queue.counts[item.id] ?? 0,
+  }));
+
+  const body = (
+    <>
+      {shell ? (
+        <ReviewInboxIntro
+          label="Memory review · separate authority"
+          trailing={!store.permissions.canManage ? (
+            <MonoTag color="var(--text-dim)" bg="var(--w-05)" size={9}>READ-ONLY REVIEW</MonoTag>
+          ) : undefined}
+          description={
+            <>
+              Same Review chrome as Validity — memory still uses its own authority, validity, supersession, and governance APIs.
+              Resolve proposed decisions and inspect memories that need human judgement.
+            </>
+          }
+        />
+      ) : (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 20, marginBottom: 20 }}>
           <div style={{ flex: 1 }}>
             <SectionLabel>Human governance</SectionLabel>
             <h2 style={{ fontSize: 22, margin: '5px 0 7px' }}>Memory review queue</h2>
             <div style={{ color: 'var(--text-dim)', fontSize: 12.5, lineHeight: 1.55 }}>
               Resolve proposed decisions and inspect memories whose authority, validity, feedback, or contradictions need human judgement.
+              Also available under Review → Memory (same queue, shared chrome).
             </div>
           </div>
           {!store.permissions.canManage && (
             <MonoTag color="var(--text-dim)" bg="var(--w-05)" size={9}>READ-ONLY REVIEW</MonoTag>
           )}
         </div>
+      )}
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(165px, 1fr))', gap: 8, marginBottom: 22 }}>
-          {REASONS.map((item) => (
-            <button key={item.id} onClick={() => setReason(reason === item.id ? undefined : item.id)} style={{
-              cursor: 'pointer', textAlign: 'left', padding: '12px 13px', borderRadius: 10,
-              background: reason === item.id ? 'var(--w-1)' : 'var(--w-04)',
-              border: `1px solid ${reason === item.id ? item.color : 'var(--w-08)'}`,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
-                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 16 }}>{queue.counts[item.id] ?? 0}</span>
-              </div>
-              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
-            </button>
-          ))}
-        </div>
+      <ReviewFilterChipGrid
+        chips={chips}
+        selectedId={reason}
+        onSelect={(id) => setReason(id as ApiMemoryReviewReason | undefined)}
+      />
 
-        {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: 14 }}>{error}</div>}
-        {!loading && queue.items.length === 0 && (
-          <div style={{ padding: 40, border: '1px dashed var(--w-12)', borderRadius: 12, textAlign: 'center', color: 'var(--text-dim)' }}>
-            No memories currently need review{reason ? ' for this reason' : ''}.
-          </div>
-        )}
-        <div style={{ display: 'grid', gap: 10 }}>
-          {queue.items.map((item) => (
-            <ReviewCard
-              key={item.id}
-              item={item}
-              canManage={store.permissions.canManage}
-              acting={acting === item.id}
-              decision={decision?.id === item.id ? decision : null}
-              onDecision={(action) => setDecision({ id: item.id, action, note: '' })}
-              onNote={(note) => setDecision((current) => current?.id === item.id ? { ...current, note } : current)}
-              onCancel={() => setDecision(null)}
-              onConfirm={() => void settleDecision()}
-              onInspect={() => onOpenInspector(`noriq://memory/${item.id}`)}
-            />
-          ))}
+      {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: shell ? 12 : 14 }}>{error}</div>}
+      {!loading && queue.items.length === 0 && (
+        <ReviewEmptyState>
+          {shell
+            ? `nothing needs memory review${reason ? ' for this reason' : ''}`
+            : `No memories currently need review${reason ? ' for this reason' : ''}.`}
+        </ReviewEmptyState>
+      )}
+      <div style={{ display: 'grid', gap: 10 }}>
+        {queue.items.map((item) => (
+          <ReviewCard
+            key={item.id}
+            item={item}
+            canManage={store.permissions.canManage}
+            acting={acting === item.id}
+            decision={decision?.id === item.id ? decision : null}
+            onDecision={(action) => setDecision({ id: item.id, action, note: '' })}
+            onNote={(note) => setDecision((current) => current?.id === item.id ? { ...current, note } : current)}
+            onCancel={() => setDecision(null)}
+            onConfirm={() => void settleDecision()}
+            onInspect={() => onOpenInspector(`noriq://memory/${item.id}`)}
+          />
+        ))}
+      </div>
+      {loading && <ReviewLoadingState>Loading review queue…</ReviewLoadingState>}
+      {!loading && queue.nextOffset != null && (
+        <div style={{ textAlign: 'center', marginTop: 16 }}>
+          <Button variant="ghost" onClick={() => void load(true)}>Load more</Button>
         </div>
-        {loading && <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 11 }}>Loading review queue…</div>}
-        {!loading && queue.nextOffset != null && <div style={{ textAlign: 'center', marginTop: 16 }}><Button variant="ghost" onClick={() => void load(true)}>Load more</Button></div>}
+      )}
+    </>
+  );
+
+  if (shell) return body;
+
+  return (
+    <div style={{ height: '100%', overflowY: 'auto', padding: '20px clamp(18px, 4vw, 54px) 48px' }}>
+      <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+        {body}
       </div>
     </div>
   );
