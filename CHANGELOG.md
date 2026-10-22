@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Memory/Intelligence copy post-runner + post-index-drop (PLNR-572)
+
+- Memory Ops / Graph / Star Map no longer promise a Noriq repository reindex or ingest-client refresh; empty code-graph notices match the settled “local IDEs own code understanding” decision.
+- Project Intelligence defaults to Copilot claims, labels runner capacity and RunnerJob history as archived, and points empty states at Copilot claims + Project Memory.
+
 ## 0.79.0 - 2026-09-17
 
 ### Repository indexing off by default (PLNR-573)
