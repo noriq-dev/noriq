@@ -869,7 +869,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
   const project = await c.env.DB.prepare(
     `SELECT p.id, p.key, p.name, p.description, p.claim_ttl_seconds AS claimTtlSeconds,
             p.lock_ttl_seconds AS lockTtlSeconds, p.file_locking_enabled AS fileLockingEnabled,
-            p.repo_url AS repoUrl,
+            p.dormancy_quiet_seconds AS dormancyQuietSeconds, p.repo_url AS repoUrl,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'review' AND t.archived_at IS NULL) AS reviewTasks,
             (SELECT COALESCE(MAX(e.seq), 0) FROM events e WHERE e.project_id = p.id) AS eventSeq
        FROM projects p WHERE p.id = ?`,
