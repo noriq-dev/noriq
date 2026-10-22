@@ -746,4 +746,77 @@ describe('reviewInbox batched freshness (PLNR-585 scale)', () => {
       expect([...item.causes].sort()).toEqual(actionable);
     }
   });
+
+  it('batched inbox and subjectFreshness agree when matching fingerprint is outside the lookback window', async () => {
+    // Repro: 1×A validation, then 20×B, restore body to A. Matching A sits outside the
+    // per-subject top-20 window — both paths must report content_changed (dormancy off).
+    const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BWIN', name: 'inbox-lookback-window' });
+    const pid = p.body.id as string;
+    const proj = await mcpCall(agent.apiKey, 'get_project', { projectId: pid });
+    const ms = proj.body.milestones[0].id as string;
+
+    const created = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [{ title: 'window restore', body: 'content-A', tags: ['lifecycle'], milestoneId: ms }],
+    });
+    const taskId = (created.body.created as Array<{ id: string }>)[0].id;
+
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId: pid, subjectType: 'task', subjectId: taskId, note: 'A',
+    });
+
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId: pid, tasks: [{ taskId, set: { body: 'content-B' } }],
+    });
+    const bVal = await mcpCall(agent.apiKey, 'record_validation', {
+      projectId: pid, subjectType: 'task', subjectId: taskId, note: 'B-0',
+    });
+    expect(bVal.isError).toBeFalsy();
+    const bFp = bVal.body.contentFingerprint as string;
+
+    // Pad to 20 B validations with staggered timestamps so A is strictly outside lookback.
+    const bRow = await env.DB.prepare(
+      `SELECT actor_kind, actor_id, actor_name, baselines_json
+         FROM entity_validations WHERE id = ?`,
+    ).bind(bVal.body.id as string).first<{
+      actor_kind: string; actor_id: string | null; actor_name: string; baselines_json: string;
+    }>();
+    expect(bRow).toBeTruthy();
+    const stmts = [];
+    for (let i = 1; i < 20; i++) {
+      const ts = new Date(Date.UTC(2024, 0, 1, 0, 0, i)).toISOString();
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO entity_validations
+            (id, project_id, subject_type, subject_id, content_fingerprint, validated_at,
+             actor_kind, actor_id, actor_name, baselines_json, note)
+           VALUES (?, ?, 'task', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          `val_bwin_${i}`, pid, taskId, bFp, ts,
+          bRow!.actor_kind, bRow!.actor_id, bRow!.actor_name, bRow!.baselines_json, `B-${i}`,
+        ),
+      );
+    }
+    await env.DB.batch(stmts);
+    // Ensure the original B-0 row is also inside the window and newer than A.
+    await env.DB.prepare(
+      `UPDATE entity_validations SET validated_at = ? WHERE id = ?`,
+    ).bind(new Date(Date.UTC(2024, 0, 1, 0, 0, 0)).toISOString(), bVal.body.id as string).run();
+    await env.DB.prepare(
+      `UPDATE entity_validations SET validated_at = ? WHERE subject_id = ? AND note = 'A'`,
+    ).bind(new Date(Date.UTC(2023, 0, 1)).toISOString(), taskId).run();
+
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId: pid, tasks: [{ taskId, set: { body: 'content-A' } }],
+    });
+
+    const fresh = await subjectFreshness(env.DB, pid, 'task', taskId);
+    expect(fresh.criticalCauses).toContain('content_changed');
+
+    const inbox = await reviewInbox(env.DB, pid, { cause: 'content_changed' });
+    const item = inbox.items.find((i) => i.subjectId === taskId);
+    expect(item).toBeTruthy();
+    expect(item!.causes).toContain('content_changed');
+    expect(item!.primaryCause).toBe('content_changed');
+  });
 });

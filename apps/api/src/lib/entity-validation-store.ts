@@ -34,6 +34,12 @@ export type { SubjectFreshnessOptions };
  */
 const D1_IN_CHUNK = 90;
 
+/**
+ * Freshness considers only this many most-recent validations per subject
+ * (individual `latestValidations` and batched inbox must stay aligned).
+ */
+const VALIDATION_LOOKBACK = 20;
+
 function chunkIds(ids: string[], size = D1_IN_CHUNK): string[][] {
   if (!ids.length) return [];
   const out: string[][] = [];
@@ -75,13 +81,23 @@ async function batchValidationsBySubject(
 ): Promise<Map<string, ValidationRow[]>> {
   const map = new Map<string, ValidationRow[]>();
   for (const chunk of chunkIds(subjectIds)) {
+    // Same selection policy as latestValidations: newest VALIDATION_LOOKBACK per
+    // subject_id — not all history, and not a global LIMIT across subjects.
     const { results } = await db.prepare(
       `SELECT id, project_id, subject_type, subject_id, content_fingerprint, validated_at,
               actor_kind, actor_id, actor_name, baselines_json, note
-         FROM entity_validations
-        WHERE project_id = ? AND subject_type = ? AND subject_id IN (${chunk.map(() => '?').join(',')})
+         FROM (
+           SELECT id, project_id, subject_type, subject_id, content_fingerprint, validated_at,
+                  actor_kind, actor_id, actor_name, baselines_json, note,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY subject_id ORDER BY validated_at DESC
+                  ) AS rn
+             FROM entity_validations
+            WHERE project_id = ? AND subject_type = ? AND subject_id IN (${chunk.map(() => '?').join(',')})
+         )
+        WHERE rn <= ?
         ORDER BY validated_at DESC`,
-    ).bind(projectId, subjectType, ...chunk).all();
+    ).bind(projectId, subjectType, ...chunk, VALIDATION_LOOKBACK).all();
     for (const raw of results ?? []) {
       const row = validationFromRow(raw as Parameters<typeof validationFromRow>[0]);
       const list = map.get(row.subjectId) ?? [];
@@ -212,8 +228,8 @@ async function latestValidations(
             actor_kind, actor_id, actor_name, baselines_json, note
        FROM entity_validations
       WHERE project_id = ? AND subject_type = ? AND subject_id = ?
-      ORDER BY validated_at DESC LIMIT 20`,
-  ).bind(projectId, subjectType, subjectId).all();
+      ORDER BY validated_at DESC LIMIT ?`,
+  ).bind(projectId, subjectType, subjectId, VALIDATION_LOOKBACK).all();
   const rows = (results ?? []).map((r) => validationFromRow(r as Parameters<typeof validationFromRow>[0]));
   const latestAny = rows[0] ?? null;
   const latestMatching = rows.find((r) => r.contentFingerprint === fingerprint) ?? null;
