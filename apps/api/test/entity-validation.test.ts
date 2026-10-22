@@ -318,4 +318,118 @@ describe('code assessments (PLNR-584 / P1-F)', () => {
     expect(claim.isError).toBeFalsy();
     await mcpCall(agent.apiKey, 'release_task', { projectId, taskId, toStatus: 'todo' });
   });
+
+  it('revalidation clears open stale without forever-suppressing later B→C drift', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess lifecycle', body: 'lifecycle body', tags: ['lifecycle'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+
+    // Open a stored stale flag, then revalidate at revision B.
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'code_assessment_stale',
+      status: 'open',
+      detail: 'prior A→somewhere drift',
+    });
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: {
+        codeAssessments: [{
+          ...assessment,
+          baseId: 'rev-B',
+        }],
+      },
+    });
+
+    // Freshness for C (≠ B) must still warn — dismissed sentinel must not suppress derived push.
+    const forC = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'rev-C',
+    });
+    expect(forC.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+    expect(forC.body.impactUnknown).toBe(false);
+
+    // Matching B stays fresh (prior stored open was cleared, not forever-dismissed).
+    const forB = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'rev-B',
+    });
+    expect(forB.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(false);
+  });
+
+  it('preserves stored open stale when no assessments; unassessed scope → impact_unknown', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess none', body: 'no assessment body', tags: ['schema'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId, subjectType: 'task', subjectId: taskId,
+    });
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'code_assessment_stale',
+      status: 'open',
+      detail: 'manual stale while unassessed',
+    });
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: assessment.repositoryKey,
+      branch: assessment.branch,
+      baseId: 'any-base',
+    });
+    expect(fresh.body.impactUnknown).toBe(true);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'impact_unknown')).toBe(true);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+  });
+
+  it('preserves stored open stale on mismatched repo/branch; unassessed caller scope → impact_unknown', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'assess mismatch', body: 'mismatch body', tags: ['mcp'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      baselines: { codeAssessments: [assessment] },
+    });
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      cause: 'code_assessment_stale',
+      status: 'open',
+      detail: 'prior scoped drift',
+    });
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', {
+      projectId,
+      subjectType: 'task',
+      subjectId: taskId,
+      repositoryKey: 'github.com/other/repo',
+      branch: 'other-branch',
+      baseId: 'zzz-unrelated',
+    });
+    expect(fresh.body.impactUnknown).toBe(true);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'impact_unknown')).toBe(true);
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'code_assessment_stale')).toBe(true);
+  });
 });
