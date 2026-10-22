@@ -110,15 +110,8 @@ export type StoredCauseRow = {
 export type SubjectFreshnessOptions = {
   /** Injectable clock for dormancy comparison (PLNR-585). */
   now?: string | null;
-  /**
-   * Agent-declared code revision for code_assessment_stale (PLNR-584 / P1-F).
-   * Accepted here for merge compatibility with #19; wiring lives in that PR.
-   */
-  declaredRevision?: {
-    repositoryKey?: string | null;
-    branch?: string | null;
-    baseId?: string | null;
-  } | null;
+  /** Agent-declared code revision for code_assessment_stale. */
+  declaredRevision?: DeclaredCodeRevision | null;
 };
 
 /** Later of ISO timestamps; ignores null/invalid. */
@@ -153,11 +146,99 @@ export function dormancyActivityAt(input: {
 }
 
 /**
+ * Agent-declared current VCS revision for comparing stored code assessments.
+ * Noriq does not fetch or index repos — staleness is declared, not discovered.
+ */
+export type DeclaredCodeRevision = {
+  repositoryKey?: string | null;
+  branch?: string | null;
+  baseId?: string | null;
+};
+
+/** Result of comparing agent-declared revision to stored code assessments. */
+export type CodeAssessmentEval =
+  | { status: 'unevaluable'; reason: 'no_declaration' | 'no_base_id' | 'no_assessments' | 'scope_miss' }
+  | { status: 'fresh' }
+  | { status: 'stale'; detail: string };
+
+function filterAssessmentsForScope(
+  assessments: ValidationBaselines['codeAssessments'],
+  declared: DeclaredCodeRevision | null | undefined,
+): ValidationBaselines['codeAssessments'] {
+  if (!declared) return assessments;
+  const repoKey = declared.repositoryKey?.trim() || null;
+  const branch = declared.branch?.trim() || null;
+  if (!repoKey && !branch) return assessments;
+  return assessments.filter((a) => {
+    if (repoKey && a.repositoryKey !== repoKey) return false;
+    if (branch && a.branch !== branch) return false;
+    return true;
+  });
+}
+
+/**
+ * True when the caller's scope has no usable assessment: no assessments at all, or a
+ * declared repositoryKey/branch that matches none of the stored assessments.
+ */
+export function callerScopeUnassessed(
+  assessments: ValidationBaselines['codeAssessments'],
+  declared: DeclaredCodeRevision | null | undefined,
+): boolean {
+  if (!assessments.length) return true;
+  const repoKey = declared?.repositoryKey?.trim() || null;
+  const branch = declared?.branch?.trim() || null;
+  if (!repoKey && !branch) return false;
+  return filterAssessmentsForScope(assessments, declared).length === 0;
+}
+
+/**
+ * Compare agent-declared current baseId to stored assessments.
+ * Distinguishes unevaluable (no baseId / no matching scope) from fresh vs stale so
+ * stored open warnings are only superseded when a matching scope was successfully evaluated.
+ */
+export function evaluateCodeAssessment(
+  assessments: ValidationBaselines['codeAssessments'],
+  declared: DeclaredCodeRevision | null | undefined,
+): CodeAssessmentEval {
+  if (!declared) return { status: 'unevaluable', reason: 'no_declaration' };
+  const declaredBaseId = declared.baseId?.trim();
+  if (!declaredBaseId) return { status: 'unevaluable', reason: 'no_base_id' };
+  if (!assessments.length) return { status: 'unevaluable', reason: 'no_assessments' };
+
+  const scoped = filterAssessmentsForScope(assessments, declared);
+  // Declared a repo/branch with no matching assessment → not "stale"; caller gets impact_unknown.
+  if (!scoped.length) return { status: 'unevaluable', reason: 'scope_miss' };
+
+  const drifted = scoped.filter((a) => a.baseId !== declaredBaseId);
+  if (!drifted.length) return { status: 'fresh' };
+
+  return {
+    status: 'stale',
+    detail: drifted
+      .map((a) => `${a.repositoryKey}@${a.branch} assessed=${a.baseId} declared=${declaredBaseId}`)
+      .join(', '),
+  };
+}
+
+/**
+ * Compare agent-declared current baseId to stored assessments.
+ * Returns detail when stale; null when fresh or not evaluable (no declaration / no match scope).
+ */
+export function codeAssessmentStaleDetail(
+  assessments: ValidationBaselines['codeAssessments'],
+  declared: DeclaredCodeRevision | null | undefined,
+): string | null {
+  const ev = evaluateCodeAssessment(assessments, declared);
+  return ev.status === 'stale' ? ev.detail : null;
+}
+
+/**
  * Compute freshness for a subject given its current fingerprint, latest matching
  * validation, doc pins, supersession, and stored cause rows (human_flagged / dismissals).
  *
  * Dormancy (P1-G): when `dormancyQuietSeconds` is null/≤0 the clock is OFF. When set,
  * quiet since lastValidated/content activity opens advisory `dormant` only — never auto-close.
+ * Pass `declaredRevision` (agent-reported baseId) to derive `code_assessment_stale`.
  */
 export function computeFreshness(input: {
   subjectType: ValidationSubjectType;
@@ -176,13 +257,16 @@ export function computeFreshness(input: {
   createdAt?: string | null;
   /** Clock for dormancy comparison (injectable in tests). */
   now?: string | null;
+  declaredRevision?: DeclaredCodeRevision | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
   const dismissed = new Set(
     input.storedCauses.filter((c) => c.status === 'dismissed').map((c) => c.cause),
   );
   const push = (code: ReviewCause, detail?: string) => {
-    if (dismissed.has(code) && code !== 'human_flagged') return;
+    // code_assessment_stale is derived from declared baseId; a dismissed sentinel must not
+    // forever-suppress later B→C drift (revalidation clears open rows instead of dismissing).
+    if (dismissed.has(code) && code !== 'human_flagged' && code !== 'code_assessment_stale') return;
     // human_flagged only surfaces when open
     if (code === 'human_flagged') {
       const row = input.storedCauses.find((c) => c.cause === 'human_flagged' && c.status === 'open');
@@ -243,25 +327,36 @@ export function computeFreshness(input: {
     }
   }
 
-  for (const row of input.storedCauses) {
-    if (row.status !== 'open') continue;
-    if (row.cause === 'human_flagged') push('human_flagged', row.detail);
-    // code_assessment_stale remains P1-F stub: only if explicitly stored open.
-    // dormant may also be force-opened via set_review_cause; derived path above is primary.
-    if (row.cause === 'code_assessment_stale' || row.cause === 'dormant') {
-      push(row.cause as ReviewCause, row.detail);
-    }
-  }
-
   const baselines = input.latestMatching
     ? parseBaselines(input.latestMatching.baselinesJson)
     : input.latestAny
       ? parseBaselines(input.latestAny.baselinesJson)
       : null;
 
-  const hasAssessment = (baselines?.codeAssessments?.length ?? 0) > 0;
-  const impactUnknown = !hasAssessment;
+  const assessments = baselines?.codeAssessments ?? [];
+  const impactUnknown = callerScopeUnassessed(assessments, input.declaredRevision);
   if (impactUnknown) push('impact_unknown');
+
+  // P1-F: agent-declared baseId drift vs stored assessments (advisory; no repo fetch).
+  const assessmentEval = evaluateCodeAssessment(assessments, input.declaredRevision);
+  // Only a successfully evaluated matching scope may supersede a stored open warning.
+  const assessedScopeEvaluated =
+    assessmentEval.status === 'fresh' || assessmentEval.status === 'stale';
+  if (assessmentEval.status === 'stale') {
+    push('code_assessment_stale', assessmentEval.detail);
+  }
+
+  for (const row of input.storedCauses) {
+    if (row.status !== 'open') continue;
+    if (row.cause === 'human_flagged') push('human_flagged', row.detail);
+    // Dormancy may also be explicitly force-opened.
+    if (row.cause === 'dormant') push('dormant', row.detail);
+    // Preserve stored open code_assessment_stale when declaration cannot be evaluated
+    // (no baseId, no assessments, or mismatched repo/branch). Matching-scope eval wins.
+    if (row.cause === 'code_assessment_stale' && !assessedScopeEvaluated) {
+      push('code_assessment_stale', row.detail);
+    }
+  }
 
   // Deduplicate by code (first wins)
   const seen = new Set<string>();

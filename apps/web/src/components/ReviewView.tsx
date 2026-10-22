@@ -3,21 +3,27 @@
 // or per-task drawer digging. Send-back requires a note: an agent bounced with
 // no reason just re-does the same thing.
 //
-// PLNR-580: also hosts the validity / decay inbox (tasks + plans + docs) grouped
-// by cause — mark validated, dismiss cause, open subject. No auto-close.
-import { useCallback, useEffect, useState } from 'react';
+// PLNR-580 / PLNR-583: also hosts the validity / decay inbox (tasks + plans + docs).
+// Group by cause (default) or entity type; Validate, dismiss cause, Supersede…
+// via existing REST. No auto-close.
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api,
+  type ApiEntityReviewGroupBy,
   type ApiEntityReviewInbox,
   type ApiEntityReviewInboxItem,
+  type ApiProjectDoc,
   type ApiReviewCause,
   type ApiTaskDetail,
+  type ApiValidationSubjectType,
 } from '../api';
 import type { ExecutionSpec } from '@noriq-dev/shared';
 import { SpecView } from './ExecutionSpec';
 import type { AppStore } from '../store';
 import type { TaskVM } from '../types';
 import { MonoTag, SectionLabel } from './bits';
+import { PlanSearchSelect } from './PlanSearchSelect';
+import { TaskSearchSelect } from './TaskSearchSelect';
 import { Button } from './ui';
 import { Markdown } from './Markdown';
 
@@ -32,8 +38,14 @@ const CAUSES: Array<{ id: ApiReviewCause; label: string; detail: string; color: 
   { id: 'dormant', label: 'Dormant', detail: 'Opt-in quiet period (P1)', color: 'var(--text-dim)' },
 ];
 
-const emptyInbox = (): ApiEntityReviewInbox => ({
-  items: [], counts: {}, overallTotal: 0, total: 0, offset: 0, nextOffset: null, groupBy: 'cause',
+const ENTITY_TYPES: Array<{ id: ApiValidationSubjectType; label: string; detail: string; color: string }> = [
+  { id: 'task', label: 'Tasks', detail: 'Task fingerprints and pins', color: 'var(--blue)' },
+  { id: 'plan', label: 'Plans', detail: 'Plan body / phase drift', color: 'var(--amber)' },
+  { id: 'doc', label: 'Docs', detail: 'Settled project docs', color: 'var(--text-mid)' },
+];
+
+const emptyInbox = (groupBy: ApiEntityReviewGroupBy = 'cause'): ApiEntityReviewInbox => ({
+  items: [], counts: {}, overallTotal: 0, total: 0, offset: 0, nextOffset: null, groupBy,
 });
 
 export function ReviewView({ store }: { store: AppStore }) {
@@ -101,8 +113,10 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
 
 function ValidityInbox({ store }: { store: AppStore }) {
   const pid = store.currentPid;
+  const [groupBy, setGroupBy] = useState<ApiEntityReviewGroupBy>('cause');
   const [cause, setCause] = useState<ApiReviewCause | undefined>();
-  const [inbox, setInbox] = useState<ApiEntityReviewInbox>(emptyInbox);
+  const [subjectType, setSubjectType] = useState<ApiValidationSubjectType | undefined>();
+  const [inbox, setInbox] = useState<ApiEntityReviewInbox>(() => emptyInbox('cause'));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [acting, setActing] = useState<string | null>(null);
@@ -112,16 +126,56 @@ function ValidityInbox({ store }: { store: AppStore }) {
     setError('');
     try {
       const offset = append ? inbox.nextOffset ?? 0 : 0;
-      const next = await api.reviewInbox(pid, { cause, limit: 50, offset });
-      setInbox((current) => (append ? { ...next, items: [...current.items, ...next.items] } : next));
+      const next = await api.reviewInbox(pid, {
+        cause: groupBy === 'cause' ? cause : undefined,
+        subjectType: groupBy === 'entity' ? subjectType : undefined,
+        groupBy,
+        limit: 50,
+        offset,
+      });
+      // Server may still echo groupBy:'cause'; prefer the user's toggle for presentation.
+      const normalized = { ...next, groupBy };
+      setInbox((current) => (append ? { ...normalized, items: [...current.items, ...normalized.items] } : normalized));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [cause, inbox.nextOffset, pid]);
+  }, [cause, groupBy, inbox.nextOffset, pid, subjectType]);
 
-  useEffect(() => { void load(false); }, [pid, cause]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load(false); }, [pid, cause, subjectType, groupBy]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const entityCounts = useMemo(() => {
+    const counts: Record<ApiValidationSubjectType, number> = { task: 0, plan: 0, doc: 0 };
+    for (const item of inbox.items) counts[item.subjectType] += 1;
+    return counts;
+  }, [inbox.items]);
+
+  const sections = useMemo(() => {
+    if (groupBy === 'entity') {
+      const order: ApiValidationSubjectType[] = ['task', 'plan', 'doc'];
+      return order
+        .filter((type) => !subjectType || subjectType === type)
+        .map((type) => ({
+          id: type,
+          label: ENTITY_TYPES.find((e) => e.id === type)?.label ?? type,
+          items: inbox.items.filter((item) => item.subjectType === type),
+        }))
+        .filter((section) => section.items.length > 0 || !!subjectType);
+    }
+    // Match any listed cause, not primaryCause alone — a subject with
+    // primaryCause=content_changed and causes including doc_baseline_moved must
+    // still appear under the Doc-pin filter (and in that cause section unfiltered).
+    const order = CAUSES.map((c) => c.id);
+    return order
+      .filter((id) => !cause || cause === id)
+      .map((id) => ({
+        id,
+        label: CAUSES.find((c) => c.id === id)?.label ?? id,
+        items: inbox.items.filter((item) => item.causes.includes(id)),
+      }))
+      .filter((section) => section.items.length > 0 || !!cause);
+  }, [cause, groupBy, inbox.items, subjectType]);
 
   const openSubject = (item: ApiEntityReviewInboxItem) => {
     if (item.subjectType === 'task') store.actions.openTask(item.subjectId);
@@ -160,53 +214,134 @@ function ValidityInbox({ store }: { store: AppStore }) {
     }
   };
 
+  const supersede = async (item: ApiEntityReviewInboxItem, replacementId: string) => {
+    setActing(item.subjectId);
+    setError('');
+    try {
+      // Replacement becomes current; inbox subject is the prior (history preserved, no auto-close).
+      await api.setSupersedes(pid, {
+        subjectType: item.subjectType,
+        subjectId: replacementId,
+        priorId: item.subjectId,
+      });
+      await load(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const switchGroupBy = (next: ApiEntityReviewGroupBy) => {
+    setGroupBy(next);
+    setCause(undefined);
+    setSubjectType(undefined);
+  };
+
   return (
     <>
       <div style={{ marginBottom: 14 }}>
-        <SectionLabel>Needs review · tasks + plans + docs</SectionLabel>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 12 }}>
+          <SectionLabel>Needs review · tasks + plans + docs</SectionLabel>
+          <div
+            role="group"
+            aria-label="Group validity inbox"
+            style={{ display: 'inline-flex', gap: 4, marginLeft: 'auto' }}
+          >
+            <GroupToggle active={groupBy === 'cause'} onClick={() => switchGroupBy('cause')}>
+              By cause
+            </GroupToggle>
+            <GroupToggle active={groupBy === 'entity'} onClick={() => switchGroupBy('entity')}>
+              By entity type
+            </GroupToggle>
+          </div>
+        </div>
         <div style={{ color: 'var(--text-dim)', fontSize: 12.5, lineHeight: 1.55, marginTop: 6 }}>
-          Age is not failure. This list is explicit drift, flags, or supersession — mark validated, dismiss a cause, or open the subject. Nothing auto-closes.
+          Age is not failure. This list is explicit drift, flags, or supersession — mark validated, dismiss a cause, supersede with a newer subject, or open it. Nothing auto-closes.
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 18 }}>
-        {CAUSES.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            onClick={() => setCause(cause === item.id ? undefined : item.id)}
-            style={{
-              cursor: 'pointer', textAlign: 'left', padding: '11px 12px', borderRadius: 10,
-              background: cause === item.id ? 'var(--w-1)' : 'var(--w-04)',
-              border: `1px solid ${cause === item.id ? item.color : 'var(--w-08)'}`,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-              <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
-              <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 15 }}>{inbox.counts[item.id] ?? 0}</span>
-            </div>
-            <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
-          </button>
-        ))}
-      </div>
+      {groupBy === 'cause' ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 18 }}>
+          {CAUSES.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setCause(cause === item.id ? undefined : item.id)}
+              style={{
+                cursor: 'pointer', textAlign: 'left', padding: '11px 12px', borderRadius: 10,
+                background: cause === item.id ? 'var(--w-1)' : 'var(--w-04)',
+                border: `1px solid ${cause === item.id ? item.color : 'var(--w-08)'}`,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
+                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 15 }}>{inbox.counts[item.id] ?? 0}</span>
+              </div>
+              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 18 }}>
+          {ENTITY_TYPES.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setSubjectType(subjectType === item.id ? undefined : item.id)}
+              style={{
+                cursor: 'pointer', textAlign: 'left', padding: '11px 12px', borderRadius: 10,
+                background: subjectType === item.id ? 'var(--w-1)' : 'var(--w-04)',
+                border: `1px solid ${subjectType === item.id ? item.color : 'var(--w-08)'}`,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 650 }}>{item.label}</span>
+                <span style={{ color: item.color, fontFamily: 'var(--mono)', fontSize: 15 }}>
+                  {entityCounts[item.id]}
+                </span>
+              </div>
+              <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>{item.detail}</div>
+            </button>
+          ))}
+        </div>
+      )}
 
       {error && <div style={{ color: 'var(--red-soft)', fontSize: 12, marginBottom: 12 }}>{error}</div>}
       {!loading && inbox.items.length === 0 && (
         <div style={{ padding: 40, border: '1px dashed var(--w-12)', borderRadius: 12, textAlign: 'center', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 11 }}>
-          nothing needs validity review{cause ? ' for this cause' : ''}
+          nothing needs validity review
+          {groupBy === 'cause' && cause ? ' for this cause' : ''}
+          {groupBy === 'entity' && subjectType ? ` for ${subjectType}s` : ''}
         </div>
       )}
 
-      <div style={{ display: 'grid', gap: 10 }}>
-        {inbox.items.map((item) => (
-          <ValidityRow
-            key={`${item.subjectType}:${item.subjectId}`}
-            item={item}
-            busy={acting === item.subjectId}
-            onOpen={() => openSubject(item)}
-            onValidate={() => void markValidated(item)}
-            onDismiss={(c) => void dismissCause(item, c)}
-          />
+      <div style={{ display: 'grid', gap: 16 }}>
+        {sections.map((section) => (
+          <div key={section.id}>
+            {(!cause && !subjectType) && (
+              <div style={{
+                fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.06em', textTransform: 'uppercase',
+                color: 'var(--text-faint)', marginBottom: 8,
+              }}>
+                {section.label} · {section.items.length}
+              </div>
+            )}
+            <div style={{ display: 'grid', gap: 10 }}>
+              {section.items.map((item) => (
+                <ValidityRow
+                  key={`${item.subjectType}:${item.subjectId}`}
+                  item={item}
+                  pid={pid}
+                  busy={acting === item.subjectId}
+                  onOpen={() => openSubject(item)}
+                  onValidate={() => void markValidated(item)}
+                  onDismiss={(c) => void dismissCause(item, c)}
+                  onSupersede={(replacementId) => void supersede(item, replacementId)}
+                />
+              ))}
+            </div>
+          </div>
         ))}
       </div>
       {loading && (
@@ -223,16 +358,56 @@ function ValidityInbox({ store }: { store: AppStore }) {
   );
 }
 
+function GroupToggle({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      style={{
+        cursor: 'pointer', padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+        background: active ? 'var(--w-1)' : 'transparent',
+        border: `1px solid ${active ? 'var(--accent)' : 'var(--w-08)'}`,
+        color: active ? 'var(--text)' : 'var(--text-dim)',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 function ValidityRow({
-  item, busy, onOpen, onValidate, onDismiss,
+  item, pid, busy, onOpen, onValidate, onDismiss, onSupersede,
 }: {
   item: ApiEntityReviewInboxItem;
+  pid: string;
   busy: boolean;
   onOpen: () => void;
   onValidate: () => void;
   onDismiss: (cause: ApiReviewCause) => void;
+  onSupersede: (replacementId: string) => void;
 }) {
   const primary = CAUSES.find((c) => c.id === item.primaryCause);
+  const [superseding, setSuperseding] = useState(false);
+  const [replacementId, setReplacementId] = useState('');
+  const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
+
+  useEffect(() => {
+    if (!superseding || item.subjectType !== 'doc') return;
+    let cancelled = false;
+    api.docs(pid).then((r) => {
+      if (!cancelled) setDocs(r.docs.filter((d) => d.id !== item.subjectId));
+    }).catch(() => { if (!cancelled) setDocs([]); });
+    return () => { cancelled = true; };
+  }, [item.subjectId, item.subjectType, pid, superseding]);
+
+  const confirmSupersede = () => {
+    if (!replacementId || replacementId === item.subjectId) return;
+    onSupersede(replacementId);
+    setSuperseding(false);
+    setReplacementId('');
+  };
+
   return (
     <article style={{
       padding: '13px 15px', border: '1px solid var(--w-08)', borderRadius: 11,
@@ -262,22 +437,93 @@ function ValidityRow({
           ? ` · last validated ${new Date(item.lastValidatedAt).toLocaleDateString()}`
           : ' · never validated'}
       </div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <Button variant="primary" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onValidate}>
-          mark validated
-        </Button>
-        <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onOpen}>
-          open
-        </Button>
-        <Button
-          variant="ghost"
-          style={{ padding: '5px 12px', fontSize: 11.5 }}
-          onClick={() => onDismiss(item.primaryCause)}
-          title="Dismiss this cause only — does not invent validity"
-        >
-          dismiss cause
-        </Button>
-      </div>
+      {!superseding ? (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <Button variant="primary" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onValidate}>
+            mark validated
+          </Button>
+          <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onOpen}>
+            open
+          </Button>
+          <Button
+            variant="ghost"
+            style={{ padding: '5px 12px', fontSize: 11.5 }}
+            onClick={() => onDismiss(item.primaryCause)}
+            title="Dismiss this cause only — does not invent validity"
+          >
+            dismiss cause
+          </Button>
+          <Button
+            variant="ghost"
+            style={{ padding: '5px 12px', fontSize: 11.5 }}
+            onClick={() => { setSuperseding(true); setReplacementId(''); }}
+            title="Link a newer subject that supersedes this one — history stays readable; nothing auto-closes"
+          >
+            Supersede…
+          </Button>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gap: 8, marginTop: 2 }}>
+          <div style={{ color: 'var(--text-dim)', fontSize: 11.5, lineHeight: 1.45 }}>
+            Pick the new current {item.subjectType}. This subject stays readable as prior history — status is not auto-closed.
+          </div>
+          {item.subjectType === 'task' && (
+            <TaskSearchSelect
+              projectId={pid}
+              value={replacementId}
+              onChange={setReplacementId}
+              label="Replacement task"
+              placeholder="Search the newer task…"
+            />
+          )}
+          {item.subjectType === 'plan' && (
+            <PlanSearchSelect
+              projectId={pid}
+              value={replacementId}
+              onChange={setReplacementId}
+              label="Replacement plan"
+              placeholder="Search the newer plan…"
+            />
+          )}
+          {item.subjectType === 'doc' && (
+            <label style={{ display: 'grid', gap: 4 }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, letterSpacing: '.05em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
+                Replacement doc
+              </span>
+              <select
+                value={replacementId}
+                onChange={(e) => setReplacementId(e.target.value)}
+                style={{
+                  background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 8,
+                  padding: '7px 11px', color: 'var(--text)', fontSize: 12.5, fontFamily: 'inherit',
+                }}
+              >
+                <option value="">Select a newer doc…</option>
+                {docs.map((doc) => (
+                  <option key={doc.id} value={doc.id}>{doc.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            <Button
+              variant="primary"
+              style={{ padding: '5px 12px', fontSize: 11.5 }}
+              onClick={confirmSupersede}
+              disabled={!replacementId || replacementId === item.subjectId}
+            >
+              link supersedes
+            </Button>
+            <Button
+              variant="ghost"
+              style={{ padding: '5px 12px', fontSize: 11.5 }}
+              onClick={() => { setSuperseding(false); setReplacementId(''); }}
+            >
+              cancel
+            </Button>
+          </div>
+        </div>
+      )}
     </article>
   );
 }

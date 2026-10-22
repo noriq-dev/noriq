@@ -1530,7 +1530,11 @@ app.get('/api/projects/:pid/freshness/:subjectType/:subjectId', userAuth, async 
   const subjectType = c.req.param('subjectType') as import('@noriq-dev/shared').ValidationSubjectType;
   const subjectId = c.req.param('subjectId')!;
   const { subjectFreshness } = await import('./lib/entity-validation-store');
-  return c.json(await subjectFreshness(c.env.DB, pid, subjectType, subjectId));
+  return c.json(await subjectFreshness(c.env.DB, pid, subjectType, subjectId, { declaredRevision: {
+    repositoryKey: c.req.query('repositoryKey') ?? null,
+    branch: c.req.query('branch') ?? null,
+    baseId: c.req.query('baseId') ?? null,
+  } }));
 });
 app.get('/api/projects/:pid/validations/:subjectType/:subjectId', userAuth, async (c) => {
   const pid = c.req.param('pid')!;

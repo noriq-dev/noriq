@@ -440,7 +440,7 @@ export async function subjectFreshness(
     contentActivityAt: activity.contentActivityAt,
     createdAt: activity.createdAt,
     now: opts?.now ?? null,
-    // declaredRevision reserved for P1-F (#19) merge — optional field on the same bag.
+    declaredRevision: opts?.declaredRevision ?? null,
   });
 }
 
@@ -484,11 +484,19 @@ export async function recordValidation(
       actor.kind, actor.id, actor.name, serializeBaselines(baselines), input.note ?? '',
     ),
     // Clear open content_changed / never_validated / doc_baseline_moved dismissals aren't needed —
-    // those are derived. Clear human_flagged when validating.
+    // those are derived. Dismiss human_flagged on revalidation.
     db.prepare(
       `UPDATE entity_review_causes SET status = 'dismissed', updated_at = ?, actor_kind = ?, actor_name = ?
-        WHERE project_id = ? AND subject_type = ? AND subject_id = ? AND cause = 'human_flagged' AND status = 'open'`,
+        WHERE project_id = ? AND subject_type = ? AND subject_id = ?
+          AND cause = 'human_flagged' AND status = 'open'`,
     ).bind(validatedAt, actor.kind, actor.name, projectId, input.subjectType, input.subjectId),
+    // Resolve prior code_assessment_stale by DELETE (not dismiss). A dismissed sentinel would
+    // forever-suppress push() for that cause and hide later B→C drift after revalidation at B.
+    db.prepare(
+      `DELETE FROM entity_review_causes
+        WHERE project_id = ? AND subject_type = ? AND subject_id = ?
+          AND cause = 'code_assessment_stale'`,
+    ).bind(projectId, input.subjectType, input.subjectId),
   ]);
 
   return wireValidation({

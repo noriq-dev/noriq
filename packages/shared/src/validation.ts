@@ -36,7 +36,11 @@ export function reviewCauseSeverity(cause: ReviewCause): ReviewCauseSeverity {
   return isCriticalReviewCause(cause) ? 'critical' : 'advisory';
 }
 
-/** Optional code assessment baseline (P0 stores shape; agent-declared staleness is P1). */
+/**
+ * Agent-declared code assessment baseline. Noriq stores these; it does not index repos
+ * or fetch git. Staleness (`code_assessment_stale`) is derived when a later call declares
+ * a current baseId that differs from a stored assessment's baseId.
+ */
 export const CodeAssessmentBaseline = z.object({
   repositoryKey: z.string().min(1),
   branch: z.string().min(1),

@@ -33,6 +33,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
+  "alias": { "zod/v4": "zod" },
+
 
   // Defaults to noriq-staging.workers.dev — no DNS work, and it is a real HTTPS origin, so
   // OAuth/MCP (`claude mcp add`) work against it unchanged.

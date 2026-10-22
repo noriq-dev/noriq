@@ -5917,9 +5917,10 @@ export class ProjectRoom extends DurableObject<Env> {
     projectId: string,
     subjectType: ValidationSubjectType,
     subjectId: string,
+    declaredRevision?: { repositoryKey?: string | null; branch?: string | null; baseId?: string | null } | null,
   ) {
     await this.setPid(projectId);
-    return storeSubjectFreshness(this.env.DB, projectId, subjectType, subjectId);
+    return storeSubjectFreshness(this.env.DB, projectId, subjectType, subjectId, { declaredRevision });
   }
 
   async setReviewCause(
