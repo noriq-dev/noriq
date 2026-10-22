@@ -13,7 +13,7 @@ let cookie: string;
 
 const snapshot = async () =>
   (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
-    taskDocs: Array<{ taskId: string; docId: string }>;
+    taskDocs: Array<{ taskId: string; docId: string; pinnedVersion: number | null; currentVersion: number | null }>;
   };
 
 beforeAll(async () => {
@@ -52,7 +52,9 @@ describe('task↔doc links (PLNR-182)', () => {
 
   it('snapshot exposes the link pairs for the UI', async () => {
     const s = await snapshot();
-    expect(s.taskDocs).toContainEqual({ taskId, docId: docA });
+    expect(s.taskDocs).toContainEqual({
+      taskId, docId: docA, pinnedVersion: 1, currentVersion: 1,
+    });
   });
 
   it('addDocIds/removeDocIds edit without clobbering; docIds replaces', async () => {

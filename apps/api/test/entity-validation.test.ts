@@ -1,0 +1,212 @@
+// PLNR-576..580: validation records, doc@version pins, supersession, freshness claim gate, review inbox.
+import { SELF } from 'cloudflare:test';
+import { describe, expect, it, beforeAll } from 'vitest';
+import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+
+let agent: { id: string; apiKey: string };
+let projectId: string;
+let cookie: string;
+let milestoneId: string;
+
+beforeAll(async () => {
+  agent = await createAgent('val-agent');
+  await createUser('val@example.com', 'Val Human', 'longenough1', 'admin').catch(() => {});
+  cookie = await loginSession('val@example.com', 'longenough1');
+  const p = await mcpCall(agent.apiKey, 'create_project', { key: 'VALD', name: 'validation-p0' });
+  projectId = p.body.id;
+  const proj = await mcpCall(agent.apiKey, 'get_project', { projectId });
+  milestoneId = proj.body.milestones[0].id;
+}, 60000);
+
+describe('entity validation (PLNR-576)', () => {
+  it('records validation for task/plan/doc; fingerprint ignores title/tags/priority', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'validate me', body: 'body-a', tags: ['schema'], milestoneId }],
+    });
+    expect(task.body.failed).toBe(0);
+    const taskId = task.body.created[0].id;
+
+    const fresh0 = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(fresh0.body.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(true);
+    expect(fresh0.body.lastValidatedAt).toBeNull();
+
+    const rec = await mcpCall(agent.apiKey, 'record_validation', {
+      projectId, subjectType: 'task', subjectId: taskId, note: 'looks good',
+    });
+    expect(rec.isError).toBeFalsy();
+    expect(rec.body.contentFingerprint).toBeTruthy();
+    expect(rec.body.validatedAt).toBeTruthy();
+
+    const fresh1 = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(fresh1.body.lastValidatedAt).toBeTruthy();
+    expect(fresh1.body.causes.some((c: { code: string }) => c.code === 'never_validated')).toBe(false);
+    expect(fresh1.body.causes.some((c: { code: string }) => c.code === 'content_changed')).toBe(false);
+
+    // Title/tags/priority out of fingerprint
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId,
+      tasks: [{ taskId, set: { title: 'renamed', priority: 0, tags: ['schema', 'backend'] } }],
+    });
+    const freshTitle = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(freshTitle.body.lastValidatedAt).toBeTruthy();
+    expect(freshTitle.body.causes.some((c: { code: string }) => c.code === 'content_changed')).toBe(false);
+
+    // Body change → content_changed (critical)
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId, tasks: [{ taskId, set: { body: 'body-b' } }],
+    });
+    const freshBody = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(freshBody.body.lastValidatedAt).toBeNull();
+    expect(freshBody.body.criticalCauses).toContain('content_changed');
+  });
+
+  it('copilot can write a doc validation keyed by version', async () => {
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Settled fact', description: 'A fact', body: 'The sky is blue.',
+    });
+    const docId = doc.body.id;
+    const v1 = await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'doc', subjectId: docId });
+    expect(v1.body.contentFingerprint).toBe('v:1');
+
+    await mcpCall(agent.apiKey, 'update_doc', {
+      projectId, docId, body: 'The sky is blue on clear days.',
+    });
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'doc', subjectId: docId });
+    expect(fresh.body.criticalCauses).toContain('content_changed');
+    expect(fresh.body.contentFingerprint).toBe('v:2');
+  });
+});
+
+describe('doc@version pins (PLNR-577)', () => {
+  it('pins current version on link; doc update surfaces doc_baseline_moved and blocks claim', async () => {
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Auth pin', description: 'Pin target', body: 'Use OAuth 2.1 with PKCE.',
+    });
+    const docId = doc.body.id;
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'implement auth', body: 'follow the doc', tags: ['auth'], milestoneId, docIds: [docId] }],
+    });
+    const taskId = task.body.created[0].id;
+
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(detail.body.docs[0].pinnedVersion).toBe(1);
+    expect(detail.body.docs[0].drifted).toBe(false);
+
+    await mcpCall(agent.apiKey, 'update_doc', {
+      projectId, docId, body: 'Use OAuth 2.1 with PKCE. Refresh tokens rotate.',
+    });
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(fresh.body.criticalCauses).toContain('doc_baseline_moved');
+
+    const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(claim.isError).toBe(true);
+    expect(claim.text).toMatch(/doc_baseline_moved/);
+  });
+
+  it('accepts explicit docId@version', async () => {
+    const doc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Explicit pin', description: 'v pin', body: 'Version one fact.',
+    });
+    const docId = doc.body.id;
+    await mcpCall(agent.apiKey, 'update_doc', { projectId, docId, body: 'Version two fact.' });
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{
+        title: 'pin v1', body: 'still on v1', tags: ['docs'], milestoneId, docIds: [`${docId}@1`],
+      }],
+    });
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId: task.body.created[0].id });
+    expect(detail.body.docs[0].pinnedVersion).toBe(1);
+    expect(detail.body.docs[0].currentVersion).toBe(2);
+    expect(detail.body.docs[0].drifted).toBe(true);
+  });
+});
+
+describe('supersession (PLNR-578)', () => {
+  it('links supersedes and surfaces superseded cause', async () => {
+    const a = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'old task', body: 'v1', tags: ['lifecycle'], milestoneId }],
+    });
+    const b = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'new task', body: 'v2', tags: ['lifecycle'], milestoneId }],
+    });
+    const oldId = a.body.created[0].id;
+    const newId = b.body.created[0].id;
+    await mcpCall(agent.apiKey, 'set_supersedes', {
+      projectId, subjectType: 'task', subjectId: newId, priorId: oldId,
+    });
+    const link = await mcpCall(agent.apiKey, 'get_supersession', {
+      projectId, subjectType: 'task', subjectId: oldId,
+    });
+    expect(link.body.supersededById).toBe(newId);
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: oldId });
+    expect(fresh.body.causes.some((c: { code: string }) => c.code === 'superseded')).toBe(true);
+  });
+});
+
+describe('hard claim gate (PLNR-579)', () => {
+  it('blocks claim on content_changed after validation + body edit', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'gate me', body: 'stable', tags: ['claims'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+    const ok = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(ok.isError).toBeFalsy();
+    await mcpCall(agent.apiKey, 'release_task', { projectId, taskId, toStatus: 'todo' });
+
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId, tasks: [{ taskId, set: { body: 'changed' } }],
+    });
+    const blocked = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toMatch(/content_changed/);
+
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+    const ok2 = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(ok2.isError).toBeFalsy();
+  });
+
+  it('get_task and get_task_context expose freshness', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'context fresh', body: 'x', tags: ['mcp'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(detail.body.freshness).toBeTruthy();
+    expect(detail.body.freshness.impactUnknown).toBe(true);
+
+    const ctx = await mcpCall(agent.apiKey, 'get_task_context', { projectId, taskId });
+    expect(ctx.body.taskFacts.freshness).toBeTruthy();
+    expect(ctx.body.taskFacts.freshness.impactUnknown).toBe(true);
+  });
+});
+
+describe('review inbox (PLNR-580)', () => {
+  it('lists drifted subjects and REST mark-validated clears content_changed', async () => {
+    const task = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: 'inbox item', body: 'a', tags: ['ux'], milestoneId }],
+    });
+    const taskId = task.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+    await mcpCall(agent.apiKey, 'update_tasks', {
+      projectId, tasks: [{ taskId, set: { body: 'b' } }],
+    });
+
+    const inbox = await mcpCall(agent.apiKey, 'list_review_inbox', { projectId, cause: 'content_changed' });
+    expect(inbox.body.items.some((i: { subjectId: string }) => i.subjectId === taskId)).toBe(true);
+
+    const rest = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/validations`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subjectType: 'task', subjectId: taskId }),
+    });
+    expect(rest.status).toBe(200);
+
+    const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
+    expect(fresh.body.criticalCauses).not.toContain('content_changed');
+  });
+});

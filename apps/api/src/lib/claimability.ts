@@ -10,7 +10,13 @@
 // window; the probe stays conservative there — it never offered in_progress work anyway.
 const CLAIMABLE_STATUSES = ['todo'];
 
-export type ClaimabilityReason = 'claimable' | 'status' | 'spin_off_approval' | 'plan_approval' | 'dependency';
+export type ClaimabilityReason =
+  | 'claimable'
+  | 'status'
+  | 'spin_off_approval'
+  | 'plan_approval'
+  | 'dependency'
+  | 'freshness';
 export type ClaimBlocker = {
   taskId: string;
   key: string;
@@ -138,6 +144,7 @@ function evaluateClaimability(
   gate: 'strict' | 'landed',
   proposedPlan: boolean,
   blockers: ClaimBlocker[],
+  criticalFreshness: string[] = [],
 ): Claimability {
   if (!CLAIMABLE_STATUSES.includes(task.status)) {
     return {
@@ -164,6 +171,12 @@ function evaluateClaimability(
       reason: `blocked until these finish: ${active.map((item) => item.key).join(', ')}`,
     };
   }
+  if (criticalFreshness.length) {
+    return {
+      claimable: false, taskKey: task.key, reasonCode: 'freshness', gate, blockers: [],
+      reason: `critical freshness causes: ${criticalFreshness.join(', ')}`,
+    };
+  }
   return { claimable: true, taskKey: task.key, reasonCode: 'claimable', gate, blockers: [] };
 }
 
@@ -173,15 +186,22 @@ function evaluateClaimability(
  *  anchored-agent bypass. This is exactly the gate the backstop must surface. */
 export async function taskClaimability(db: D1Database, taskId: string): Promise<Claimability> {
   const task = await db
-    .prepare('SELECT id, key, status, proposed_at AS proposedAt FROM tasks WHERE id = ? OR key = ?')
+    .prepare('SELECT id, key, status, proposed_at AS proposedAt, project_id AS projectId FROM tasks WHERE id = ? OR key = ?')
     .bind(taskId, taskId)
-    .first<{ id: string; key: string; status: string; proposedAt: string | null }>();
+    .first<{ id: string; key: string; status: string; proposedAt: string | null; projectId: string }>();
   if (!task) throw new Error(`task ${taskId} not found`);
-  const [gates, proposed, blockers] = await Promise.all([
-    claimGates(db, [task.id]), proposedPlanTasks(db, [task.id]), blockerRows(db, [task.id]),
+  const [gates, proposed, blockers, freshness] = await Promise.all([
+    claimGates(db, [task.id]),
+    proposedPlanTasks(db, [task.id]),
+    blockerRows(db, [task.id]),
+    import('./entity-validation-store').then((m) => m.subjectFreshness(db, task.projectId, 'task', task.id)),
   ]);
   return evaluateClaimability(
-    task, gates.get(task.id) ?? 'strict', proposed.has(task.id), blockers.get(task.id) ?? [],
+    task,
+    gates.get(task.id) ?? 'strict',
+    proposed.has(task.id),
+    blockers.get(task.id) ?? [],
+    freshness.criticalCauses,
   );
 }
 
@@ -199,14 +219,23 @@ export async function projectTaskClaimability(
   ).bind(projectId, bounded + 1).all<ClaimTaskFacts>();
   const tasks = results.slice(0, bounded);
   const ids = tasks.map((task) => task.id);
-  const [gates, proposed, blockers] = await Promise.all([
-    claimGates(db, ids), proposedPlanTasks(db, ids), blockerRows(db, ids),
+  const { subjectFreshness } = await import('./entity-validation-store');
+  const [gates, proposed, blockers, freshnessList] = await Promise.all([
+    claimGates(db, ids),
+    proposedPlanTasks(db, ids),
+    blockerRows(db, ids),
+    Promise.all(ids.map((id) => subjectFreshness(db, projectId, 'task', id).catch(() => ({ criticalCauses: [] as string[] })))),
   ]);
+  const criticalByTask = new Map(ids.map((id, i) => [id, freshnessList[i]!.criticalCauses]));
   return {
     items: tasks.map((task) => ({
       ...task,
       claimability: evaluateClaimability(
-        task, gates.get(task.id) ?? 'strict', proposed.has(task.id), blockers.get(task.id) ?? [],
+        task,
+        gates.get(task.id) ?? 'strict',
+        proposed.has(task.id),
+        blockers.get(task.id) ?? [],
+        criticalByTask.get(task.id) ?? [],
       ),
     })),
     truncated: results.length > bounded,

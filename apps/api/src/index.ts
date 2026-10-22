@@ -944,7 +944,9 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
           CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
           CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`, pid),
     rows(docsSurface,
-      'SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?', pid),
+      `SELECT td.task_id AS taskId, td.doc_id AS docId, td.pinned_version AS pinnedVersion, d.current_version AS currentVersion
+         FROM task_docs td JOIN tasks t ON t.id = td.task_id JOIN docs d ON d.id = td.doc_id
+        WHERE t.project_id = ?`, pid),
     rows(planSurface,
       'SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName, created_at AS createdAt, updated_at AS updatedAt FROM plan_docs WHERE project_id = ? ORDER BY updated_at DESC', pid),
     rows(lockSurface,
@@ -1099,7 +1101,11 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
          CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
          CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`,
     ).bind(pid).all(),
-    c.env.DB.prepare('SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?').bind(pid).all(),
+    c.env.DB.prepare(
+      `SELECT td.task_id AS taskId, td.doc_id AS docId, td.pinned_version AS pinnedVersion, d.current_version AS currentVersion
+         FROM task_docs td JOIN tasks t ON t.id = td.task_id JOIN docs d ON d.id = td.doc_id
+        WHERE t.project_id = ?`,
+    ).bind(pid).all(),
     // Plan-local docs (PLNR-200): body included so the plan view renders/edits inline
     // (mirrors plans/phases, which also carry full body in the snapshot). Not indexed.
     c.env.DB.prepare('SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName, created_at AS createdAt, updated_at AS updatedAt FROM plan_docs WHERE project_id = ? ORDER BY updated_at DESC').bind(pid).all(),
@@ -1223,14 +1229,30 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
     c.env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(tid).all(),
     c.env.DB.prepare('SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploaderKind, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments WHERE task_id = ? ORDER BY created_at').bind(tid).all(),
     c.env.DB.prepare('SELECT tag_id AS tagId FROM task_tags WHERE task_id = ?').bind(tid).all(),
-    c.env.DB.prepare('SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name').bind(tid).all(),
+    c.env.DB.prepare(
+      `SELECT d.id, d.name, d.description, td.pinned_version AS pinnedVersion, d.current_version AS currentVersion
+         FROM task_docs td JOIN docs d ON d.id = td.doc_id
+        WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name`,
+    ).bind(tid).all(),
+  ]);
+  const { subjectFreshness, getSupersession } = await import('./lib/entity-validation-store');
+  const [freshness, supersession] = await Promise.all([
+    subjectFreshness(c.env.DB, String(task.project_id), 'task', tid),
+    getSupersession(c.env.DB, String(task.project_id), 'task', tid),
   ]);
   return c.json({
     task,
     comments: commentPage.comments,
     moreResolvedComments: commentPage.moreResolvedComments,
     commentCounts: commentPage.commentCounts,
-    refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId), docs: docRows.results,
+    refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId),
+    docs: docRows.results.map((d) => ({
+      ...d,
+      drifted: d.pinnedVersion != null && d.currentVersion != null && d.pinnedVersion !== d.currentVersion,
+    })),
+    freshness,
+    supersession,
+    lastValidatedAt: freshness.lastValidatedAt,
   });
 });
 
@@ -1489,6 +1511,72 @@ app.post('/api/projects/:pid/docs/:did/restore', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).archiveDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, false)));
 app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
+
+// Entity validation / review inbox (PLNR-576..580)
+app.get('/api/projects/:pid/review-inbox', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const cause = c.req.query('cause') as import('@noriq-dev/shared').ReviewCause | undefined;
+  const subjectType = c.req.query('subjectType') as import('@noriq-dev/shared').ValidationSubjectType | undefined;
+  const limit = Number(c.req.query('limit') ?? 50);
+  const offset = Number(c.req.query('offset') ?? 0);
+  return c.json(await room(c.env, pid).reviewInbox(pid, {
+    cause, subjectType,
+    limit: Number.isFinite(limit) ? limit : 50,
+    offset: Number.isFinite(offset) ? offset : 0,
+  }));
+});
+app.get('/api/projects/:pid/freshness/:subjectType/:subjectId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const subjectType = c.req.param('subjectType') as import('@noriq-dev/shared').ValidationSubjectType;
+  const subjectId = c.req.param('subjectId')!;
+  const { subjectFreshness } = await import('./lib/entity-validation-store');
+  return c.json(await subjectFreshness(c.env.DB, pid, subjectType, subjectId));
+});
+app.get('/api/projects/:pid/validations/:subjectType/:subjectId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const subjectType = c.req.param('subjectType') as import('@noriq-dev/shared').ValidationSubjectType;
+  const subjectId = c.req.param('subjectId')!;
+  const limit = Number(c.req.query('limit') ?? 20);
+  return c.json({
+    records: await room(c.env, pid).listValidations(pid, subjectType, subjectId, Number.isFinite(limit) ? limit : 20),
+    freshness: await (await import('./lib/entity-validation-store')).subjectFreshness(c.env.DB, pid, subjectType, subjectId),
+  });
+});
+app.post('/api/projects/:pid/validations', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    subjectType: import('@noriq-dev/shared').ValidationSubjectType;
+    subjectId: string;
+    note?: string;
+    baselines?: import('@noriq-dev/shared').ValidationBaselines;
+  }>();
+  if (!body.subjectType || !body.subjectId) return c.json({ error: 'subjectType and subjectId required' }, 400);
+  return c.json(await room(c.env, pid).recordValidation(pid, humanActor(c), body));
+});
+app.post('/api/projects/:pid/review-causes', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    subjectType: import('@noriq-dev/shared').ValidationSubjectType;
+    subjectId: string;
+    cause: import('@noriq-dev/shared').ReviewCause;
+    status: 'open' | 'dismissed';
+    detail?: string;
+  }>();
+  if (!body.subjectType || !body.subjectId || !body.cause || !body.status) {
+    return c.json({ error: 'subjectType, subjectId, cause, and status required' }, 400);
+  }
+  return c.json(await room(c.env, pid).setReviewCause(pid, humanActor(c), body));
+});
+app.post('/api/projects/:pid/supersedes', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    subjectType: import('@noriq-dev/shared').ValidationSubjectType;
+    subjectId: string;
+    priorId: string | null;
+  }>();
+  if (!body.subjectType || !body.subjectId) return c.json({ error: 'subjectType and subjectId required' }, 400);
+  return c.json(await room(c.env, pid).setSupersedes(pid, humanActor(c), body.subjectType, body.subjectId, body.priorId ?? null));
+});
 
 // Project memory (PLNR-251/252) — human-facing READS only; recording happens through the
 // agent-facing record_memory MCP tool. Access is already gated by requireProjectAccess on

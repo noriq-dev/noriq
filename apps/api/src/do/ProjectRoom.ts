@@ -56,6 +56,21 @@ import {
   recordShadowCaptureFailure,
   type StoredShadowDispatchSnapshot,
 } from '../memory/shadow-dispatch';
+import {
+  claimBlockedByFreshnessMessage,
+} from '../lib/entity-validation';
+import {
+  recordValidation as storeRecordValidation,
+  listValidations as storeListValidations,
+  subjectFreshness as storeSubjectFreshness,
+  setReviewCause as storeSetReviewCause,
+  setPlanDocPins as storeSetPlanDocPins,
+  setSupersedes as storeSetSupersedes,
+  getSupersession as storeGetSupersession,
+  reviewInbox as storeReviewInbox,
+} from '../lib/entity-validation-store';
+import type { ReviewCause, ValidationBaselines, ValidationSubjectType } from '@noriq-dev/shared';
+import { normalizeDocPinInputs } from '../lib/entity-validation';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -110,7 +125,8 @@ export interface CreateTaskInput {
   type?: string;
   /** Board this task lands on; defaults to the project's default board. */
   boardId?: string | null;
-  /** Related project docs (PLNR-182) — validated against this project's docs. */
+  /** Related project docs (PLNR-182) — validated against this project's docs.
+   *  Accepts `docId` or `docId@version` (PLNR-577); omitted version pins to current. */
   docIds?: string[];
   /** Attach the created task to a plan phase (PLNR-228) — a phase id in a plan in THIS
    *  project, validated here; membership alone gates claimability by phase order (no
@@ -959,7 +975,9 @@ export class ProjectRoom extends DurableObject<Env> {
         );
       }
       for (const doc of docs) {
-        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(id, doc.id));
+        stmts.push(this.env.DB.prepare(
+          'INSERT OR IGNORE INTO task_docs (task_id, doc_id, pinned_version) VALUES (?, ?, ?)',
+        ).bind(id, doc.id, doc.pinnedVersion));
       }
       for (const tid of tagIds) {
         stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(id, tid));
@@ -1148,12 +1166,20 @@ export class ProjectRoom extends DurableObject<Env> {
           for (const d of docs) if (!before.has(d.id)) linked.set(d.id, d.name);
           for (const docId of before) if (!after.has(docId)) unlinked.add(docId);
           stmts.push(this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(taskId));
-          for (const d of docs) stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d.id));
+          for (const d of docs) {
+            stmts.push(this.env.DB.prepare(
+              `INSERT INTO task_docs (task_id, doc_id, pinned_version) VALUES (?, ?, ?)
+               ON CONFLICT (task_id, doc_id) DO UPDATE SET pinned_version = excluded.pinned_version`,
+            ).bind(taskId, d.id, d.pinnedVersion));
+          }
         }
         for (const d of await this.requireProjectDocs(patch.addDocIds)) {
           linked.set(d.id, d.name);
           unlinked.delete(d.id);
-          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d.id));
+          stmts.push(this.env.DB.prepare(
+            `INSERT INTO task_docs (task_id, doc_id, pinned_version) VALUES (?, ?, ?)
+             ON CONFLICT (task_id, doc_id) DO UPDATE SET pinned_version = excluded.pinned_version`,
+          ).bind(taskId, d.id, d.pinnedVersion));
         }
         for (const d of patch.removeDocIds ?? []) {
           linked.delete(d);
@@ -1551,6 +1577,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // agent path — including an anchored run's bypass — until a human accepts it.
       if (task.proposed_at) {
         throw new Error(`${task.key} is a proposed task awaiting human acceptance — it cannot be claimed until accepted`);
+      }
+      // PLNR-579: always-on hard claim gate for critical freshness causes.
+      // Renewals re-check too — content can drift while a claim is held and an agent
+      // re-asserts; surface the same codes so the agent knows why.
+      {
+        const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', task.id);
+        if (freshness.criticalCauses.length) {
+          throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses));
+        }
       }
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
@@ -2622,19 +2657,37 @@ export class ProjectRoom extends DurableObject<Env> {
    *  project's doc id fails loudly with the full list of offenders. Returns the
    *  deduplicated ids WITH their names — PLNR-319's `task.docs_linked` events want the
    *  label already in hand rather than a second D1 round trip at emit time; `[]` for
-   *  empty/undefined input. */
-  private async requireProjectDocs(docIds: string[] | undefined): Promise<Array<{ id: string; name: string }>> {
-    const ids = [...new Set((docIds ?? []).filter(Boolean))];
-    if (!ids.length) return [];
+   *  empty/undefined input.
+   *
+   *  PLNR-577: accepts `docId` or `docId@version`. Omitted version pins to the doc's
+   *  current_version at link time. An explicit version must exist in doc_versions. */
+  private async requireProjectDocs(docIds: string[] | undefined): Promise<Array<{ id: string; name: string; pinnedVersion: number }>> {
+    const pins = normalizeDocPinInputs(docIds);
+    if (!pins.length) return [];
+    const ids = pins.map((p) => p.docId);
     const { results } = await this.env.DB.prepare(
-      `SELECT id, name FROM docs WHERE project_id = ? AND archived_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
-    ).bind(this.projectId, ...ids).all<{ id: string; name: string }>();
-    const found = new Map(results.map((r) => [r.id, r.name]));
+      `SELECT id, name, current_version AS version FROM docs
+        WHERE project_id = ? AND archived_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
+    ).bind(this.projectId, ...ids).all<{ id: string; name: string; version: number }>();
+    const found = new Map(results.map((r) => [r.id, r]));
     const missing = ids.filter((d) => !found.has(d));
     if (missing.length) throw new Error(`doc(s) not found in this project: ${missing.join(', ')} (see list_docs)`);
-    // Preserve the caller's original (deduplicated) order — results from an IN(...) query
-    // are not guaranteed to come back in list order.
-    return ids.map((id) => ({ id, name: found.get(id)! }));
+    const out: Array<{ id: string; name: string; pinnedVersion: number }> = [];
+    for (const pin of pins) {
+      const doc = found.get(pin.docId)!;
+      let pinnedVersion = pin.version ?? doc.version;
+      if (pin.version != null) {
+        const ver = await this.env.DB.prepare(
+          'SELECT version FROM doc_versions WHERE doc_id = ? AND version = ?',
+        ).bind(pin.docId, pin.version).first<{ version: number }>();
+        if (!ver) {
+          throw new Error(`doc ${pin.docId} has no version ${pin.version} (current is ${doc.version})`);
+        }
+        pinnedVersion = pin.version;
+      }
+      out.push({ id: doc.id, name: doc.name, pinnedVersion });
+    }
+    return out;
   }
 
   /** The board a new subtask inherits (PLNR-181): its parent's, so a decomposed task's
@@ -5789,6 +5842,114 @@ export class ProjectRoom extends DurableObject<Env> {
       return { ok: true };
     
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Entity validation / supersession / review inbox (PLNR-576..580)
+  // ---------------------------------------------------------------------------
+
+  async recordValidation(
+    projectId: string,
+    actor: Actor,
+    input: {
+      subjectType: ValidationSubjectType;
+      subjectId: string;
+      note?: string;
+      baselines?: ValidationBaselines | null;
+    },
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return storeRecordValidation(this.env.DB, projectId, actor, input);
+    });
+  }
+
+  async listValidations(
+    projectId: string,
+    subjectType: ValidationSubjectType,
+    subjectId: string,
+    limit?: number,
+  ) {
+    await this.setPid(projectId);
+    return storeListValidations(this.env.DB, projectId, subjectType, subjectId, limit);
+  }
+
+  async subjectFreshness(
+    projectId: string,
+    subjectType: ValidationSubjectType,
+    subjectId: string,
+  ) {
+    await this.setPid(projectId);
+    return storeSubjectFreshness(this.env.DB, projectId, subjectType, subjectId);
+  }
+
+  async setReviewCause(
+    projectId: string,
+    actor: Actor,
+    input: {
+      subjectType: ValidationSubjectType;
+      subjectId: string;
+      cause: ReviewCause;
+      status: 'open' | 'dismissed';
+      detail?: string;
+    },
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return storeSetReviewCause(this.env.DB, projectId, actor, input);
+    });
+  }
+
+  async setPlanDocPins(
+    projectId: string,
+    actor: Actor,
+    planId: string,
+    docRefs: Array<string | { docId: string; version?: number | null }> | undefined,
+    mode: 'replace' | 'add' = 'replace',
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, projectId).first();
+      if (!plan) throw new Error('plan not found in this project');
+      await storeSetPlanDocPins(this.env.DB, projectId, planId, docRefs, mode);
+      await this.emit(actor, 'plan.updated', 'plan', planId, { fields: ['docPins'] });
+      return { ok: true as const };
+    });
+  }
+
+  async setSupersedes(
+    projectId: string,
+    actor: Actor,
+    subjectType: ValidationSubjectType,
+    subjectId: string,
+    priorId: string | null,
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const result = await storeSetSupersedes(this.env.DB, projectId, subjectType, subjectId, priorId);
+      await this.emit(actor, `${subjectType}.updated` as EventVerb, subjectType, subjectId, {
+        fields: ['supersedes'], supersedesId: priorId,
+      });
+      return result;
+    });
+  }
+
+  async getSupersession(
+    projectId: string,
+    subjectType: ValidationSubjectType,
+    subjectId: string,
+  ) {
+    await this.setPid(projectId);
+    return storeGetSupersession(this.env.DB, projectId, subjectType, subjectId);
+  }
+
+  async reviewInbox(
+    projectId: string,
+    opts: { cause?: ReviewCause; subjectType?: ValidationSubjectType; limit?: number; offset?: number } = {},
+  ) {
+    await this.setPid(projectId);
+    return storeReviewInbox(this.env.DB, projectId, opts);
   }
 
   // ---------------------------------------------------------------------------

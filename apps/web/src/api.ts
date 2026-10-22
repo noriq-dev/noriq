@@ -643,6 +643,24 @@ export const api = {
     const query = params.size ? `?${params}` : '';
     return req<ApiMemoryReviewQueue>('GET', `/api/projects/${pid}/memory/review-queue${query}`);
   },
+
+  // Entity validation / decay inbox (PLNR-576..580)
+  reviewInbox: (pid: string, input: { cause?: ApiReviewCause; subjectType?: ApiValidationSubjectType; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (input.cause) params.set('cause', input.cause);
+    if (input.subjectType) params.set('subjectType', input.subjectType);
+    if (input.limit != null) params.set('limit', String(input.limit));
+    if (input.offset != null) params.set('offset', String(input.offset));
+    const query = params.size ? `?${params}` : '';
+    return req<ApiEntityReviewInbox>('GET', `/api/projects/${pid}/review-inbox${query}`);
+  },
+  recordValidation: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; note?: string }) =>
+    req<ApiValidationRecord>('POST', `/api/projects/${pid}/validations`, body),
+  setReviewCause: (pid: string, body: {
+    subjectType: ApiValidationSubjectType; subjectId: string; cause: ApiReviewCause; status: 'open' | 'dismissed'; detail?: string;
+  }) => req<{ ok: true }>('POST', `/api/projects/${pid}/review-causes`, body),
+  setSupersedes: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; priorId: string | null }) =>
+    req<{ ok: true }>('POST', `/api/projects/${pid}/supersedes`, body),
   /** Authority 5 is reachable ONLY through this path (§12) — never a direct authority write. */
   memoryApproveDecision: (pid: string, id: string, note?: string) =>
     req<{ approvedMemoryId: string; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/approve`, { note }),
@@ -1836,6 +1854,52 @@ export interface ApiMemoryReviewQueueItem {
   contradictionSetIds: string[];
   recentNegativeFeedbackCount: number;
   latestNegativeFeedbackAt: string | null;
+}
+
+export type ApiReviewCause =
+  | 'never_validated'
+  | 'content_changed'
+  | 'doc_baseline_moved'
+  | 'code_assessment_stale'
+  | 'impact_unknown'
+  | 'superseded'
+  | 'dormant'
+  | 'human_flagged';
+export type ApiValidationSubjectType = 'task' | 'plan' | 'doc';
+
+export interface ApiValidationRecord {
+  id: string;
+  projectId: string;
+  subjectType: ApiValidationSubjectType;
+  subjectId: string;
+  contentFingerprint: string;
+  validatedAt: string;
+  actorKind: string;
+  actorId: string | null;
+  actorName: string;
+  baselines: { docPins: Array<{ docId: string; version: number }>; codeAssessments: unknown[] };
+  note: string;
+}
+
+export interface ApiEntityReviewInboxItem {
+  subjectType: ApiValidationSubjectType;
+  subjectId: string;
+  key: string | null;
+  title: string;
+  primaryCause: ApiReviewCause;
+  causes: ApiReviewCause[];
+  lastValidatedAt: string | null;
+  ageSinceValidationSeconds: number | null;
+}
+
+export interface ApiEntityReviewInbox {
+  items: ApiEntityReviewInboxItem[];
+  counts: Record<string, number>;
+  overallTotal: number;
+  total: number;
+  offset: number;
+  nextOffset: number | null;
+  groupBy: 'cause';
 }
 
 export interface ApiMemoryReviewQueue {
