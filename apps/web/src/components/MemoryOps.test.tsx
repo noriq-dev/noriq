@@ -189,14 +189,14 @@ describe('the five failure modes render distinctly — no shared generic error t
     expect(text()).toContain('rebuild vectors');
     // Backup failure: distinct guidance to investigate R2, never "rebuild vectors" or "reindex".
     expect(text()).toContain('investigate R2 connectivity');
-    // Stale index: distinct guidance for legacy ingest clients, never at R2 or vectors.
-    expect(text()).toContain('re-run repository indexing from your ingest client');
-    // Failed ingest: distinct guidance to re-upload, carrying the actual validation problem text.
-    expect(text()).toContain('re-upload from your ingest client');
+    // Stale legacy generation: no Noriq reindex CTA — local IDEs own code understanding.
+    expect(text()).toContain('Noriq does not refresh repository indexes');
+    // Failed legacy ingest: no re-upload promise; abort/remove instead.
+    expect(text()).toContain('not a supported product path');
     expect(text()).toContain('manifest declares fileCount 9');
 
     // No two of the four share their guidance sentence.
-    const guidances = ['rebuild vectors', 'investigate R2 connectivity', 're-run repository indexing from your ingest client', 're-upload from your ingest client'];
+    const guidances = ['rebuild vectors', 'investigate R2 connectivity', 'Noriq does not refresh repository indexes', 'not a supported product path'];
     expect(new Set(guidances).size).toBe(guidances.length);
   });
 });

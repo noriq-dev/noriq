@@ -76,7 +76,7 @@ function CapabilitiesStrip({ capabilities }: { capabilities: ApiMemoryOpsStatus[
     { label: 'R2 (portable backups)', on: capabilities.r2, whenOff: 'backup/restore are unavailable — live coordination, reads, and writes are unaffected' },
     { label: 'Vectorize (semantic search)', on: capabilities.vectorize, whenOff: 'retrieval falls back to exact/keyword lookup and graph expansion' },
     { label: 'Workers AI (embeddings)', on: capabilities.workersAI, whenOff: 'nothing can be embedded — semantic search and vector rebuild are inert' },
-    { label: 'Code-intelligence index', on: capabilities.codeVectorize, whenOff: 'code search falls back to exact/keyword lookup' },
+    { label: 'Code-intelligence index', on: capabilities.codeVectorize, whenOff: 'Noriq does not own repository code-graph search — local agents own code understanding; Project Memory and docs stay searchable' },
     { label: 'Repository code indexing', on: capabilities.repositoryIndexing, whenOff: 'Noriq does not ingest git checkouts — local agents own code understanding; repository keys remain for URI routing and citations' },
   ];
   const reduced = rows.filter((r) => !r.on);
@@ -335,7 +335,7 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
                   onAbort={(genId) => runAction(`abort:${genId}`, () => api.memoryAbortGeneration(pid, genId))}
                   onRemove={async () => {
                     const ok = await confirm(
-                      `Remove repository "${r.repositoryKey}" from this project's memory?\n\nThis deregisters the repository — its routing entry and checkouts are removed, and it stops being indexable until re-registered. It does NOT touch the memory graph: decisions, hazards, and episodes already recorded under this key are untouched.`,
+                      `Remove repository "${r.repositoryKey}" from this project's memory?\n\nThis deregisters the repository — its URI routing entry (and any leftover checkout rows) are removed. It does NOT touch the memory graph: decisions, hazards, and episodes already recorded under this key are untouched.`,
                       { title: 'Remove repository', danger: true, confirmLabel: 'Remove repository' },
                     );
                     if (ok) runAction(`remove:${r.id}`, () => api.deregisterRepository(pid, r.repositoryKey));
@@ -492,14 +492,14 @@ function RepositoryCard({
        *  states that are actually triggered, so a healthy repository stays uncluttered. */}
       {repositoryIndexing && repo.stale && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', lineHeight: 1.6, marginBottom: 6 }}>
-          ◐ stale index — active generation base {repo.activeGeneration?.baseId.slice(0, 10)} is behind the repository's current base ({repo.latestObservedBase?.slice(0, 10)}).
-          {' '}→ re-run repository indexing from your ingest client (legacy operator path only when enabled on this instance).
+          ◐ stale legacy generation — active base {repo.activeGeneration?.baseId.slice(0, 10)} is behind the repository's observed base ({repo.latestObservedBase?.slice(0, 10)}).
+          {' '}→ Noriq does not refresh repository indexes; use local IDE agents for code understanding. Treat this generation as historical debt only.
         </div>
       )}
       {repositoryIndexing && repo.failedIngest && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--red-soft)', lineHeight: 1.6, marginBottom: 6 }}>
-          ✕ failed ingest — {repo.failedIngestProblems.join('; ') || `ingest status: ${repo.ingestStatus}`}.
-          {' '}→ fix the ingest payload and re-upload from your ingest client.
+          ✕ failed legacy ingest — {repo.failedIngestProblems.join('; ') || `ingest status: ${repo.ingestStatus}`}.
+          {' '}→ repository ingest is not a supported product path; abort or remove this registration rather than expecting a Noriq reindex.
         </div>
       )}
 

@@ -515,7 +515,7 @@ export function MemoryConstellationV2({
   // region every other truthful-degradation message uses, rather than a separate ad hoc box — one
   // flow container stays the single source of "what's wrong right now". Informational severity:
   // per the Navigator conventions doc §4 "Unavailable ≠ empty", a renderer failure is grouped with
-  // "confirmed empty hierarchy" and "indexing may not have run" as a truthful capability statement,
+  // "confirmed empty hierarchy" and "no Noriq checkout ingest" as a truthful capability statement,
   // not a data-quality error — Catalogue itself remains fully functional, which is the whole point.
   if (rendererFailure) {
     statusNotices.push({
