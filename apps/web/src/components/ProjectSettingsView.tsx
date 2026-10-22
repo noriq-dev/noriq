@@ -1,5 +1,7 @@
 // Project-local settings (PLNR-401). Account settings remain in SettingsView.
+// PLNR-595: dormancyQuietSeconds control (opt-in dormant review cause — never auto-close).
 import { useEffect, useState, type ReactNode } from 'react';
+import { DORMANCY_QUIET_SECONDS_MAX, DORMANCY_QUIET_SECONDS_MIN } from '@noriq-dev/shared';
 import { api, type ApiUser } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
@@ -8,6 +10,24 @@ import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 
 type ProjectAccess = Awaited<ReturnType<typeof api.projectAccess>>;
 type GrantRole = 'manager' | 'contributor' | 'viewer';
+
+const DAY_SECONDS = 86_400;
+const DORMANCY_PRESETS: Array<{ label: string; seconds: number }> = [
+  { label: '7 days', seconds: 7 * DAY_SECONDS },
+  { label: '30 days', seconds: 30 * DAY_SECONDS },
+  { label: '90 days', seconds: 90 * DAY_SECONDS },
+  { label: '1 year', seconds: 365 * DAY_SECONDS },
+];
+
+function dormancyPresetKey(seconds: number | null): string {
+  if (seconds == null || seconds <= 0) return 'off';
+  const match = DORMANCY_PRESETS.find((preset) => preset.seconds === seconds);
+  return match ? String(match.seconds) : 'custom';
+}
+
+function daysFromSeconds(seconds: number): string {
+  return String(Math.max(1, Math.round(seconds / DAY_SECONDS)));
+}
 
 function SettingsSection({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return (
@@ -30,17 +50,25 @@ function PermissionNote({ children }: { children: ReactNode }) {
 export function ProjectSettingsView({ store }: { store: AppStore }) {
   const project = store.data.projects.find((item) => item.id === store.currentPid);
   const claimTtlSeconds = store.snapshot?.project.claimTtlSeconds ?? 1800;
+  const snapshotDormancy = store.snapshot?.project.dormancyQuietSeconds ?? null;
   const [name, setName] = useState(project?.name ?? '');
   const [description, setDescription] = useState(project?.phase ?? '');
   const [groupId, setGroupId] = useState(project?.groupId ?? '');
   const [ttlMin, setTtlMin] = useState(String(Math.round(claimTtlSeconds / 60)));
   const [isPublic, setIsPublic] = useState(Boolean(project?.isPublic));
+  const [dormancyPreset, setDormancyPreset] = useState(() => dormancyPresetKey(snapshotDormancy));
+  const [dormancyCustomDays, setDormancyCustomDays] = useState(() => (
+    snapshotDormancy != null && snapshotDormancy > 0 ? daysFromSeconds(snapshotDormancy) : '30'
+  ));
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [visibilitySaving, setVisibilitySaving] = useState(false);
   const [visibilitySaved, setVisibilitySaved] = useState(false);
   const [visibilityError, setVisibilityError] = useState<string | null>(null);
+  const [dormancySaving, setDormancySaving] = useState(false);
+  const [dormancySaved, setDormancySaved] = useState(false);
+  const [dormancyError, setDormancyError] = useState<string | null>(null);
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [access, setAccess] = useState<ProjectAccess | null>(null);
   const [accessLoading, setAccessLoading] = useState(false);
@@ -74,6 +102,15 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
       });
     return () => { current = false; };
   }, [project?.id, store.permissions.canManage]);
+
+  useEffect(() => {
+    setDormancyPreset(dormancyPresetKey(snapshotDormancy));
+    if (snapshotDormancy != null && snapshotDormancy > 0) {
+      setDormancyCustomDays(daysFromSeconds(snapshotDormancy));
+    }
+    setDormancySaved(false);
+    setDormancyError(null);
+  }, [project?.id, snapshotDormancy]);
 
   if (!project) return null;
 
@@ -130,6 +167,44 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
     }
   };
 
+  const resolveDormancySeconds = (): number | null => {
+    if (dormancyPreset === 'off') return null;
+    if (dormancyPreset === 'custom') {
+      const days = Math.round(Number(dormancyCustomDays));
+      if (!Number.isFinite(days) || days < 1) {
+        throw new Error('Quiet period must be at least 1 day when using a custom value.');
+      }
+      const seconds = days * DAY_SECONDS;
+      if (seconds < DORMANCY_QUIET_SECONDS_MIN || seconds > DORMANCY_QUIET_SECONDS_MAX) {
+        throw new Error(
+          `Quiet period must be between ${Math.round(DORMANCY_QUIET_SECONDS_MIN / DAY_SECONDS)} day and ${Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)} days.`,
+        );
+      }
+      return seconds;
+    }
+    const seconds = Number(dormancyPreset);
+    if (!Number.isFinite(seconds) || seconds < DORMANCY_QUIET_SECONDS_MIN) {
+      throw new Error('Choose a quiet-period preset or a custom number of days.');
+    }
+    return seconds;
+  };
+
+  const saveDormancy = async () => {
+    if (!canManage) return;
+    setDormancySaving(true);
+    setDormancySaved(false);
+    setDormancyError(null);
+    try {
+      const dormancyQuietSeconds = resolveDormancySeconds();
+      await store.actions.submitProjectMeta({ dormancyQuietSeconds });
+      setDormancySaved(true);
+    } catch (error) {
+      setDormancyError(error instanceof Error ? error.message : 'Could not save dormancy settings.');
+    } finally {
+      setDormancySaving(false);
+    }
+  };
+
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '24px 26px 48px' }}>
       <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -180,6 +255,57 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
               {saved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Saved</span>}
               <ErrorNote>{saveError}</ErrorNote>
               <Button disabled={saving || !name.trim()} onClick={saveGeneral}>{saving ? 'Saving…' : 'Save changes'}</Button>
+            </div>
+          )}
+        </SettingsSection>
+
+        <SettingsSection
+          title="Dormancy"
+          description="Opt-in quiet period for tasks, plans, and docs. When enabled, a long stretch without validation or content change opens an advisory dormant review cause only — nothing is auto-closed."
+        >
+          <Field label="Quiet period" hint="null / off is the default; minimum 1 hour on the API, presets use whole days">
+            <Select
+              aria-label="Dormancy quiet period"
+              value={dormancyPreset}
+              disabled={!canManage}
+              onChange={(event) => {
+                setDormancyPreset(event.target.value);
+                setDormancySaved(false);
+              }}
+            >
+              <option value="off">Off (default)</option>
+              {DORMANCY_PRESETS.map((preset) => (
+                <option key={preset.seconds} value={String(preset.seconds)}>{preset.label}</option>
+              ))}
+              <option value="custom">Custom (days)…</option>
+            </Select>
+          </Field>
+          {dormancyPreset === 'custom' && (
+            <div style={{ marginTop: 12 }}>
+              <Field label="Custom quiet period (days)" hint={`allowed range ≈ ${Math.round(DORMANCY_QUIET_SECONDS_MIN / DAY_SECONDS)}–${Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)} days`}>
+                <TextInput
+                  aria-label="Custom dormancy quiet period in days"
+                  type="number"
+                  min={1}
+                  max={Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)}
+                  value={dormancyCustomDays}
+                  disabled={!canManage}
+                  onChange={(event) => {
+                    setDormancyCustomDays(event.target.value);
+                    setDormancySaved(false);
+                  }}
+                />
+              </Field>
+            </div>
+          )}
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', marginTop: 12, lineHeight: 1.55 }}>
+            Quiet clock uses later(lastValidated, content activity). Flagging is review-only — validate or dismiss in Review; dormancy never auto-closes work.
+          </div>
+          {canManage && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
+              {dormancySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Dormancy saved</span>}
+              <ErrorNote>{dormancyError}</ErrorNote>
+              <Button disabled={dormancySaving} onClick={() => void saveDormancy()}>{dormancySaving ? 'Saving…' : 'Save dormancy'}</Button>
             </div>
           )}
         </SettingsSection>

@@ -23,14 +23,14 @@ const access = {
   canTransferOwnership: true,
 };
 
-function fakeStore({ canManage = true, canOwn = true } = {}) {
+function fakeStore({ canManage = true, canOwn = true, dormancyQuietSeconds = null as number | null } = {}) {
   return {
     currentPid: 'prj_alpha',
     data: { projects: [{
       id: 'prj_alpha', key: 'ALPHA', name: 'Alpha Project', phase: 'Initial description', groupId: 'grp_1',
       isPublic: false, effectiveRole: canOwn ? 'owner' : canManage ? 'manager' : 'viewer',
     }] },
-    snapshot: { project: { claimTtlSeconds: 1800 } },
+    snapshot: { project: { claimTtlSeconds: 1800, dormancyQuietSeconds } },
     groups: [{ id: 'grp_1', name: 'Product', canEdit: 1 }],
     permissions: {
       canManage, canOwn, canCreateGroups: false,
@@ -130,6 +130,50 @@ describe('ProjectSettingsView (PLNR-401)', () => {
     expect(container.textContent).toContain('Visibility saved');
   });
 
+  it('saves project dormancyQuietSeconds via the existing meta PATCH (PLNR-595)', async () => {
+    vi.spyOn(api, 'projectAccess').mockResolvedValue(access);
+    vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
+    const store = fakeStore();
+    render(<ProjectSettingsView store={store} />);
+    await tick();
+
+    expect(container.textContent).toContain('Dormancy');
+    expect(container.textContent).toMatch(/never auto-closes|Does not auto-close|review cause only/i);
+
+    const select = container.querySelector<HTMLButtonElement>('[aria-label="Dormancy quiet period"]')!;
+    act(() => select.click());
+    const thirtyDays = [...container.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find((option) => option.textContent?.includes('30 days'))!;
+    await act(async () => { thirtyDays.click(); });
+
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Save dormancy')!;
+    await act(async () => { save.click(); });
+
+    expect(store.actions.submitProjectMeta).toHaveBeenCalledWith({ dormancyQuietSeconds: 30 * 86_400 });
+    expect(container.textContent).toContain('Dormancy saved');
+  });
+
+  it('clears dormancy back to null (off) when Off is selected', async () => {
+    vi.spyOn(api, 'projectAccess').mockResolvedValue(access);
+    vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
+    const store = fakeStore({ dormancyQuietSeconds: 7 * 86_400 });
+    render(<ProjectSettingsView store={store} />);
+    await tick();
+
+    const select = container.querySelector<HTMLButtonElement>('[aria-label="Dormancy quiet period"]')!;
+    act(() => select.click());
+    const off = [...container.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find((option) => option.textContent?.includes('Off'))!;
+    await act(async () => { off.click(); });
+
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'Save dormancy')!;
+    await act(async () => { save.click(); });
+
+    expect(store.actions.submitProjectMeta).toHaveBeenCalledWith({ dormancyQuietSeconds: null });
+  });
+
   it('is read-only for viewers and does not request the management directory', () => {
     const accessSpy = vi.spyOn(api, 'projectAccess');
     const usersSpy = vi.spyOn(api, 'users');
@@ -138,7 +182,9 @@ describe('ProjectSettingsView (PLNR-401)', () => {
     expect(container.textContent).toContain('A project manager or owner is required to make changes.');
     expect(container.querySelector<HTMLInputElement>('[aria-label="Project name"]')!.disabled).toBe(true);
     expect(container.querySelector<HTMLInputElement>('[aria-label="Public read-only page"]')!.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Dormancy quiet period"]')!.disabled).toBe(true);
     expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'Save changes')).toBe(false);
+    expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'Save dormancy')).toBe(false);
     expect(container.textContent).not.toContain('Danger zone');
     expect(accessSpy).not.toHaveBeenCalled();
     expect(usersSpy).not.toHaveBeenCalled();

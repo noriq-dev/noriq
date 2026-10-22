@@ -41,12 +41,15 @@ describe('surface-scoped UI state (PLNR-400)', () => {
 
     const state = await response.json() as {
       surface: string;
-      project: { reviewTasks: number; eventSeq: number };
+      project: { reviewTasks: number; eventSeq: number; dormancyQuietSeconds: number | null };
       tasks: unknown[]; plans: unknown[]; planDocs: unknown[]; events: unknown[];
     };
     expect(state.surface).toBe('project-settings');
     expect(state.project.reviewTasks).toBe(1);
     expect(state.project.eventSeq).toBeGreaterThan(0);
+    // PLNR-595: project-settings surface carries dormancy config (null = off).
+    expect(state.project).toHaveProperty('dormancyQuietSeconds');
+    expect(state.project.dormancyQuietSeconds == null || typeof state.project.dormancyQuietSeconds === 'number').toBe(true);
     expect(state.tasks).toEqual([]);
     expect(state.plans).toEqual([]);
     expect(state.planDocs).toEqual([]);

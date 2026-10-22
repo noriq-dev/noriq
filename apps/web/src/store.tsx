@@ -737,7 +737,10 @@ export function useAppStore() {
       refresh();
     },
 
-    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number; public?: boolean }) {
+    async submitProjectMeta(meta: {
+      name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number;
+      public?: boolean; dormancyQuietSeconds?: number | null;
+    }) {
       if (!pidRef.current || !permissions.canManage) return;
       await api.setProjectMeta(pidRef.current, meta);
       await loadProjects();
