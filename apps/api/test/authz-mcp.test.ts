@@ -3,7 +3,7 @@
 // attachment resource, next_claimable, read_open_comments, and attach_ref.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, mcpRpc } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpRpc, restCreateTask } from './helpers';
 
 const PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -42,10 +42,7 @@ beforeAll(async () => {
   });
   bobPid = (await bp.json() as { id: string }).id;
   // Priority 4 so a cross-tenant next_claimable leak (if present) would sort first.
-  const bt = await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks`, {
-    method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'bob task', priority: 4 }),
-  });
+  const bt = await restCreateTask(bobCookie, bobPid, { title: 'bob task', priority: 4 });
   const btj = await bt.json() as { id: string; key: string };
   bobTaskId = btj.id; bobTaskKey = btj.key;
   // A human steering comment on Bob's task (what read_open_comments would leak).

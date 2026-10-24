@@ -4,7 +4,7 @@
 // (task/comment/message bodies) — ids are the guessable prj_<key>.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createUser, loginSession } from './helpers';
+import { createUser, loginSession, restCreateTask } from './helpers';
 
 let ownerCookie: string;
 let outsiderCookie: string;
@@ -66,10 +66,7 @@ describe('WebSocket upgrade is authenticated + authorized (PLNR-91)', () => {
       "DELETE FROM project_grants WHERE project_id = ? AND principal_type = 'user' AND principal_id = ?",
     ).bind(projectId, outsider!.id).run();
     // Any subsequent project event re-authorizes every subscriber before delivery.
-    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
-      method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'revocation trigger' }),
-    });
+    await restCreateTask(ownerCookie, projectId, { title: 'revocation trigger' });
     expect((await closed).code).toBe(1008);
   });
 

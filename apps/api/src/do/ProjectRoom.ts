@@ -902,15 +902,19 @@ export class ProjectRoom extends DurableObject<Env> {
       // id must fail loudly, not as an opaque FK error or a silent cross-project placement)
       // → the parent task's board (a subtask sits beside its parent, PLNR-181) → the
       // creating agent's repo board lock (RUN-71, run-spawned agents only; a copilot or
-      // human has no run bound, so the lookup finds nothing) → the project's default
-      // board. The lock is a DEFAULT, not a fence: it is about where a repo's work lands
-      // uninstructed, not about forbidding instruction — and a parent's board is
-      // instruction too, since someone placed that parent deliberately.
+      // human has no run bound, so the lookup finds nothing). There is NO defaultBoardId
+      // fallback (PLNR-603): creates must name a board (or inherit one). The lock is a
+      // DEFAULT, not a fence: it is about where a repo's work lands uninstructed, not
+      // about forbidding instruction — and a parent's board is instruction too.
       const boardId = input.boardId
         ? await this.requireProjectBoard(input.boardId)
         : (await this.parentBoardId(input.parentTaskId))
-          ?? (await this.actorRepoBoardId(actor))
-          ?? (await this.defaultBoardId(pid));
+          ?? (await this.actorRepoBoardId(actor));
+      if (!boardId) {
+        throw new Error(
+          'boardId is required (pass defaults.boardId or per-item boardId; see get_project.boards)',
+        );
+      }
       // A task always belongs to a milestone. Older API clients can omit it; put their
       // work beside its parent, or in Backlog. Explicit placement must be project-local.
       const milestoneId = input.milestoneId
@@ -5469,6 +5473,8 @@ export class ProjectRoom extends DurableObject<Env> {
             if (n.trim()) await this._resolveTagLocked(this.projectId, actor, n, false);
           }
           const boardId = nt.boardId ?? d.boardId;
+          // MCP create_plan requires boardId; DO still allows omit so a repo board lock
+          // (RUN-71) can supply placement in _createTaskLocked.
           if (boardId) await this.requireProjectBoard(boardId);
           const milestoneId = nt.milestoneId ?? d.milestoneId;
           if (milestoneId) await this.requireProjectMilestone(milestoneId);

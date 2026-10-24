@@ -2,7 +2,7 @@
 // and (b) size the file from the stored bytes, not the client Content-Length.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createUser, loginSession } from './helpers';
+import { createUser, loginSession, restCreateTask } from './helpers';
 
 let ownerCookie: string;
 let outsiderCookie: string;
@@ -23,10 +23,7 @@ beforeAll(async () => {
     body: JSON.stringify({ key: 'UPP', name: 'Upload' }),
   });
   const pid = (await p.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks`, {
-    method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'target' }),
-  });
+  const t = await restCreateTask(ownerCookie, pid, { title: 'target' });
   taskId = (await t.json() as { id: string }).id;
 }, 60000);
 

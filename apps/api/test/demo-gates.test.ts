@@ -4,6 +4,7 @@
 // in-project work stays open — the demo's whole point.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { restCreateTask } from './helpers';
 
 let cookie: string;
 
@@ -114,10 +115,7 @@ describe('demo lockdown (PLNR-199)', () => {
   });
 
   it('still allows light in-project work — creating a task in the seeded project', async () => {
-    const res = await SELF.fetch('https://noriq.test/api/projects/prj_demo/tasks', {
-      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'A visitor-created task' }),
-    });
+    const res = await restCreateTask(cookie, 'prj_demo', { title: 'A visitor-created task' });
     expect(res.status).toBe(200);
     const { id } = (await res.json()) as { id: string };
     expect(id).toBeTruthy();

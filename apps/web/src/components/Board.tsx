@@ -70,8 +70,8 @@ export function Board({ store }: { store: AppStore }) {
   // the snapshot so the filter follows the same canonical relationship as PlansView.
   const planTaskIds = new Set((snapshot?.phaseTasks ?? []).map((pt) => pt.taskId));
 
-  // A task shows on the selected board; tasks with no board (shouldn't happen post-
-  // migration) fall onto the default board so nothing ever disappears.
+  // `null` boardId is the virtual All filter (PLNR-603) — every task. Otherwise equality
+  // match; tasks with no board (shouldn't happen post-migration) fall onto the first board.
   const onBoard = (tBoardId: string | null) =>
     boardId === null || tBoardId === boardId || (tBoardId == null && boardId === firstBoardId);
 
@@ -737,33 +737,50 @@ function BoardTabs({ boards, current, editable, onSelect, onCreate, onRename, on
   boards: Array<{ id: string; name: string }>;
   current: string | null;
   editable: boolean;
-  onSelect: (id: string) => void;
+  onSelect: (id: string | null) => void;
   onCreate: () => void;
   onRename: (id: string, name: string) => void;
   onDelete: (id: string, name: string) => void;
 }) {
+  const allActive = current === null;
+  const tabStyle = (active: boolean) => ({
+    cursor: 'pointer' as const, flex: 'none' as const, display: 'flex' as const, alignItems: 'center' as const, gap: 7,
+    padding: '6px 11px', borderRadius: '9px 9px 0 0',
+    fontSize: 12.5, fontWeight: 600 as const,
+    color: active ? 'var(--text)' : 'var(--text-dim)',
+    background: active ? 'var(--card)' : 'transparent',
+    borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
+  });
   return (
     <div
+      data-testid="board-tabs"
       style={{
         flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
         padding: '10px 22px 0', overflowX: 'auto',
       }}
     >
+      {/* Virtual All filter — UI-only, no DB row (PLNR-603). */}
+      <div
+        role="tab"
+        aria-selected={allActive}
+        data-testid="board-tab-all"
+        onClick={() => onSelect(null)}
+        className="hover-border"
+        style={tabStyle(allActive)}
+      >
+        All
+      </div>
       {boards.map((b) => {
         const active = b.id === current;
         return (
           <div
             key={b.id}
+            role="tab"
+            aria-selected={active}
+            data-testid={`board-tab-${b.id}`}
             onClick={() => onSelect(b.id)}
             className="hover-border"
-            style={{
-              cursor: 'pointer', flex: 'none', display: 'flex', alignItems: 'center', gap: 7,
-              padding: '6px 11px', borderRadius: '9px 9px 0 0',
-              fontSize: 12.5, fontWeight: 600,
-              color: active ? 'var(--text)' : 'var(--text-dim)',
-              background: active ? 'var(--card)' : 'transparent',
-              borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
-            }}
+            style={tabStyle(active)}
           >
             {b.name}
             {active && editable && (

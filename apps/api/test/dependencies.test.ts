@@ -2,7 +2,7 @@
 // PLNR-241: cross-project dependencies — a blocker may live in another project.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createRunAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createRunAgent, createUser, loginSession, mcpCall, restCreateTask } from './helpers';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
@@ -181,10 +181,7 @@ describe('cross-project dependencies (PLNR-241)', () => {
       method: 'POST', headers: { Cookie: outsiderCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'DEPPRIV', name: 'private-deps' }),
     })).json() as { id: string };
-    const secret = await (await SELF.fetch(`https://noriq.test/api/projects/${proj.id}/tasks`, {
-      method: 'POST', headers: { Cookie: outsiderCookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'secret task' }),
-    })).json() as { id: string };
+    const secret = await (await restCreateTask(outsiderCookie, proj.id, { title: 'secret task' })).json() as { id: string };
 
     // create_task dependsOn and add_dependency both refuse with the same not-found shape.
     const viaCreate = await mcpCall(agent.apiKey, 'create_task', {

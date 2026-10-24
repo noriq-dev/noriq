@@ -1,7 +1,7 @@
 // PLNR-567: project soft-archive / restore via projects.status.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, restCreateTask } from './helpers';
 
 let cookie: string;
 let agent: { id: string; apiKey: string };
@@ -26,11 +26,7 @@ describe('project archive (PLNR-567)', () => {
     });
     expect(created.status).toBe(200);
     const p = await created.json() as { id: string; key: string };
-    const taskRes = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/tasks`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'survives archive', tags: ['test-fixture'] }),
-    });
+    const taskRes = await restCreateTask(cookie, p.id, { title: 'survives archive', tags: ['test-fixture'] });
     expect(taskRes.status).toBe(200);
 
     const before = await (await list()).json() as { projects: Array<{ id: string; status: string }> };

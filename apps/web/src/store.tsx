@@ -366,12 +366,16 @@ export function useAppStore() {
     else uiRequest.current?.controller.abort();
   }, [user, currentPid, view, loadUiState]);
 
-  // Keep the selected board valid: default to the first board, and re-home if the
-  // current one vanished (project switch or board deletion).
+  // Keep the selected board valid. `null` is the virtual All filter (PLNR-603) — show
+  // every board's tasks. Re-home only when a real board id vanished (project switch /
+  // board deletion); otherwise leave All selected.
   useEffect(() => {
     const boards = snapshot?.boards ?? [];
     if (!boards.length) { setBoardId(null); return; }
-    setBoardId((cur) => (cur && boards.some((b) => b.id === cur) ? cur : boards[0]!.id));
+    setBoardId((cur) => {
+      if (cur === null) return null; // All
+      return boards.some((b) => b.id === cur) ? cur : null;
+    });
   }, [snapshot?.boards]);
 
   useEffect(() => {
@@ -713,8 +717,11 @@ export function useAppStore() {
 
     async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string; phaseId?: string }) {
       if (!pidRef.current || !permissions.canContribute) return;
-      // New tasks land on the board you're currently viewing (falls back to default server-side).
-      await api.createTask(pidRef.current, { ...input, ...(boardRef.current ? { boardId: boardRef.current } : {}) });
+      // New tasks land on the board you're viewing. On the virtual All filter, use the
+      // project's first board (usually Main) — server no longer invents a default (PLNR-603).
+      const boardId = boardRef.current ?? snapshot?.boards?.[0]?.id;
+      if (!boardId) return;
+      await api.createTask(pidRef.current, { ...input, boardId });
       setModal(null);
       refresh();
     },
@@ -899,8 +906,8 @@ export function useAppStore() {
     },
 
     // --- boards (PLNR-80) ---
-    setBoard(id: string) {
-      setBoardId(id);
+    setBoard(id: string | null) {
+      setBoardId(id); // null = virtual All (PLNR-603)
     },
     async createBoard(name: string) {
       if (!pidRef.current || !name.trim()) return;
