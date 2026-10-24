@@ -272,18 +272,36 @@ export const sessionFor = (apiKey: string): string => {
   return fresh;
 };
 
-/** First board id for a project (usually Main). Used only by the test mcpCall adapter so
- *  legacy fixtures written before PLNR-603 still create tasks; production MCP requires boardId. */
-async function firstBoardId(
-  apiKey: string,
+/** First board id for a project (usually Main). D1 lookup — does not depend on MCP auth. */
+export async function projectBoardId(projectId: string): Promise<string> {
+  const row = await (env as unknown as { DB: D1Database }).DB.prepare(
+    'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
+  ).bind(projectId).first<{ id: string }>();
+  if (!row) throw new Error(`project ${projectId} has no board`);
+  return row.id;
+}
+
+/** REST task create with boardId injected when omitted (PLNR-603 test comfort). */
+export async function restCreateTask(
+  cookie: string,
   projectId: string,
-  sessionId: string,
-  meta?: Record<string, unknown>,
-): Promise<string | undefined> {
-  const gp = await mcpCallOnce(apiKey, 'get_project', { projectId }, sessionId, meta);
-  if (gp.isError) return undefined;
-  const boards = (gp.body as { boards?: Array<{ id: string }> } | null)?.boards;
-  return boards?.[0]?.id;
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const payload = body.boardId ? body : { ...body, boardId: await projectBoardId(projectId) };
+  return SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** First board id for mcpCall injection. */
+async function firstBoardId(projectId: string): Promise<string | undefined> {
+  try {
+    return await projectBoardId(projectId);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Inject boardId into create_tasks / create_plan args when omitted (test-only comfort). */
@@ -303,18 +321,21 @@ async function withInjectedBoardId(
     const needsDefault = !defaults.boardId && tasks.some((t) =>
       !t.boardId && !(t.parentTaskId ?? defaults.parentTaskId));
     if (!needsDefault) return args;
-    const boardId = await firstBoardId(apiKey, projectId, sessionId, meta);
+    const boardId = await firstBoardId(projectId);
     if (!boardId) return args;
     return { ...args, defaults: { ...defaults, boardId } };
   }
   if (tool === 'create_plan') {
+    // templateId is mutually exclusive with taskDefaults — board placement for stamps is
+    // handled in the MCP create_plan template path. Inline newTasks need injection here.
+    if (args.templateId) return args;
     const phases = args.phases as Array<{ newTasks?: Array<Record<string, unknown>> }> | undefined;
     if (!phases?.some((p) => (p.newTasks ?? []).length)) return args;
     const taskDefaults = (args.taskDefaults as Record<string, unknown> | undefined) ?? {};
     const needs = !taskDefaults.boardId && phases.some((p) =>
       (p.newTasks ?? []).some((t) => !t.boardId));
     if (!needs) return args;
-    const boardId = await firstBoardId(apiKey, projectId, sessionId, meta);
+    const boardId = await firstBoardId(projectId);
     if (!boardId) return args;
     return { ...args, taskDefaults: { ...taskDefaults, boardId } };
   }

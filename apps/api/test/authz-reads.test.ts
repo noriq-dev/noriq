@@ -2,7 +2,7 @@
 // events, attachment download) must be gated to a project the caller can reach.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createUser, loginSession } from './helpers';
+import { createUser, loginSession, restCreateTask } from './helpers';
 
 let ownerCookie: string;
 let outsiderCookie: string;
@@ -27,10 +27,7 @@ beforeAll(async () => {
     body: JSON.stringify({ key: 'RDP', name: 'Reads' }),
   });
   projectId = (await p.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
-    method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'private task' }),
-  });
+  const t = await restCreateTask(ownerCookie, projectId, { title: 'private task' });
   taskId = (await t.json() as { id: string }).id;
   const a = await SELF.fetch(`https://noriq.test/api/tasks/${taskId}/attachments?filename=s.txt`, {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'text/plain' }, body: 'secret',

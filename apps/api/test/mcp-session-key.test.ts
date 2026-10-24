@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll } from 'vitest';
 import { SELF, env } from 'cloudflare:test';
-import { createAgent, mintPairForUser, mcpCall } from './helpers';
+import { createAgent, mintPairForUser, mcpCall, projectBoardId } from './helpers';
 import {
   CURSOR_AGENT_META,
   isCursorClient,
@@ -513,8 +513,10 @@ describe('Grok TUI OAuth client identity (PLNR-557)', () => {
       return JSON.parse(text.split('\n\n--- notices ---\n')[0] ?? '');
     };
     const project = await grokCall('create_project', { key: 'GNS', name: 'grok-unscoped' });
+    const boardId = await projectBoardId(project.id as string);
     const created = await grokCall('create_tasks', {
       projectId: project.id, allowNewTags: true,
+      defaults: { boardId },
       tasks: [{ title: 'unscoped-hold', tags: ['backend'] }],
     });
     const taskId = created.created[0].id as string;

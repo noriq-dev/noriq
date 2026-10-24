@@ -4,7 +4,7 @@
 // REST, which is the other write seam and needs no new tool schema.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects, restCreateTask } from './helpers';
 
 const SPEC = {
   requirementIds: ['RUN-135'],
@@ -26,11 +26,7 @@ describe('a task carries an execution spec (RUN-135)', () => {
   let projectId: string;
 
   const createTask = async (body: Record<string, unknown>) => {
-    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: cookie },
-      body: JSON.stringify(body),
-    });
+    const res = await restCreateTask(cookie, projectId, body);
     return { status: res.status, body: (await res.json()) as { id: string; key: string; error?: string } };
   };
   const patchTask = async (taskId: string, patch: Record<string, unknown>) => {

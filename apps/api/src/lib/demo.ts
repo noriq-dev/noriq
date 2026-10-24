@@ -56,7 +56,7 @@ export async function resetDemo(env: Env): Promise<void> {
   ).bind(DEMO_PROJECT_ID, userId, nowIso()).run();
 
   const r = room(env, DEMO_PROJECT_ID);
-  await r.createBoard(DEMO_PROJECT_ID, sys, 'Main');
+  const main = await r.createBoard(DEMO_PROJECT_ID, sys, 'Main');
   const ms = await r.createMilestone(DEMO_PROJECT_ID, sys, 'v2 launch', new Date(Date.now() + 12 * 86400_000).toISOString(), 'Done when: new checkout serves 100% of traffic.');
 
   await r.createDoc(DEMO_PROJECT_ID, sys, {
@@ -70,7 +70,7 @@ export async function resetDemo(env: Env): Promise<void> {
     title: 'Rebuild checkout in three phases',
     description: 'API first, then UI, then cutover',
     body: '# Goals\n\nReplace the legacy checkout without a big-bang release.\n\n## Exit gate\n\nConversion neutral-or-better over 7 days.',
-    taskDefaults: { milestoneId: ms.id },
+    taskDefaults: { milestoneId: ms.id, boardId: main.id },
     phases: [
       { title: 'Payment API', newTasks: [
         { title: 'Design payment-intent schema', type: 'chore', priority: 1, tags: ['api'] },
@@ -92,11 +92,11 @@ export async function resetDemo(env: Env): Promise<void> {
 
   // Loose tasks in the other columns, one overdue — the badges have something to show.
   const rev = await r.createTask(DEMO_PROJECT_ID, sys, {
-    title: 'Add retry/backoff to webhook consumer', type: 'feature', priority: 0, tags: ['api'], milestoneId: ms.id,
+    title: 'Add retry/backoff to webhook consumer', type: 'feature', priority: 0, tags: ['api'], milestoneId: ms.id, boardId: main.id,
   });
   await r.updateTask(DEMO_PROJECT_ID, sys, rev.id, { status: 'review' });
   await r.createTask(DEMO_PROJECT_ID, sys, {
     title: 'Chase declined-card error taxonomy', type: 'research', priority: 2,
-    dueAt: new Date(Date.now() - 2 * 86400_000).toISOString(), milestoneId: ms.id,
+    dueAt: new Date(Date.now() - 2 * 86400_000).toISOString(), milestoneId: ms.id, boardId: main.id,
   });
 }

@@ -3,7 +3,7 @@
 // agent the caller's tenant can't reach.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, restCreateTask } from './helpers';
 
 let agent: { id: string; apiKey: string };
 let foreignAgentId: string;
@@ -19,10 +19,7 @@ beforeAll(async () => {
     body: JSON.stringify({ key: 'SXBOB', name: "Bob's sync" }),
   });
   const bobPid = (await bp.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks`, {
-    method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'bob unclaimed task' }),
-  });
+  const t = await restCreateTask(bobCookie, bobPid, { title: 'bob unclaimed task' });
   const tid = (await t.json() as { id: string }).id;
   await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks/${tid}/comments`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },

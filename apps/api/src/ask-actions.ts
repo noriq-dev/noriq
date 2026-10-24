@@ -365,15 +365,24 @@ export const ASK_TASK_ACTION_EXECUTORS: AskActionExecutors = {
     async execute({ env, action, actor, arguments: raw }) {
       const args = normalizeAskCreateTaskArguments(raw);
       requireActionProject(action, args.projectId);
+      // Ask proposals often omit boardId; place on the project's first board (PLNR-603).
+      let boardId = args.boardId;
+      if (!boardId) {
+        const board = await env.DB.prepare(
+          'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
+        ).bind(args.projectId).first<{ id: string }>();
+        if (!board) throw new Error('boardId is required (see get_project.boards)');
+        boardId = board.id;
+      }
       const input: CreateTaskInput = {
         title: args.title,
         tags: args.tags,
+        boardId,
         ...(args.body !== undefined ? { body: args.body } : {}),
         ...(args.priority !== undefined ? { priority: args.priority } : {}),
         ...(args.type !== undefined ? { type: args.type } : {}),
         ...(args.estimate !== undefined ? { estimate: args.estimate } : {}),
         ...(args.dueAt !== undefined ? { dueAt: args.dueAt } : {}),
-        ...(args.boardId !== undefined ? { boardId: args.boardId } : {}),
         ...(args.docIds !== undefined ? { docIds: args.docIds } : {}),
       };
       return projectRoom(env, args.projectId).createTask(args.projectId, actor, input);

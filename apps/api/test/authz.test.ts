@@ -5,7 +5,7 @@
 // create/update/delete/message in any project (ids are the guessable prj_<key>).
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createUser, loginSession } from './helpers';
+import { createUser, loginSession, projectBoardId } from './helpers';
 
 let ownerCookie: string;
 let outsiderCookie: string;
@@ -30,13 +30,15 @@ beforeAll(async () => {
 
   const p = await req('/api/projects', ownerCookie, 'POST', { key: 'AZP', name: 'Owner project' });
   projectId = (await p.json() as { id: string }).id;
-  const t = await req(`/api/projects/${projectId}/tasks`, ownerCookie, 'POST', { title: 'owned task' });
+  const boardId = await projectBoardId(projectId);
+  const t = await req(`/api/projects/${projectId}/tasks`, ownerCookie, 'POST', { title: 'owned task', boardId });
   taskId = (await t.json() as { id: string }).id;
 }, 60000);
 
 describe('project write routes require project access (PLNR-92)', () => {
   it('the owner can create a task', async () => {
-    expect((await req(`/api/projects/${projectId}/tasks`, ownerCookie, 'POST', { title: 'ok' })).status).toBe(200);
+    const boardId = await projectBoardId(projectId);
+    expect((await req(`/api/projects/${projectId}/tasks`, ownerCookie, 'POST', { title: 'ok', boardId })).status).toBe(200);
   });
 
   it('an outsider cannot create a task in the project', async () => {
@@ -57,7 +59,8 @@ describe('project write routes require project access (PLNR-92)', () => {
   });
 
   it('an admin retains access to any project (escalation preserved)', async () => {
-    expect((await req(`/api/projects/${projectId}/tasks`, adminCookie, 'POST', { title: 'admin ok' })).status).toBe(200);
+    const boardId = await projectBoardId(projectId);
+    expect((await req(`/api/projects/${projectId}/tasks`, adminCookie, 'POST', { title: 'admin ok', boardId })).status).toBe(200);
   });
 
   it('project reach does not let a group contributor change project settings', async () => {

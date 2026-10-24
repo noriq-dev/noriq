@@ -2094,10 +2094,24 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         if (!row) throw new Error(`template ${templateId} not found`);
         const spec = JSON.parse(row.spec) as {
           title: string; description?: string; body?: string;
-          taskDefaults?: { priority?: number; estimate?: number; type?: string; tags?: string[] };
-          phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[]; executionSpec?: ExecutionSpecInput | null }> }>;
+          taskDefaults?: { priority?: number; estimate?: number; type?: string; tags?: string[]; boardId?: string };
+          phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[]; boardId?: string; executionSpec?: ExecutionSpecInput | null }> }>;
         };
-        const created = await room(env, projectId).createPlan(projectId, actor, { ...spec, title: title ?? spec.title, proposed, agentId: agent.id });
+        // Templates are project-agnostic and usually omit boardId. Stamp onto this project's
+        // first board when neither taskDefaults nor any newTask names one (PLNR-603).
+        const needsBoard = !spec.taskDefaults?.boardId
+          && (spec.phases ?? []).some((ph) => (ph.newTasks ?? []).some((nt) => !nt.boardId));
+        let stampedDefaults = spec.taskDefaults;
+        if (needsBoard) {
+          const board = await env.DB.prepare(
+            'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
+          ).bind(projectId).first<{ id: string }>();
+          if (!board) throw new Error('project has no board; create one before stamping a template (see get_project.boards)');
+          stampedDefaults = { ...spec.taskDefaults, boardId: board.id };
+        }
+        const created = await room(env, projectId).createPlan(projectId, actor, {
+          ...spec, taskDefaults: stampedDefaults, title: title ?? spec.title, proposed, agentId: agent.id,
+        });
         return { ...created, phases: presentCreatedPhases(created.phases) };
       }
       if (!title || !phases) throw new Error('inline plans require title and phases');
