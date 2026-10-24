@@ -51,19 +51,26 @@ const task = (id: string, key: string, title: string): TaskVM => ({
   comments: [],
 });
 
-function mount(taskList?: TaskVM[], permissions = { canContribute: false, canManage: false }) {
+function mount(
+  taskList?: TaskVM[],
+  permissions = { canContribute: false, canManage: false },
+  opts?: {
+    boardId?: string | null;
+    boards?: Array<{ id: string; name: string }>;
+  },
+) {
   const tasks = taskList ?? [
     task('task_planned', 'BRD-1', 'Task from the release plan'),
     task('task_standalone', 'BRD-2', 'Standalone board task'),
   ];
   const store = {
     currentPid: 'project_board',
-    boardId: 'board_1',
+    boardId: opts?.boardId === undefined ? 'board_1' : opts.boardId,
     draggedId: null,
     showArchived: false,
     permissions,
     snapshot: {
-      boards: [{ id: 'board_1', name: 'Main' }],
+      boards: opts?.boards ?? [{ id: 'board_1', name: 'Main' }],
       milestones: [],
       tags: [],
       locks: [],
@@ -168,6 +175,43 @@ describe('Board plan membership filter', () => {
     selectPlanFilter('standalone');
     expect(container.textContent).not.toContain('Task from the release plan');
     expect(container.textContent).toContain('Standalone board task');
+  });
+
+  it('shows All first and filters across boards when All is selected (PLNR-603)', () => {
+    const onMain = task('task_main', 'BRD-20', 'Main board task');
+    const onOther = { ...task('task_other', 'BRD-21', 'Other board task'), boardId: 'board_2' };
+    const store = mount([onMain, onOther], undefined, {
+      boardId: null,
+      boards: [
+        { id: 'board_1', name: 'Main' },
+        { id: 'board_2', name: 'Staging' },
+      ],
+    });
+
+    const tabs = container.querySelector('[data-testid="board-tabs"]');
+    expect(tabs?.textContent?.startsWith('All')).toBe(true);
+    expect(container.querySelector('[data-testid="board-tab-all"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(container.textContent).toContain('Main board task');
+    expect(container.textContent).toContain('Other board task');
+
+    act(() => {
+      container.querySelector<HTMLElement>('[data-testid="board-tab-board_2"]')!.click();
+    });
+    expect(store.actions.setBoard).toHaveBeenCalledWith('board_2');
+  });
+
+  it('filters to one board when a real board is selected', () => {
+    const onMain = task('task_main', 'BRD-22', 'Main only');
+    const onOther = { ...task('task_other', 'BRD-23', 'Staging only'), boardId: 'board_2' };
+    mount([onMain, onOther], undefined, {
+      boardId: 'board_1',
+      boards: [
+        { id: 'board_1', name: 'Main' },
+        { id: 'board_2', name: 'Staging' },
+      ],
+    });
+    expect(container.textContent).toContain('Main only');
+    expect(container.textContent).not.toContain('Staging only');
   });
 
   it('keeps body search lazy and renders incremental server matches', async () => {

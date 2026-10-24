@@ -33,6 +33,14 @@ let A: Actor;
 let B: Actor;
 let pid: string; // locking ENABLED
 let pidOff: string; // locking OFF
+let mainBoardId: string;
+
+async function boardIdFor(projectId: string): Promise<string> {
+  const row = await env.DB.prepare(
+    'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
+  ).bind(projectId).first<{ id: string }>();
+  return row!.id;
+}
 
 async function seedAgent(pidFor: string, id: string): Promise<Actor> {
   // A copilot (a human's MCP session) — a natural lock holder, and needs no runner (the agents
@@ -64,6 +72,7 @@ beforeAll(async () => {
   const cookie = await loginSession('flock@example.com', 'longenough1');
   pid = await mkProject('FLK', 'file-locks', cookie);
   pidOff = await mkProject('FLKOFF', 'file-locks-off', cookie);
+  mainBoardId = await boardIdFor(pid);
   await room(pid).setFileLocking(pid, { enabled: true });
   A = await seedAgent(pid, 'agt_flk_a');
   B = await seedAgent(pid, 'agt_flk_b');
@@ -168,7 +177,7 @@ describe('release + force-release (§7)', () => {
 
 describe('auto-release on task settle (§5)', () => {
   it('releaseTask (to review) drops the task’s locks', async () => {
-    const t = await room(pid).createTask(pid, human, { title: 'lock via claim' });
+    const t = await room(pid).createTask(pid, human, { title: 'lock via claim', boardId: mainBoardId });
     await room(pid).claimTask(pid, A, t.id, A.id);
     await room(pid).acquireLocks(pid, A, A.id, { paths: ['src/via-release.ts'], branch: 'main', taskId: t.id });
     await room(pid).releaseTask(pid, A, t.id, { toStatus: 'review' });
@@ -176,7 +185,7 @@ describe('auto-release on task settle (§5)', () => {
   });
 
   it('a supervisor status→done also drops the task’s locks (distinct path)', async () => {
-    const t = await room(pid).createTask(pid, human, { title: 'lock via update' });
+    const t = await room(pid).createTask(pid, human, { title: 'lock via update', boardId: mainBoardId });
     await room(pid).acquireLocks(pid, A, A.id, { paths: ['src/via-update.ts'], branch: 'main', taskId: t.id });
     await room(pid).updateTask(pid, human, t.id, { status: 'done' });
     expect((await anyRow('src/via-update.ts'))!.releasedAt).toBeTruthy();
@@ -219,7 +228,7 @@ describe('event log + WS fanout (PLNR-205)', () => {
 
 describe('delete cascade (PLNR-203)', () => {
   it('deleteTask reaps the task’s locks', async () => {
-    const t = await room(pid).createTask(pid, human, { title: 'doomed task' });
+    const t = await room(pid).createTask(pid, human, { title: 'doomed task', boardId: mainBoardId });
     await room(pid).acquireLocks(pid, A, A.id, { paths: ['src/cascade-task.ts'], branch: 'main', taskId: t.id });
     await room(pid).deleteTask(pid, human, t.id);
     expect(await anyRow('src/cascade-task.ts')).toBeNull();

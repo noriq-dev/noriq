@@ -272,6 +272,55 @@ export const sessionFor = (apiKey: string): string => {
   return fresh;
 };
 
+/** First board id for a project (usually Main). Used only by the test mcpCall adapter so
+ *  legacy fixtures written before PLNR-603 still create tasks; production MCP requires boardId. */
+async function firstBoardId(
+  apiKey: string,
+  projectId: string,
+  sessionId: string,
+  meta?: Record<string, unknown>,
+): Promise<string | undefined> {
+  const gp = await mcpCallOnce(apiKey, 'get_project', { projectId }, sessionId, meta);
+  if (gp.isError) return undefined;
+  const boards = (gp.body as { boards?: Array<{ id: string }> } | null)?.boards;
+  return boards?.[0]?.id;
+}
+
+/** Inject boardId into create_tasks / create_plan args when omitted (test-only comfort). */
+async function withInjectedBoardId(
+  apiKey: string,
+  tool: string,
+  args: Record<string, unknown>,
+  sessionId: string,
+  meta?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const projectId = args.projectId as string | undefined;
+  if (!projectId) return args;
+  if (tool === 'create_tasks') {
+    const defaults = (args.defaults as Record<string, unknown> | undefined) ?? {};
+    const tasks = (args.tasks as Array<Record<string, unknown>> | undefined) ?? [];
+    // Skip items that will inherit a parent's board (PLNR-181) — only fill root creates.
+    const needsDefault = !defaults.boardId && tasks.some((t) =>
+      !t.boardId && !(t.parentTaskId ?? defaults.parentTaskId));
+    if (!needsDefault) return args;
+    const boardId = await firstBoardId(apiKey, projectId, sessionId, meta);
+    if (!boardId) return args;
+    return { ...args, defaults: { ...defaults, boardId } };
+  }
+  if (tool === 'create_plan') {
+    const phases = args.phases as Array<{ newTasks?: Array<Record<string, unknown>> }> | undefined;
+    if (!phases?.some((p) => (p.newTasks ?? []).length)) return args;
+    const taskDefaults = (args.taskDefaults as Record<string, unknown> | undefined) ?? {};
+    const needs = !taskDefaults.boardId && phases.some((p) =>
+      (p.newTasks ?? []).some((t) => !t.boardId));
+    if (!needs) return args;
+    const boardId = await firstBoardId(apiKey, projectId, sessionId, meta);
+    if (!boardId) return args;
+    return { ...args, taskDefaults: { ...taskDefaults, boardId } };
+  }
+  return args;
+}
+
 /** Call an MCP tool over Streamable HTTP and return the parsed result body + notices.
  *  Pass a sessionId to act as a distinct MCP session (a chat / sub-agent). */
 export async function mcpCall(
@@ -340,6 +389,10 @@ export async function mcpCall(
     const { projectId, taskIds, set } = args as { projectId: string; taskIds: string[]; set: Record<string, unknown> };
     wireArgs = { projectId, tasks: taskIds.map((taskId) => ({ taskId, set })) };
   }
+  // PLNR-603: production create_tasks/create_plan require boardId. Legacy fixtures omit it —
+  // inject the project's first board here so they keep working. Use mcpCallRaw to assert the
+  // required-boardId failure path without injection.
+  wireArgs = await withInjectedBoardId(apiKey, wireTool, wireArgs, effectiveSession, meta);
   let first = await mcpCallOnce(apiKey, wireTool, wireArgs, effectiveSession, meta);
   // vitest-pool-workers reloads the bundle between files, breaking in-flight DO
   // stubs exactly once ("invalidating this Durable Object ... Please retry").
@@ -368,6 +421,17 @@ export async function mcpCall(
     return { ...first, body: value };
   }
   return first;
+}
+
+/** Unadapted tools/call — no create_task alias, no boardId injection. Prefer mcpCall. */
+export async function mcpCallRaw(
+  apiKey: string,
+  tool: string,
+  args: Record<string, unknown> = {},
+  sessionId?: string,
+  meta?: Record<string, unknown>,
+) {
+  return mcpCallOnce(apiKey, tool, args, sessionId ?? sessionFor(apiKey), meta);
 }
 
 async function mcpCallOnce(

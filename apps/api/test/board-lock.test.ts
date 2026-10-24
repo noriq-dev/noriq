@@ -87,20 +87,28 @@ describe("a locked repo's agent lands its tasks on the locked board", () => {
     expect((await taskBoard(t.id))!.boardId).toBe(defaultBoard!.id);
   });
 
-  it('an unresolved lock (boardId null) falls through to the default board, never throws', async () => {
+  it('an unresolved lock (boardId null) requires an explicit boardId (no defaultBoardId fallback)', async () => {
     const { agent } = await seedLockedAgent(null);
-    const t = await room(pid).createTask(pid, agent, { title: 'unlocked fallback' });
+    await expect(room(pid).createTask(pid, agent, { title: 'unlocked fallback' }))
+      .rejects.toThrow(/boardId is required/);
     const defaultBoard = await env.DB.prepare(
       'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
     ).bind(pid).first<{ id: string }>();
+    const t = await room(pid).createTask(pid, agent, {
+      title: 'unlocked explicit', boardId: defaultBoard!.id,
+    });
     expect((await taskBoard(t.id))!.boardId).toBe(defaultBoard!.id);
   });
 
-  it('humans are untouched — no run bound, no lock consulted', async () => {
-    const t = await room(pid).createTask(pid, human, { title: 'human task' });
+  it('humans without a board lock must pass boardId (PLNR-603)', async () => {
+    await expect(room(pid).createTask(pid, human, { title: 'human task' }))
+      .rejects.toThrow(/boardId is required/);
     const defaultBoard = await env.DB.prepare(
       'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
     ).bind(pid).first<{ id: string }>();
+    const t = await room(pid).createTask(pid, human, {
+      title: 'human task', boardId: defaultBoard!.id,
+    });
     expect((await taskBoard(t.id))!.boardId).toBe(defaultBoard!.id);
   });
 });

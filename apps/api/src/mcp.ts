@@ -413,7 +413,9 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   create_project: WRITE, save_template: WRITE, create_doc: WRITE, create_tasks: WRITE,
   handoff_task: WRITE, attach_files: WRITE, claim_task: WRITE, release_task: WRITE, post_comment: WRITE,
   send_message: WRITE, request_input: WRITE, raise_alert: WRITE,
-  create_plan: WRITE, create_plan_doc: WRITE, create_milestone: WRITE, record_memory: WRITE,
+  create_plan: WRITE, create_plan_doc: WRITE, create_milestone: WRITE,
+  list_boards: READ, create_board: WRITE, rename_board: WRITE_IDEMPOTENT, delete_board: WRITE_DESTRUCTIVE,
+  record_memory: WRITE,
   create_orchestration: WRITE, record_validation: WRITE,
 
   // Both operations discard relationships or vocabulary that cannot be reconstructed from the
@@ -435,6 +437,7 @@ export const MCP_TOOL_AUDIENCE: Record<string, ToolAudience> = {
   list_review_inbox: 'core', set_plan_doc_pins: 'core', set_supersedes: 'core', get_supersession: 'core',
   save_template: 'planning', list_templates: 'planning', create_doc: 'planning', update_doc: 'planning',
   create_plan: 'planning', update_plan: 'planning', create_plan_doc: 'planning', update_plan_doc: 'planning', create_milestone: 'planning',
+  list_boards: 'planning', create_board: 'planning', rename_board: 'planning', delete_board: 'planning',
   create_project: 'maintenance', set_project_group: 'maintenance', list_groups: 'maintenance', move_task: 'maintenance',
   merge_tags: 'maintenance', tag_report: 'maintenance', reindex_search: 'maintenance',
   get_orchestration: 'orchestration', create_orchestration: 'orchestration', declare_execution: 'orchestration',
@@ -462,7 +465,7 @@ const minimumMcpAction = (
 // pinning this to an old protocol-era value makes newly deployed tools look permanently absent.
 // The application version is bumped for every deploy and is the cache invalidator every host can
 // observe without understanding a Noriq-specific extension.
-export const SERVER_INFO = { name: 'noriq', version: pkg.version, catalogRevision: 5 };
+export const SERVER_INFO = { name: 'noriq', version: pkg.version, catalogRevision: 6 };
 
 /** Discovery metadata for the deployed catalogue. */
 export function serverInfoForAgent() {
@@ -1096,7 +1099,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_project',
-    'Project scaffold for orientation + id resolution — deliberately NOT the full task list. Returns: the project (incl. `fileLocking` — when true you MUST acquire_lock before editing any file here), milestones, boards, tags, the docs index, the active/pending plans (completed & archived plans omitted), and only the P0 (most urgent — the scale runs 0 = drop everything to 4 = someday) still-open tasks. For the full or filtered task list use search_tasks; for the next thing to work use next_claimable; for "find the thing about X" use semantic_search; for a plan\'s detail use get_plans.',
+    'Project scaffold for orientation + id resolution — deliberately NOT the full task list. Returns: the project (incl. `fileLocking` — when true you MUST acquire_lock before editing any file here), milestones (time/goal buckets — NOT boards), boards (kanban partitions for concurrent workstreams; the web UI also has a virtual All filter that is NOT a board row), tags, the docs index, the active/pending plans (completed & archived plans omitted), and only the P0 (most urgent — the scale runs 0 = drop everything to 4 = someday) still-open tasks. Use `boards[].id` when creating tasks (`boardId` is required on create_tasks / create_plan newTasks). For board CRUD use list_boards / create_board / rename_board / delete_board. For the full or filtered task list use search_tasks (optional boardId filter); for the next thing to work use next_claimable; for "find the thing about X" use semantic_search; for a plan\'s detail use get_plans.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const [tasks, milestones, boards, project, categories, docs, plans] = await Promise.all([
@@ -1144,14 +1147,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_tasks',
-    'Create one or many tasks. Every item needs descriptive `tags` and a meaningful milestoneId (its own, or via defaults). Items may reference earlier batch refs for parent/dependency wiring. Use `proposal` only when a human must decide whether work should proceed; confirmed bugs and authorized work are normal claimable tasks with honest priority. Runtime failures are per item, while malformed schemas reject the entire call before writes. ' +
+    'Create one or many tasks. Every item needs descriptive `tags`, a meaningful milestoneId (its own, or via defaults), and a boardId (defaults.boardId or per-item — REQUIRED; there is no default-board fallback). Boards partition concurrent workstreams (see get_project.boards / list_boards); milestones are time/goal buckets — do not confuse them. The web UI "All" tab is a virtual filter only and is not a boardId. Items may reference earlier batch refs for parent/dependency wiring. Use `proposal` only when a human must decide whether work should proceed; confirmed bugs and authorized work are normal claimable tasks with honest priority. Runtime failures are per item, while malformed schemas reject the entire call before writes. ' +
     EXECUTION_SPEC_DESC +
       " Per item AND in `defaults` — but a default spec is replaced wholesale by an item's own, never merged with it, and a spec usually names one piece of work.",
     {
       projectId: z.string(),
       defaults: z.object({
-        milestoneId: z.string().optional(),
-        boardId: z.string().optional(),
+        milestoneId: z.string().optional().describe('Milestone id from get_project.milestones (time/goal bucket — not a board)'),
+        boardId: z.string().optional().describe('Board id from get_project.boards / list_boards — required per item unless set here'),
         priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
         estimate: z.number().int().min(0).optional(),
         dueAt: z.string().datetime().optional(),
@@ -1175,8 +1178,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
           estimate: z.number().int().min(0).optional(),
           dueAt: z.string().datetime().optional(),
-          milestoneId: z.string().optional(),
-          boardId: z.string().optional(),
+          milestoneId: z.string().optional().describe('Milestone id (time/goal) — not a board'),
+          boardId: z.string().optional().describe('Board id from get_project.boards — required unless defaults.boardId is set'),
           docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
           tags: z.array(z.string()).optional(),
@@ -1221,8 +1224,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           // Checked per item so one untagged entry fails alone, matching batch semantics.
           const effectiveTags = item.tags ?? defaults?.tags;
           requireDescriptiveTags(effectiveTags);
+          // PLNR-603: boardId required (defaults or per-item) unless a parentTaskId will
+          // inherit the parent's board (PLNR-181). No defaultBoardId fallback.
+          const boardId = item.boardId ?? defaults?.boardId;
           const dependsOn = await Promise.all((item.dependsOn ?? defaults?.dependsOn ?? []).map(resolveDep));
           const parentRef = item.parentTaskId ?? defaults?.parentTaskId;
+          if (!boardId && !parentRef) {
+            throw new Error(
+              'boardId is required (pass defaults.boardId or per-item boardId; see get_project.boards)',
+            );
+          }
           const parentTaskId = parentRef ? await resolve(parentRef) : undefined;
           let proposal;
           if (item.proposal) {
@@ -1256,7 +1267,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             estimate: item.estimate ?? defaults?.estimate,
             dueAt: item.dueAt ?? defaults?.dueAt,
             milestoneId: item.milestoneId ?? defaults?.milestoneId,
-            boardId: item.boardId ?? defaults?.boardId,
+            boardId: boardId,
             docIds: item.docIds ?? defaults?.docIds,
             phaseId: item.phaseId ?? defaults?.phaseId,
             type: item.type ?? defaults?.type,
@@ -1284,7 +1295,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_tasks',
-    'Update one or many tasks with heterogeneous patches, dependency edits, and git references. `defaults` is merged with each item\'s set (item wins). Results are per task; one failure does not stop later items. executionSpec replaces the whole value; use defaults.executionSpec only when the same contract genuinely applies to every item. ' + EXECUTION_SPEC_DESC,
+    'Update one or many tasks with heterogeneous patches, dependency edits, and git references. `defaults` is merged with each item\'s set (item wins). `boardId` moves a task between boards (ids from get_project.boards / list_boards — not milestones); `milestoneId` reassigns the time/goal bucket. Results are per task; one failure does not stop later items. executionSpec replaces the whole value; use defaults.executionSpec only when the same contract genuinely applies to every item. ' + EXECUTION_SPEC_DESC,
     {
       projectId: z.string(),
       defaults: z.object({
@@ -1549,7 +1560,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'search_tasks',
-    'Filter tasks by ATTRIBUTES — "review tasks tagged auth", "my in-progress work", "overdue anywhere". Omit projectId to search every project you can reach. All filters AND together; `text` is an exact substring over title/body/key (NOT meaning — for loosely-phrased "find the thing about X", or to search docs and plans too, use semantic_search). Returns up to `limit` matches urgent-first, plus `matched` (the true total) so a truncated result is visible.',
+    'Filter tasks by ATTRIBUTES — "review tasks tagged auth", "my in-progress work", "overdue anywhere", "tasks on board X". Omit projectId to search every project you can reach. All filters AND together; `boardId` restricts to one board (from get_project.boards — the UI All filter is not a board id); `milestoneId` is the time/goal bucket, not a board. `text` is an exact substring over title/body/key (NOT meaning — for loosely-phrased "find the thing about X", or to search docs and plans too, use semantic_search). Returns up to `limit` matches urgent-first, plus `matched` (the true total) so a truncated result is visible.',
     {
       projectId: z.string().optional().describe('Restrict to one project; omit for everything your credential reaches'),
       // The WIRE vocabulary, derived statuses included: the filter matches what the results
@@ -1557,20 +1568,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'failed', 'proposed', 'done', 'cancelled']).optional().describe('Exact wire status; proposed = awaiting a human accept, failed = last run failed'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional().describe('Task type'),
       tag: z.string().optional().describe('Tag name (exact, case-insensitive)'),
-      milestoneId: z.string().optional(),
+      milestoneId: z.string().optional().describe('Milestone id (time/goal bucket — not a board)'),
+      boardId: z.string().optional().describe('Board id from get_project.boards / list_boards — filter to one board'),
       holder: z.string().optional().describe("'me' (your claims), 'none' (unclaimed), or an agent id"),
       text: z.string().optional().describe('Substring over title/body/key'),
       overdue: z.boolean().optional().describe('Only past-due, still-open tasks'),
       includeArchived: z.boolean().optional(),
       limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
     },
-    tool(async ({ projectId, status, type, tag, milestoneId, holder, text, overdue, includeArchived, limit }) => {
+    tool(async ({ projectId, status, type, tag, milestoneId, boardId, holder, text, overdue, includeArchived, limit }) => {
       return searchWorkspaceTasks(env, {
         userId: agent.userId,
         oauthTokenId: opts.oauthTokenId,
       }, {
         projectId,
-        status, type, tag, milestoneId, text, overdue, includeArchived,
+        status, type, tag, milestoneId, boardId, text, overdue, includeArchived,
         holder: holder === 'me' ? agent.id : holder,
         limit,
       });
@@ -2033,7 +2045,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_plan',
-    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Give each new task a milestoneId or a shared taskDefaults.milestoneId. Phase order is ENFORCED — computed live from the structure (PLNR-163), no edges minted: every task in phase N waits until all of phase N-1 is finished. Phases are numbered from 1 (the first phase is order 1), matching the Plans view — a user who says "start phase 3" means the third phase, not the fourth. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
+    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Give each new task a milestoneId or a shared taskDefaults.milestoneId, AND a boardId or taskDefaults.boardId (REQUIRED — no default-board fallback; see get_project.boards). Boards are kanban partitions; milestones are time/goal buckets; the UI All tab is not a board. Phase order is ENFORCED — computed live from the structure (PLNR-163), no edges minted: every task in phase N waits until all of phase N-1 is finished. Phases are numbered from 1 (the first phase is order 1), matching the Plans view — a user who says "start phase 3" means the third phase, not the fourth. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
     EXECUTION_SPEC_DESC + ' Per newTask, never in taskDefaults — a spec names ONE piece of work, so a shared one would be wrong for every task that inherited it. This is how a scoping pass hands real execution detail forward instead of prose alone.',
     {
       projectId: z.string(),
@@ -2043,8 +2055,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       body: z.string().optional().describe('The full plan document (markdown): goals, approach, constraints, exit gate'),
       proposed: z.boolean().optional().describe('Use only when a human go/no-go decision is needed. Its tasks are not claimable until approval. Already-authorized work and confirmed urgent bugs belong in active plans.'),
       taskDefaults: z.object({
-        milestoneId: z.string().optional(),
-        boardId: z.string().optional(),
+        milestoneId: z.string().optional().describe('Milestone id (time/goal) — not a board'),
+        boardId: z.string().optional().describe('Board id from get_project.boards — required for newTasks unless each sets its own'),
         priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
         estimate: z.number().int().min(0).optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -2061,8 +2073,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             body: z.string().optional(),
             priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
             estimate: z.number().int().min(0).optional(),
-            milestoneId: z.string().optional(),
-            boardId: z.string().optional(),
+            milestoneId: z.string().optional().describe('Milestone id (time/goal) — not a board'),
+            boardId: z.string().optional().describe('Board id — required unless taskDefaults.boardId is set'),
             docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
@@ -2089,6 +2101,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         return { ...created, phases: presentCreatedPhases(created.phases) };
       }
       if (!title || !phases) throw new Error('inline plans require title and phases');
+      // PLNR-603: every newTask needs a boardId (own or taskDefaults). No default-board fallback.
+      for (const ph of phases) {
+        for (const nt of ph.newTasks ?? []) {
+          if (!(nt.boardId ?? taskDefaults?.boardId)) {
+            throw new Error(
+              'boardId is required on newTasks (per-item or taskDefaults.boardId; see get_project.boards)',
+            );
+          }
+        }
+      }
       const created = await room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, taskDefaults, phases });
       return { ...created, phases: presentCreatedPhases(created.phases) };
     }),
@@ -2231,7 +2253,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_milestone',
-    'Create a milestone in a project. `description` is the goal — what "done" means. Assign tasks to it via update_tasks.milestoneId, or in bulk via create_tasks/create_plan taskDefaults.',
+    'Create a milestone in a project — a time/goal bucket (roadmap phase, release target), NOT a board. Boards partition concurrent workstreams on the kanban; milestones answer "which delivery goal?". `description` is the goal — what "done" means. Assign tasks via update_tasks.milestoneId, or in bulk via create_tasks/create_plan taskDefaults.milestoneId. Creating tasks still requires a separate boardId (see get_project.boards).',
     {
       projectId: z.string(),
       title: z.string().min(1).describe('Milestone title'),
@@ -2239,6 +2261,53 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       description: z.string().optional().describe('The goal / exit criteria for this milestone'),
     },
     tool(async ({ projectId, title, dueAt, description }) => room(env, projectId).createMilestone(projectId, actor, title, dueAt, description)),
+  );
+
+  // ---- boards (PLNR-603) — kanban partitions; distinct from milestones -----
+
+  defineTool(
+    'list_boards',
+    'List boards in a project. Boards are kanban partitions for concurrent workstreams (e.g. Main, Staging). They are NOT milestones (time/goal buckets) and NOT the web UI "All" tab (All is a virtual filter with no DB row). Use board ids with create_tasks / create_plan newTasks (boardId required) and search_tasks.boardId. Also available on get_project.boards.',
+    { projectId: z.string() },
+    tool(async ({ projectId }) => {
+      const { results } = await env.DB.prepare(
+        'SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at',
+      ).bind(projectId).all<{ id: string; name: string }>();
+      return { boards: results };
+    }),
+  );
+
+  defineTool(
+    'create_board',
+    'Create a board (kanban partition) in a project. Distinct from create_milestone. New boards start empty; place tasks with create_tasks.boardId or update_tasks.boardId. The web UI "All" tab remains virtual and is never created here.',
+    {
+      projectId: z.string(),
+      name: z.string().min(1).describe('Board display name'),
+    },
+    tool(async ({ projectId, name }) => room(env, projectId).createBoard(projectId, actor, name.trim())),
+  );
+
+  defineTool(
+    'rename_board',
+    'Rename an existing board. Pass boardId from list_boards / get_project.boards. Does not move tasks.',
+    {
+      projectId: z.string(),
+      boardId: z.string().describe('Board id from list_boards / get_project.boards'),
+      name: z.string().min(1).describe('New board display name'),
+    },
+    tool(async ({ projectId, boardId, name }) =>
+      room(env, projectId).renameBoard(projectId, actor, boardId, name.trim())),
+  );
+
+  defineTool(
+    'delete_board',
+    'Delete a board and move its tasks onto another board in the same project (returned as movedTo). Refuses to delete the last remaining board — a project always needs at least one. Prefer rename when you only want a new label. The UI All filter is unaffected (it is not a board).',
+    {
+      projectId: z.string(),
+      boardId: z.string().describe('Board id to delete'),
+    },
+    tool(async ({ projectId, boardId }) =>
+      room(env, projectId).deleteBoard(projectId, actor, boardId)),
   );
 
   // ---- entity validation / decay (PLNR-576..580) ---------------------------

@@ -2,7 +2,7 @@
 // moving tasks between boards, and the last-board guard.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpCallRaw } from './helpers';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
@@ -142,6 +142,67 @@ describe('board placement at creation (PLNR-181)', () => {
     // and the task did not move
     const s = await snapshot();
     expect(s.tasks.find((t) => t.id === parentOnQa)?.boardId).toBe(qa);
+  });
+
+  // PLNR-603: create_tasks requires boardId (no defaultBoardId fallback). mcpCallRaw skips
+  // the test helper's comfort injection so we exercise the real MCP error.
+  it('create_tasks without boardId fails pointing at get_project.boards', async () => {
+    const r = await mcpCallRaw(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'no board', tags: ['test-fixture'] }],
+    });
+    expect(r.isError).toBe(false); // batch tool returns per-item errors
+    const body = r.body as { failed: number; created: Array<{ error?: string }> };
+    expect(body.failed).toBe(1);
+    expect(body.created[0]!.error).toMatch(/boardId is required/i);
+    expect(body.created[0]!.error).toContain('get_project.boards');
+  });
+
+  it('create_tasks with boardId succeeds', async () => {
+    const r = await mcpCallRaw(agent.apiKey, 'create_tasks', {
+      projectId,
+      tasks: [{ title: 'explicit board', tags: ['test-fixture'], boardId: qa }],
+    });
+    expect(r.isError).toBe(false);
+    const created = (r.body as { created: Array<{ id: string; error?: string }> }).created[0]!;
+    expect(created.error).toBeUndefined();
+    expect((await snapshot()).tasks.find((t) => t.id === created.id)?.boardId).toBe(qa);
+  });
+});
+
+// PLNR-603: MCP board CRUD mirrors REST createBoard / renameBoard / deleteBoard.
+describe('MCP board management (PLNR-603)', () => {
+  it('lists, creates, renames, and deletes boards (delete moves tasks)', async () => {
+    const listed = await mcpCall(agent.apiKey, 'list_boards', { projectId });
+    expect(listed.isError).toBe(false);
+    const before = (listed.body as { boards: Array<{ id: string; name: string }> }).boards;
+    expect(before.length).toBeGreaterThanOrEqual(1);
+
+    const created = await mcpCall(agent.apiKey, 'create_board', { projectId, name: 'MCP-Staging' });
+    expect(created.isError).toBe(false);
+    const boardId = (created.body as { id: string }).id;
+
+    const task = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'on mcp staging', tags: ['test-fixture'], boardId,
+    });
+    expect(task.isError).toBe(false);
+
+    const renamed = await mcpCall(agent.apiKey, 'rename_board', {
+      projectId, boardId, name: 'MCP-Prod',
+    });
+    expect(renamed.isError).toBe(false);
+    const afterRename = await mcpCall(agent.apiKey, 'list_boards', { projectId });
+    expect((afterRename.body as { boards: Array<{ id: string; name: string }> }).boards
+      .find((b) => b.id === boardId)?.name).toBe('MCP-Prod');
+
+    const del = await mcpCall(agent.apiKey, 'delete_board', { projectId, boardId });
+    expect(del.isError).toBe(false);
+    const movedTo = (del.body as { movedTo: string }).movedTo;
+    expect(movedTo).toBeTruthy();
+    expect(movedTo).not.toBe(boardId);
+    const s = await snapshot();
+    expect(s.boards.some((b) => b.id === boardId)).toBe(false);
+    expect(s.tasks.find((t) => t.id === task.body.id)?.boardId).toBe(movedTo);
   });
 });
 
