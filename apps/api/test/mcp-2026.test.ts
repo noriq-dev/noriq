@@ -95,7 +95,12 @@ describe('server/discover', () => {
     expect(r.cacheScope).toBe('private');
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
     expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
-    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 6 });
+    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({
+      catalogRevision: 6,
+      title: 'Noriq',
+      description: expect.stringContaining('get_briefing'),
+      websiteUrl: 'https://plan.frs.llc',
+    });
     expect(r._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 

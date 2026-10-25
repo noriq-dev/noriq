@@ -20,19 +20,19 @@
     "db:migrate:remote": "sh -c 'wrangler d1 migrations apply DB --remote --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'"
   },
   "dependencies": {
-    "@hono/mcp": "^0.3.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@hono/mcp": "^0.3.2",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@noriq-dev/shared": "*",
     "@simplewebauthn/server": "^13.3.2",
-    "hono": "^4.7.0",
+    "hono": "^4.13.14",
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.8.0",
-    "@cloudflare/workers-types": "^4.20250620.0",
-    "@types/node": "^26.1.1",
-    "typescript": "^5.7.0",
-    "vitest": "~3.1.0",
-    "wrangler": "^4.20.0"
+    "@cloudflare/vitest-pool-workers": "~0.8.71",
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3",
+    "vitest": "~3.2.7",
+    "wrangler": "~4.35.0"
   }
 }
