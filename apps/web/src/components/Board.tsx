@@ -438,9 +438,14 @@ export function Board({ store }: { store: AppStore }) {
             // Urgent first; the stable sort keeps board order within a priority band (PLNR-119).
             // Ascending, because 0 is the most urgent (PLNR-231).
             const list = visible.filter((t) => t.status === st).sort((a, b) => a.priority - b.priority);
+            // Empty lanes stay visible as drop targets / status landmarks, but stop claiming a
+            // full card-column width (PLNR-605). Filled lanes keep the existing 282px track.
+            const empty = list.length === 0;
             return (
               <div
                 key={st}
+                data-testid={`board-col-${st}`}
+                data-empty={empty ? 'true' : 'false'}
                 onDragOver={(e) => {
                   e.preventDefault();
                   // 'failed' is system-set (PLNR-178) — not a drop target; show the no-drop cursor.
@@ -451,13 +456,13 @@ export function Board({ store }: { store: AppStore }) {
                   if (store.permissions.canContribute && draggedId != null && st !== 'failed') actions.moveTask(draggedId, st);
                 }}
                 className="board-col"
-                style={{ width: 282, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0 }}
+                style={{ width: empty ? 136 : 282, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0 }}
               >
                 <div style={{ padding: '2px 4px 12px', display: 'flex', alignItems: 'center', gap: 8, flex: 'none' }}>
                   <span style={{ width: 8, height: 8, borderRadius: '50%', background: m.dot }} />
                   <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-soft)' }}>{label}</span>
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>{list.length}</span>
-                  <div style={{ flex: 1, height: 1, background: 'var(--w-05)' }} />
+                  {!empty && <div style={{ flex: 1, height: 1, background: 'var(--w-05)' }} />}
                 </div>
                 <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 }}>
                   {list.map((t) => {

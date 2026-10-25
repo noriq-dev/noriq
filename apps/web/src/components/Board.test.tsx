@@ -177,6 +177,33 @@ describe('Board plan membership filter', () => {
     expect(container.textContent).toContain('Standalone board task');
   });
 
+  it('keeps empty status columns visible but narrower than filled ones (PLNR-605)', () => {
+    const todo = task('task_todo', 'BRD-30', 'Only in todo');
+    const review = { ...task('task_review', 'BRD-31', 'Only in review'), status: 'review' as const };
+    mount([todo, review]);
+
+    const filled = container.querySelector<HTMLElement>('[data-testid="board-col-todo"]')!;
+    const empty = container.querySelector<HTMLElement>('[data-testid="board-col-failed"]')!;
+    const alsoFilled = container.querySelector<HTMLElement>('[data-testid="board-col-review"]')!;
+    const alsoEmpty = container.querySelector<HTMLElement>('[data-testid="board-col-in_progress"]')!;
+
+    expect(filled).toBeTruthy();
+    expect(empty).toBeTruthy();
+    expect(alsoFilled).toBeTruthy();
+    expect(alsoEmpty).toBeTruthy();
+    expect(filled.getAttribute('data-empty')).toBe('false');
+    expect(alsoFilled.getAttribute('data-empty')).toBe('false');
+    expect(empty.getAttribute('data-empty')).toBe('true');
+    expect(alsoEmpty.getAttribute('data-empty')).toBe('true');
+    expect(filled.style.width).toBe('282px');
+    expect(alsoFilled.style.width).toBe('282px');
+    expect(empty.style.width).toBe('136px');
+    expect(alsoEmpty.style.width).toBe('136px');
+    expect(empty.textContent).toContain('Failed');
+    expect(alsoEmpty.textContent).toContain('In progress');
+    expect(parseInt(empty.style.width, 10)).toBeLessThan(parseInt(filled.style.width, 10));
+  });
+
   it('shows All first and filters across boards when All is selected (PLNR-603)', () => {
     const onMain = task('task_main', 'BRD-20', 'Main board task');
     const onOther = { ...task('task_other', 'BRD-21', 'Other board task'), boardId: 'board_2' };
