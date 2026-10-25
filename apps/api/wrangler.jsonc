@@ -11,6 +11,13 @@
   // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
   "alias": { "zod/v4": "zod" },
 
+  // Memory DO schema ships as Text modules (memory-migrations/*.sql). Wrangler 4.35+
+  // in this lockfile has no default **/*.sql Text rule (4.110 did); without this the
+  // Worker bundle fails. fallthrough keeps any other default module rules intact.
+  "rules": [
+    { "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }
+  ],
+
 
   // Ask answer budget and actor-lifecycle retention policy. Lifecycle numeric values are parsed,
   // clamped, and reported by the sweep. Scheduled mutation is deliberately opt-in; operators can

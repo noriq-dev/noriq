@@ -10,6 +10,13 @@
   // Force single zod module entry (MCP SDK imports zod/v4; esbuild init-order otherwise throws Class2 is not a constructor).
   "alias": { "zod/v4": "zod" },
 
+  // Memory DO schema ships as Text modules (memory-migrations/*.sql). Wrangler 4.35+
+  // in this lockfile has no default **/*.sql Text rule (4.110 did); without this the
+  // Worker bundle fails. fallthrough keeps any other default module rules intact.
+  "rules": [
+    { "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }
+  ],
+
 
   // Your custom domain (zone must be on your Cloudflare account). Wrangler
   // creates the DNS record + certificate on deploy. Delete to use workers.dev.
