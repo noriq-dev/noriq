@@ -30,11 +30,8 @@
   "allowScripts": {
     "esbuild@0.25.12": true,
     "esbuild@0.25.4": true,
-    "esbuild@0.28.1": true,
     "workerd@1.20250906.0": true,
-    "workerd@1.20260708.1": true,
-    "sharp@0.33.5": true,
-    "sharp@0.34.5": true
+    "sharp@0.33.5": true
   },
   "devDependencies": {
     "zod": "^4.0.0"

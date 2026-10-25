@@ -460,12 +460,21 @@ const minimumMcpAction = (
 };
 
 /** Self-reported server identity — sent in legacy `initialize` results and mirrored into
- *  every modern (2026-07-28) result's `_meta` serverInfo by the compat layer. */
-// The server version is also the MCP catalogue revision. Copilot hosts may cache tools/list, so
-// pinning this to an old protocol-era value makes newly deployed tools look permanently absent.
-// The application version is bumped for every deploy and is the cache invalidator every host can
-// observe without understanding a Noriq-specific extension.
-export const SERVER_INFO = { name: 'noriq', version: pkg.version, catalogRevision: 6 };
+ *  every modern (2026-07-28) result's `_meta` serverInfo by the compat layer.
+ *  `description` / `title` / `websiteUrl` follow MCP Implementation metadata
+ *  (2025-11-25+); `catalogRevision` is the Noriq tools/list cache key (bump when the
+ *  tool catalogue shape changes — names, schemas, or annotations that affect hosts). */
+// Copilot hosts may cache tools/list; the application version is also a cache invalidator
+// every host can observe without understanding a Noriq-specific extension.
+export const SERVER_INFO = {
+  name: 'noriq',
+  title: 'Noriq',
+  version: pkg.version,
+  description:
+    'AI-native project management — MCP coordination for agents, mission control for humans. Call get_briefing first; claim before work; boardId is required on create_tasks (the UI All board is virtual and not a boardId).',
+  websiteUrl: 'https://plan.frs.llc',
+  catalogRevision: 6,
+};
 
 /** Discovery metadata for the deployed catalogue. */
 export function serverInfoForAgent() {
@@ -477,6 +486,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     serverInfoForAgent(),
     {
       instructions: INSTRUCTIONS,
+      // Cap nested tool-call argument size (SDK 1.32+). Coordination payloads are bounded;
+      // this rejects pathological trees before validation walks them.
+      maxToolInputElements: 8_192,
       // logging → standard notifications/message (any client); experimental claude/channel
       // → Claude's richer surfacing. Both ride the live POST SSE stream (PLNR-54/45).
       capabilities: {
@@ -604,11 +616,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (annotations.readOnlyHint !== true && isMaintenanceMode(env)) return deny(MAINTENANCE_MESSAGE, 'maintenance_mode');
       return cb(args, extra);
     };
-    // The SDK (1.29.0) accepts zod v4 at runtime (peer `^3.25 || ^4.0`) but types
-    // registerTool's inputSchema against v3's fuller ZodType, so v4's leaner raw
-    // shape needs a cast at this single funnel point. Runtime validation is unchanged.
+    // SDK 1.32+ types registerTool via ZodRawShapeCompat (zod v3 | v4). Root zod@4 is the
+    // single hoisted copy (PLNR-549); cast only the callback — its RequestHandlerExtra shape
+    // still disagrees with our optional-extra wrapper used for relatedRequestId push.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return server.registerTool(name, { description, inputSchema: inputSchema as any, annotations }, guarded as any);
+    return server.registerTool(name, { description, inputSchema, annotations }, guarded as any);
   };
 
   // ---- orientation --------------------------------------------------------
