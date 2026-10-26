@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.80.0 - 2026-10-26
+
+### Evidence-backed verification and coordination surfaces (PLNR-609–617)
+
+- Record structured readiness, implementation and document assessments with scoped evidence and actor attribution. Initial task/doc evidence can be supplied at creation; legacy attestations remain distinguishable.
+- New plans require current task readiness and separate implementation evidence at completion. Later phases require rechecks after preceding work changes; human approval accepts plan direction without certifying every task.
+- Keep critical claim blockers independent of reminder snooze/dismiss. Explicit, expiring overrides retain their reason, actor and context; assessment and exception history stays readable.
+- Replace Intelligence's landing with live Project health, retaining historical analytics and lineage as secondary views and removing the mandatory request to a retired runner API.
+- Open Memory to searchable knowledge, preserving maps, graphs and evidence workflows. Present Agents as Connected sessions with explicit roster scope, project claims/locks, and visible error/retry states.
+
+**Upgrade:** apply additive D1 migrations `0123_entity_assessments.sql` and `0124_phase_readiness.sql` with the updated Worker and web assets. Existing plans retain legacy policy until explicitly enabled using `update_plan {requireTaskEvidence:true}`. Evidence remains actor-reported; Noriq does not execute the cited checks or independently inspect repository revisions.
+
 ### Memory/Intelligence copy post-runner + post-index-drop (PLNR-572)
 
 - Memory Ops / Graph / Star Map no longer promise a Noriq repository reindex or ingest-client refresh; empty code-graph notices match the settled “local IDEs own code understanding” decision.
