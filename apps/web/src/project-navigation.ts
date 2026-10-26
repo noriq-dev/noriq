@@ -34,8 +34,8 @@ export const PROJECT_NAV_GROUPS: ProjectNavigationGroup[] = [
   {
     label: 'Operate',
     items: [
-      { id: 'agents', label: 'Agents', description: 'Live actors and lifecycle' },
-      { id: 'intelligence', label: 'Intelligence', description: 'Project-level signals' },
+      { id: 'agents', label: 'Connected sessions', description: 'Session presence and project activity' },
+      { id: 'intelligence', label: 'Project health', description: 'Readiness, evidence gaps and coordination' },
     ],
   },
   {

@@ -562,6 +562,7 @@ export async function assembleContextPack(
         lastValidatedAt: freshness.lastValidatedAt,
         causes: freshness.causes.map((c) => ({ code: c.code, severity: c.severity, detail: c.detail })),
         criticalCauses: freshness.criticalCauses,
+        assessment: freshness.assessment,
         impactUnknown: freshness.impactUnknown,
       },
     } : {}),

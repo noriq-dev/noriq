@@ -1,3 +1,4 @@
+import type { AssessmentState } from './assessment';
 import { z } from 'zod';
 import { RepoPath, ExecutionSpec } from './execution-spec';
 import { ProjectIntelligenceEpisode } from './intelligence';
@@ -828,6 +829,7 @@ export const ContextPackTaskFacts = z.object({
       detail: z.string().optional(),
     })),
     criticalCauses: z.array(z.string()),
+    assessment: z.custom<AssessmentState>().optional(),
     impactUnknown: z.boolean(),
   }).optional(),
 });

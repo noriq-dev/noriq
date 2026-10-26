@@ -1,145 +1,37 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiOrchestrationSummary, type ApiOrchestrationTree, type ApiProjectIntelligence } from '../api';
+import { afterEach, expect, it, vi } from 'vitest';
+import { api, type ApiProjectHealth } from '../api';
 import type { AppStore } from '../store';
 import { IntelligenceView } from './IntelligenceView';
-
-let root: Root | null = null;
-let container: HTMLDivElement;
-const originalMatchMedia = window.matchMedia;
-const mockPhoneViewport = () => {
-  window.matchMedia = vi.fn((query: string) => ({
-    matches: query.includes('767px') || query.includes('1023px'), media: query, onchange: null,
-    addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
-  }));
-};
-const tick = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-const metric = (median: number | null, denominator = median == null ? 0 : 1) => ({
-  observedCount: denominator, partialCount: 0, unavailableCount: denominator ? 0 : 1, denominator,
-  min: median, p25: median, median, p75: median, iqr: median == null ? null : 0, p90: median, max: median, total: median,
+let root: Root, container: HTMLDivElement;
+const openTask = vi.fn(), setView = vi.fn();
+const packet: ApiProjectHealth = { observedAt: new Date().toISOString(), totalOpenTasks: 1, activeClaims: 0, activeLocks: 0, offset: 0, nextOffset: null, pageSize: 10,
+  items: [{ id: 't1', key: 'APP-1', title: 'Recheck phase two', status: 'todo', priority: 2, claimability: { claimable: false, reason: 'Readiness required', reasonCode: 'freshness_critical' }, phases: [], readiness: 'missing', implementation: 'missing', evidenceRequired: true, checkedAt: null, checkedRevision: null, causes: [{ code: 'readiness_required', severity: 'critical' }], blockingCauses: ['readiness_required'], overrides: [] }] };
+async function render() {
+  container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+  await act(async () => root.render(<IntelligenceView store={{ currentPid: 'p1', actions: { openTask, setView } } as unknown as AppStore} />));
+}
+afterEach(() => { act(() => root?.unmount()); container?.remove(); vi.restoreAllMocks(); });
+it('shows actionable evidence gaps and opens the existing task', async () => {
+  vi.spyOn(api, 'projectHealth').mockResolvedValue(packet);
+  await render();
+  expect(container.textContent).toContain('0 claimable on this page');
+  expect(container.textContent).toContain('Readiness required');
+  act(() => [...container.querySelectorAll('button')].find(b => b.textContent?.includes('APP-1'))!.click());
+  expect(openTask).toHaveBeenCalledWith('t1');
 });
-
-const packet: ApiProjectIntelligence = {
-  live: {
-    observedAt: '2026-08-10T05:00:00.000Z', source: 'd1_current_state',
-    readiness: { totalTasks: 4, readyTasks: 2, blockedTasks: 1, inProgressTasks: 1, reviewTasks: 0 },
-    plans: { statuses: { active: 1 }, dispatchStatuses: {}, phaseGateStatuses: { pending: 1 }, phasesWithoutGate: 0, landings: { recorded: 1, owed: 0, succeeded: 1, failed: 0 } },
-    execution: { runStatuses: { done: 1 }, orchestrationStatuses: { succeeded: 1 }, nodeStatuses: {}, activeNodes: 1, parkedNodes: 0 },
-    coordination: { activeClaims: 1, activeLocks: 2 },
-    runners: { statuses: { online: 1 }, presenceStates: { active: 1 }, capacity: { reportedRunners: 1, maxConcurrency: 2, freeSlots: 1, busySlots: 1, completeness: 'complete' } },
-  },
-  analytics: {
-    health: { state: 'complete', staleSources: [], active: { id: 'ang_1', completedAt: '2026-08-10T04:00:00.000Z' }, latestFailure: null },
-    freshness: { state: 'current', liveObservedAt: '2026-08-10T05:00:00.000Z', generationCompletedAt: '2026-08-10T04:00:00.000Z', gapMs: 3_600_000, label: 'analytics current with known sources' },
-    historical: { state: 'available', result: {
-      observedAt: '2026-08-10T05:00:00.000Z', generation: { id: 'ang_1', completedAt: '2026-08-10T04:00:00.000Z', completeness: {} },
-      filter: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', scope: 'runner_job_tasks', groupBy: 'executed_workflow', filters: [] },
-      coverage: { complete: true, scannedRows: 1, matchedSittings: 1, reasons: [], qualityEventsScanned: 0, unassociatedQualityEvents: 0 },
-      groups: [{
-        dimension: 'executed_workflow', value: 'build', provenance: { source: 'derived_generation', generationId: 'ang_1', generationCompletedAt: '2026-08-10T04:00:00.000Z' },
-        sample: { sittings: 1, runs: 1 }, throughput: { sittings: 1, runs: 1, firstObservedAt: null, lastObservedAt: null },
-        metrics: { elapsedExecutionMs: metric(60_000), parkedMs: metric(0), verifyDurationMs: metric(null), tokens: metric(1200), costUSD: metric(null) },
-        outcomes: { done: { numerator: 1, denominator: 1, rate: 1 }, failed: { numerator: 0, denominator: 1, rate: 0 }, cancelled: { numerator: 0, denominator: 1, rate: 0 }, landed: { numerator: 1, denominator: 1, rate: 1 }, laterInstability: { status: 'unavailable', count: null, eventCount: 0, denominator: 0, rate: null, horizonDays: 30, observedThrough: '2026-08-10T04:00:00.000Z', eventTypeCounts: {}, reason: 'horizon incomplete' } },
-        composition: { stages: [], roles: [], reviewRepairTokenShare: { value: null, denominator: 0, share: null, completeness: 'unavailable' } },
-        completeness: { lineageComplete: 1, lineagePartial: 0, lineageUnknown: 0, metricDenominators: { costUSD: 0 } }, supportingCaseCount: 1,
-        supportingCases: [{ episodeId: 'epi_1', runId: 'run_1', sitting: 1, taskId: 'task_1', planId: 'plan_1', planDispatchId: null, orchestrationId: 'orc_1', executionId: 'exe_1' }],
-      }], cases: { items: [{ episodeId: 'epi_1', runId: 'run_1', sitting: 1, taskId: 'task_1', planId: 'plan_1', planDispatchId: null, orchestrationId: 'orc_1', executionId: 'exe_1' }], nextCursor: null, total: 1 },
-    } },
-  },
-  comparison: { dimension: 'workflow', metric: 'run_success', state: 'insufficient_evidence', interpretation: 'insufficient evidence', rows: [], eligibility: { totalCases: 1, eligibleCases: 0, independentClusters: 0, reasons: ['fewer than two comparable strategy cohorts'], policy: {} }, caseAudit: { eligible: [], excluded: [{ caseId: 'run_1/1', episodeId: 'epi_1', reasons: ['no comparison cohort'] }] } },
-  bounds: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', caseLimit: 24, groupBy: 'executed_workflow' },
-};
-
-const lineageSummary: ApiOrchestrationSummary = {
-  id: 'orc_1', anchorType: 'task', anchorId: 'task_1', anchorLabel: 'RUN-1 · Example',
-  rootExecutionId: 'exe_1', status: 'succeeded', completenessStatus: 'complete',
-  completenessMissing: [], completenessReason: null, createdByKind: 'copilot', createdById: 'agent_1',
-  createdByName: 'Codex', nodeCount: 1, liveNodeCount: 0, incompleteNodeCount: 0,
-  relationCount: 0, runnerJobId: null, createdAt: '2026-08-10T00:00:00.000Z',
-  updatedAt: '2026-08-10T01:00:00.000Z', finishedAt: '2026-08-10T01:00:00.000Z',
-};
-const lineageTree: ApiOrchestrationTree = {
-  orchestration: lineageSummary,
-  nodes: [{
-    id: 'exe_1', parentExecutionId: null, kind: 'copilot_session', role: 'worker', actorKind: 'copilot',
-    actorId: 'agent_1', actorName: 'Codex', presenceId: null, taskId: 'task_1', taskKey: 'RUN-1',
-    taskTitle: 'Example', planId: null, planTitle: null, runId: null, sitting: null, stage: null,
-    step: null, gateId: null, status: 'succeeded', completenessStatus: 'complete', completenessMissing: [],
-    completenessReason: null, lastRevision: 1, startedAt: lineageSummary.createdAt, parkedAt: null,
-    finishedAt: lineageSummary.finishedAt, outcomeReason: null, createdAt: lineageSummary.createdAt,
-    updatedAt: lineageSummary.updatedAt,
-  }],
-  rootExecutionIds: ['exe_1'], relations: [], timeline: [],
-  timelinePage: { limit: 100, hasMore: false, nextCursor: null },
-};
-
-beforeEach(() => {
-  vi.spyOn(api, 'runnerJobIntelligenceHistory').mockResolvedValue({
-    from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z',
-    jobs: [], tasks: [], truncated: false,
-  });
-  vi.spyOn(api, 'orchestrations').mockResolvedValue({
-    orchestrations: [lineageSummary], counts: { active: 0, history: 1, total: 1 },
-    page: { limit: 40, hasMore: false, nextCursor: null },
-  });
-  vi.spyOn(api, 'orchestration').mockResolvedValue(lineageTree);
+it('shows load failure and retries without presenting empty health', async () => {
+  vi.spyOn(api, 'projectHealth').mockRejectedValueOnce(new Error('offline')).mockResolvedValue(packet);
+  await render();
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('offline');
+  expect(container.textContent).not.toContain('No open tasks');
+  await act(async () => [...container.querySelectorAll('button')].find(b => b.textContent === 'Retry')!.click());
+  expect(container.textContent).toContain('Recheck phase two');
 });
-
-afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; window.matchMedia = originalMatchMedia; vi.restoreAllMocks(); history.replaceState(null, '', '/'); });
-
-describe('Project Intelligence surface (PLNR-302)', () => {
-  it('keeps the phone first paint compact and defers comparisons and cases', async () => {
-    mockPhoneViewport();
-    vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
-    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
-    act(() => root!.render(<IntelligenceView store={{ currentPid: 'prj_1' } as AppStore} />));
-    await tick();
-
-    expect(container.querySelectorAll('.intelligence-grid > article')).toHaveLength(6);
-    expect(container.textContent).not.toContain('insufficient evidence');
-    expect(container.textContent).not.toContain('Canonical case drill-down');
-    expect(container.querySelector<HTMLButtonElement>('button[aria-label="Analytics range"]')?.style.fontSize).toBe('9.5px');
-
-    const compare = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Compare')!;
-    act(() => compare.click());
-    expect(container.textContent).toContain('insufficient evidence');
-    const cases = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Cases')!;
-    act(() => cases.click());
-    expect(container.textContent).toContain('Canonical case drill-down');
-  });
-
-  it('renders server-authored completeness and refuses to turn missing spend into zero', async () => {
-    vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
-    history.replaceState(null, '', '/p/prj_1/intelligence');
-    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
-    act(() => root!.render(<IntelligenceView store={{ currentPid: 'prj_1' } as AppStore} />));
-    await tick();
-    expect(container.textContent).toContain('Costunavailable');
-    expect(container.textContent).toContain('insufficient evidence');
-    expect(container.textContent).toContain('fewer than two comparable strategy cohorts');
-    expect(api.projectIntelligence).toHaveBeenCalledWith('prj_1', expect.objectContaining({
-      caseLimit: 24, groupBy: 'executed_workflow', scope: 'copilot_claims',
-      comparison: { dimension: 'workflow', metric: 'run_success' },
-    }));
-    expect(container.textContent).toContain('ARCHIVED RUNNER CAPACITY');
-    expect(container.textContent).toContain('Historical RunnerJob summaries');
-    expect(container.textContent).not.toMatch(/(?<!ARCHIVED )RUNNER CAPACITY/);
-  });
-
-  it('opens canonical lineage inside Intelligence and restores it in query state', async () => {
-    vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
-    history.replaceState(null, '', '/p/prj_1/intelligence');
-    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
-    act(() => root!.render(<IntelligenceView store={{ currentPid: 'prj_1' } as AppStore} />));
-    await tick();
-    const button = [...container.querySelectorAll('button')].find((item) => item.textContent === 'Lineage');
-    act(() => button!.click());
-    await tick();
-    expect(location.pathname).toBe('/p/prj_1/intelligence');
-    expect(location.search).toContain('lineage=orc_1');
-    expect(location.search).toContain('node=exe_1');
-    expect(container.textContent).toContain('Canonical execution relationships');
-    expect(container.textContent).toContain('RUN-1 · Example');
-  });
+it('uses the live endpoint without requesting removed runner APIs', async () => {
+  const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(packet)));
+  await render();
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(fetcher.mock.calls[0]![0]).toBe('/api/projects/p1/health-summary?offset=0');
 });

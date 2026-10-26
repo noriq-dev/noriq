@@ -1,3 +1,4 @@
+import { AssessmentForm } from './AssessmentForm';
 // Review queue (PLNR-124) — the human's backlog: everything agents released to
 // `review`, as a focused list with one-click accept / send-back instead of drag
 // or per-task drawer digging. Send-back requires a note: an agent bounced with
@@ -207,18 +208,8 @@ function ValidityInbox({ store }: { store: AppStore }) {
     else store.actions.setView('plans');
   };
 
-  const markValidated = async (item: ApiEntityReviewInboxItem) => {
-    setActing(item.subjectId);
-    setError('');
-    try {
-      await api.recordValidation(pid, { subjectType: item.subjectType, subjectId: item.subjectId });
-      await load(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setActing(null);
-    }
-  };
+  const [assessmentItem, setAssessmentItem] = useState<ApiEntityReviewInboxItem | null>(null);
+  const markValidated = async (item: ApiEntityReviewInboxItem) => { setAssessmentItem(item); };
 
   const dismissCause = async (item: ApiEntityReviewInboxItem, dismiss: ApiReviewCause) => {
     setActing(item.subjectId);
@@ -287,6 +278,8 @@ function ValidityInbox({ store }: { store: AppStore }) {
 
   return (
     <>
+      {assessmentItem && <AssessmentForm projectId={pid} subjectType={assessmentItem.subjectType} subjectId={assessmentItem.subjectId}
+        onCancel={() => setAssessmentItem(null)} onSaved={async () => { setAssessmentItem(null); await load(false); }} />}
       <div style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 12 }}>
           <SectionLabel>Needs review · tasks + plans + docs</SectionLabel>
@@ -304,7 +297,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
           </div>
         </div>
         <div style={{ color: 'var(--text-dim)', fontSize: 12.5, lineHeight: 1.55, marginTop: 6 }}>
-          Age is not failure. This list is explicit drift, flags, or supersession — mark validated, dismiss a cause, supersede with a newer subject, or open it. Nothing auto-closes.
+          Age is not failure. This list is explicit drift, flags, or supersession — record evidence, dismiss a cause, supersede with a newer subject, or open it. Nothing auto-closes.
         </div>
       </div>
 
@@ -463,7 +456,7 @@ function ValidityRow({
       {!superseding && !snoozing ? (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           <Button variant="primary" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onValidate}>
-            mark validated
+            record evidence
           </Button>
           <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onOpen}>
             open

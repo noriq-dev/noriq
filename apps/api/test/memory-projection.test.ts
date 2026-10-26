@@ -1285,6 +1285,9 @@ describe('deleting a coordination entity removes its node and every edge inciden
     });
     if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
     const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+    await mcpCall(token, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId,
+      assessment: { purpose: 'readiness', outcome: 'passed', scope: 'non_code', summary: 'Synthetic projection fixture ready for the claim edge assertion.',
+        evidence: [{ kind: 'inspection', reference: 'test/memory-projection.test.ts', result: 'Doc and plan relationships prepared for deletion coverage.' }] } });
     const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
     if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
 

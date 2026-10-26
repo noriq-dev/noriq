@@ -184,7 +184,7 @@ function evaluateClaimability(
  *  read from the task's active plan_dispatch — 'approved' (strict, the default) or the
  *  opted-in 'landed' — so the answer equals what claim_task decides for that run, minus the
  *  anchored-agent bypass. This is exactly the gate the backstop must surface. */
-export async function taskClaimability(db: D1Database, taskId: string): Promise<Claimability> {
+export async function taskClaimability(db: D1Database, taskId: string, knownCriticalCauses?: string[]): Promise<Claimability> {
   const task = await db
     .prepare('SELECT id, key, status, proposed_at AS proposedAt, project_id AS projectId FROM tasks WHERE id = ? OR key = ?')
     .bind(taskId, taskId)
@@ -194,7 +194,7 @@ export async function taskClaimability(db: D1Database, taskId: string): Promise<
     claimGates(db, [task.id]),
     proposedPlanTasks(db, [task.id]),
     blockerRows(db, [task.id]),
-    import('./entity-validation-store').then((m) => m.subjectFreshness(db, task.projectId, 'task', task.id)),
+    knownCriticalCauses ? Promise.resolve({ criticalCauses: knownCriticalCauses }) : import('./entity-validation-store').then((m) => m.subjectFreshness(db, task.projectId, 'task', task.id)),
   ]);
   return evaluateClaimability(
     task,
@@ -224,7 +224,7 @@ export async function projectTaskClaimability(
     claimGates(db, ids),
     proposedPlanTasks(db, ids),
     blockerRows(db, ids),
-    Promise.all(ids.map((id) => subjectFreshness(db, projectId, 'task', id).catch(() => ({ criticalCauses: [] as string[] })))),
+    Promise.all(ids.map((id) => subjectFreshness(db, projectId, 'task', id))),
   ]);
   const criticalByTask = new Map(ids.map((id, i) => [id, freshnessList[i]!.criticalCauses]));
   return {

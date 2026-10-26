@@ -41,7 +41,7 @@ describe('copilot lifecycle inventory', () => {
   it('lists copilots only (no agents-vs-copilots toggle) and exposes Active / Dormant / History', async () => {
     mount(true, 'admin');
     await tick();
-    expect(container.textContent).toContain('Copilot lifecycle');
+    expect(container.textContent).toContain('Connected sessions');
     expect(container.textContent).toContain('Active 3');
     expect(container.textContent).toContain('Dormant 1');
     expect(container.textContent).toContain('History 5');
@@ -74,4 +74,16 @@ describe('copilot lifecycle inventory', () => {
     expect(button('dry run')).toBeUndefined();
     expect(button('apply one batch')).toBeUndefined();
   });
+});
+
+it('shows roster failures with retry instead of claiming there are no sessions', async () => {
+  mount();
+  vi.mocked(api.agents).mockRejectedValue(new Error('offline'));
+  await act(async () => button('Dormant 0')?.click());
+  await tick();
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('offline');
+  expect(container.textContent).not.toContain('no dormant copilots');
+  vi.mocked(api.agents).mockResolvedValue(emptyAgents);
+  await act(async () => button('Retry')!.click());
+  expect(container.querySelector('[role="alert"]')).toBeNull();
 });

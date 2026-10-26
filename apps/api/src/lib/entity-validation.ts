@@ -264,6 +264,7 @@ export function computeFreshness(input: {
   declaredRevision?: DeclaredCodeRevision | null;
 }): SubjectFreshness {
   const causes: SubjectFreshness['causes'] = [];
+  const critical = new Set<ReviewCause>();
   const nowIso = input.now ?? new Date().toISOString();
   // Dismissed permanently suppress; active snooze suppresses until snoozedUntil (P2-C).
   const suppressed = new Set(
@@ -272,6 +273,7 @@ export function computeFreshness(input: {
       .map((c) => c.cause),
   );
   const push = (code: ReviewCause, detail?: string) => {
+    if (isCriticalReviewCause(code)) critical.add(code);
     // code_assessment_stale is derived from declared baseId; a dismissed/snoozed sentinel must not
     // forever-suppress later B→C drift (revalidation clears open rows instead of dismissing).
     if (suppressed.has(code) && code !== 'human_flagged' && code !== 'code_assessment_stale') return;
@@ -376,9 +378,8 @@ export function computeFreshness(input: {
     return true;
   });
 
-  const criticalCauses = unique
-    .filter((c) => isCriticalReviewCause(c.code))
-    .map((c) => c.code);
+  // Reminder suppression never changes eligibility to work.
+  const criticalCauses = [...critical];
 
   return {
     subjectType: input.subjectType,
@@ -473,5 +474,5 @@ export type ReviewInboxItem = {
 };
 
 export function claimBlockedByFreshnessMessage(taskKey: string, critical: ReviewCause[]): string {
-  return `${taskKey} cannot be claimed — critical freshness causes: ${critical.join(', ')}. Mark validated (or resolve doc pins / supersession) before claiming.`;
+  return `${taskKey} cannot be claimed — critical freshness causes: ${critical.join(', ')}. Record current readiness evidence, resolve doc pins, or record an explicit readiness override before claiming.`;
 }

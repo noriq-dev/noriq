@@ -1,3 +1,5 @@
+import { recordOverride } from '../lib/entity-assessments';
+import { AssessmentInput, ReadinessOverrideInput } from '@noriq-dev/shared';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso, sha256Hex } from '../lib/util';
@@ -110,6 +112,7 @@ interface LiveLockRow {
 }
 
 export interface CreateTaskInput {
+  assessment?: AssessmentInput;
   title: string;
   body?: string;
   parentTaskId?: string | null;
@@ -892,6 +895,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // leaves whatever already committed. Tag minting below is a real write (and emits
       // `tag.created`), so validating after it would answer a bad spec with a freshly-minted tag
       // and no task. Nothing here writes until the batch, so this is the safe place.
+      if (input.assessment) { AssessmentInput.parse(input.assessment); if (input.assessment.purpose === 'document') throw new Error('Tasks require readiness or implementation assessments'); }
       const executionSpec = writeExecutionSpec(input.executionSpec);
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
@@ -1028,6 +1032,7 @@ export class ProjectRoom extends DurableObject<Env> {
           links: [{ taskId: id, taskTitle: input.title, planId: phasePlan.id, planTitle: phasePlan.title, phaseId }],
         });
       }
+      if (input.assessment) await storeRecordValidation(this.env.DB, projectId, actor, { subjectType: 'task', subjectId: id, assessment: input.assessment });
       this.reindexSearch('task', id);
       // Echo the spec BACK when one was set (RUN-136), normalised as stored: defaults filled in,
       // unknown keys dropped. Without it a caller cannot see what its spec became without a
@@ -1071,6 +1076,7 @@ export class ProjectRoom extends DurableObject<Env> {
             JSON.stringify(comparable(field, current[field])) !== JSON.stringify(comparable(field, value)));
         if (stale) throw new Error(`${task.key} changed since this action was proposed; review the current task and try again`);
       }
+      if (patch.status === 'review' || patch.status === 'done') await this.requireImplementationEvidence(projectId, taskId, undefined, patch);
       // A claimed task's status is not editable via MCP (PLNR-226): the claim protects
       // in-flight work, and an agent restatusing it — even to the "right" status — stomps the
       // holder's work loop. Agent actors only: `actor.kind === 'agent'` is exactly "via MCP"
@@ -1528,7 +1534,7 @@ export class ProjectRoom extends DurableObject<Env> {
     actor: Actor,
     taskId: string,
     agentId: string,
-    metadata: { workRole?: 'scope' | 'build' | 'verify'; executionId?: string | null } = {},
+    metadata: { workRole?: 'scope' | 'build' | 'verify'; executionId?: string | null; repositoryKey?: string; branch?: string; baseId?: string } = {},
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -1602,7 +1608,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // Renewals re-check too — content can drift while a claim is held and an agent
       // re-asserts; surface the same codes so the agent knows why.
       {
-        const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', task.id);
+        const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', task.id, { declaredRevision: metadata });
         if (freshness.criticalCauses.length) {
           throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses));
         }
@@ -1693,6 +1699,7 @@ export class ProjectRoom extends DurableObject<Env> {
         throw new Error(`${task.key} is held by another agent — you can't release a claim you don't own`);
       }
       const toStatus = opts.toStatus ?? 'todo';
+      if (toStatus === 'review' || toStatus === 'done') await this.requireImplementationEvidence(projectId, taskId, opts.commitId);
       if (!['todo', 'review', 'done', 'blocked'].includes(toStatus)) throw new Error(`invalid release status: ${toStatus}`);
       const liveClaim = await this.env.DB.prepare(
         `SELECT c.id, c.agent_id AS agentId, a.kind AS agentKind
@@ -3180,9 +3187,10 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
    *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
-  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean }) {
+  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean; assessment?: AssessmentInput }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (input.assessment) { AssessmentInput.parse(input.assessment); if (input.assessment.purpose !== 'document') throw new Error('Docs require document assessments'); }
       requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
       const id = newId('doc');
       const created = nowIso();
@@ -3193,6 +3201,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags, input.allowNewTags);
       const version = await this.appendDocVersion(id, actor);
       await this.emit(actor, 'doc.created', 'doc', id, { name: input.name, version });
+      if (input.assessment) await storeRecordValidation(this.env.DB, projectId, actor, { subjectType: 'doc', subjectId: id, assessment: input.assessment });
       this.reindexSearch('doc', id);
       return { id, name: input.name, version };
     });
@@ -5414,6 +5423,7 @@ export class ProjectRoom extends DurableObject<Env> {
            *  `taskDefaults`: a spec names the files, decisions and acceptance criteria of ONE
            *  piece of work, so a shared default would be wrong for every task that inherited it. */
           executionSpec?: ExecutionSpecInput | null;
+          assessment?: AssessmentInput;
         }>;
       }>;
     },
@@ -5467,6 +5477,7 @@ export class ProjectRoom extends DurableObject<Env> {
         if (!existing.length && !newTasks.length) throw new Error(`phase "${ph.title}" has no tasks`);
         const phaseDeps: string[][] = [];
         for (const nt of newTasks) {
+          if (nt.assessment) { AssessmentInput.parse(nt.assessment); if (nt.assessment.purpose === 'document') throw new Error('Tasks require readiness or implementation assessments'); }
           writeExecutionSpec(nt.executionSpec);
           // Same strict mint semantics as the real create: create_plan carries no allowNewTags.
           for (const n of nt.tags ?? d.tags ?? []) {
@@ -5498,13 +5509,14 @@ export class ProjectRoom extends DurableObject<Env> {
       const status = input.proposed ? 'proposed' : 'active';
       const planCreated = nowIso();
       await this.env.DB.prepare(
-        'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at, content_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at, content_activity_at, readiness_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)',
       ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, planCreated, planCreated).run();
   
       const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
       // PLNR-319: every task that lands in ANY phase of this plan, across the whole call —
       // ONE `plan.tasks_linked` event below carries all of them, not one event per phase or
       // per task (a plan created with forty tasks must not serialize forty coordination writes).
+      const initialAssessments: Array<{ id: string; assessment: AssessmentInput }> = [];
       const planLinks: Array<{ taskId: string; taskTitle: string; phaseId: string }> = [];
       for (let i = 0; i < input.phases.length; i++) {
         const ph = input.phases[i]!;
@@ -5534,6 +5546,7 @@ export class ProjectRoom extends DurableObject<Env> {
             dependsOn,
             executionSpec: nt.executionSpec,
           });
+          if (nt.assessment) initialAssessments.push({ id: created.id, assessment: nt.assessment });
           taskIds.push(created.id);
           planLinks.push({ taskId: created.id, taskTitle: nt.title, phaseId });
         }
@@ -5546,6 +5559,7 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       // Phase ordering gates directly off phase membership (PLNR-163) — no dependency
       // edges are minted; the claim/claimable/dispatch predicates read the phase graph.
+      for (const item of initialAssessments) await storeRecordValidation(this.env.DB, projectId, actor, { subjectType: 'task', subjectId: item.id, assessment: item.assessment });
       await this.emit(actor, 'plan.created', 'plan', planId, {
         title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
@@ -5831,7 +5845,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   /** Plans evolve — agents append status updates, correct course, mark outcomes. */
-  async updatePlan(projectId: string, actor: Actor, planId: string, patch: { title?: string; description?: string; body?: string })  {
+  async updatePlan(projectId: string, actor: Actor, planId: string, patch: { title?: string; description?: string; body?: string; requireTaskEvidence?: true })  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const plan = await this.env.DB.prepare('SELECT id, title, body FROM plans WHERE id = ? AND project_id = ?')
@@ -5842,6 +5856,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.title !== undefined) { sets.push('title = ?'); binds.push(patch.title); }
       if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
       if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
+      if (patch.requireTaskEvidence === true) { sets.push('readiness_required = 1'); }
       if (!sets.length) return { ok: true };
       // Plan fingerprint includes body (not title/description) — advance dormancy clock only
       // when the body value actually changes (idempotent resubmit must not postpone dormant).
@@ -5893,6 +5908,36 @@ export class ProjectRoom extends DurableObject<Env> {
   // Entity validation / supersession / review inbox (PLNR-576..580)
   // ---------------------------------------------------------------------------
 
+  async recordReadinessOverride(projectId: string, actor: Actor, raw: ReadinessOverrideInput) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const input = ReadinessOverrideInput.parse(raw);
+      const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', input.subjectId);
+      const result = await recordOverride(this.env.DB, projectId, actor, freshness.assessment!, input);
+      await this.emit(actor, 'task.updated', 'task', input.subjectId, { fields: ['readinessOverride'], overrideId: result.id, reason: input.reason });
+      return result;
+    });
+  }
+
+  private async requireImplementationEvidence(projectId: string, taskId: string, commitId?: string, patch?: TaskPatch) {
+    const f = await storeSubjectFreshness(this.env.DB, projectId, 'task', taskId);
+    const state = f.assessment!;
+    if (!state.required && state.implementation.record?.outcome !== 'failed') return;
+    if (patch) {
+      const current = await this.env.DB.prepare('SELECT body, execution_spec AS spec FROM tasks WHERE id = ?').bind(taskId).first<{body:string;spec:string|null}>();
+      const nextFingerprint = await taskContentFingerprint(patch.body ?? current!.body,
+        patch.executionSpec === undefined ? current!.spec : writeExecutionSpec(patch.executionSpec));
+      if (nextFingerprint !== f.contentFingerprint || patch.docIds !== undefined || patch.addDocIds !== undefined || patch.removeDocIds !== undefined) {
+        throw new Error('Update task intent and doc links first, then record evidence against the resulting context before completion');
+      }
+    }
+    if (state.overrides?.some(o => o.scope === 'implementation' && (!commitId || o.revision?.baseId === commitId))) return;
+    if (state.implementation.state !== 'passed') throw new Error(`Implementation evidence is ${state.implementation.state}; record an implementation assessment or an explicit implementation override before completion`);
+    if (commitId && state.implementation.record?.scope === 'repository' && state.implementation.record.baseId !== commitId) {
+      throw new Error('Implementation evidence does not match the released commitId');
+    }
+  }
+
   async recordValidation(
     projectId: string,
     actor: Actor,
@@ -5901,11 +5946,14 @@ export class ProjectRoom extends DurableObject<Env> {
       subjectId: string;
       note?: string;
       baselines?: ValidationBaselines | null;
+      assessment?: AssessmentInput;
     },
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      return storeRecordValidation(this.env.DB, projectId, actor, input);
+      const result = await storeRecordValidation(this.env.DB, projectId, actor, input);
+      await this.emit(actor, `${input.subjectType}.updated` as EventVerb, input.subjectType, input.subjectId, { fields: ['assessment'], purpose: input.assessment?.purpose ?? 'legacy_attestation' });
+      return result;
     });
   }
 

@@ -1,3 +1,5 @@
+import { AssessmentInput, isReviewCauseSuppressed } from '@noriq-dev/shared';
+import { assessmentState, recordAssessment, activeOverrides } from './entity-assessments';
 import type {
   DormancyConfig,
   ReviewCause,
@@ -444,7 +446,7 @@ export async function subjectFreshness(
     resolveDormancyConfig(db, projectId, subjectType, subjectId),
     loadContentActivity(db, projectId, subjectType, subjectId),
   ]);
-  return computeFreshness({
+  const freshness = computeFreshness({
     subjectType,
     subjectId,
     contentFingerprint: fingerprint,
@@ -459,6 +461,25 @@ export async function subjectFreshness(
     now: opts?.now ?? null,
     declaredRevision: opts?.declaredRevision ?? null,
   });
+  return attachAssessmentFreshness(db, projectId, subjectType, subjectId, fingerprint, freshness, storedCauses, opts);
+}
+
+async function attachAssessmentFreshness(db: D1Database, projectId: string, subjectType: ValidationSubjectType,
+  subjectId: string, fingerprint: string, freshness: SubjectFreshness, storedCauses: StoredCauseRow[], opts?: SubjectFreshnessOptions) {
+  freshness.assessment = await assessmentState(db, projectId, subjectType, subjectId, fingerprint, opts?.declaredRevision);
+  if (subjectType === 'task') {
+    const state = freshness.assessment;
+    const code = state.required && state.readiness.state !== 'passed' ? 'readiness_required'
+      : state.readiness.record?.outcome === 'failed' ? 'assessment_failed' : null;
+    if (code) {
+      if (!storedCauses.some(c => c.cause === code && isReviewCauseSuppressed(c.status, c.snoozedUntil))) freshness.causes.push({ code, severity: 'critical', detail: `Task readiness is ${state.readiness.state}; record current evidence before work` });
+      freshness.criticalCauses.push(code);
+    }
+    freshness.blockingCauses = [...freshness.criticalCauses];
+    state.overrides = await activeOverrides(db, projectId, subjectId, state, opts?.declaredRevision);
+    if (state.overrides.some(o => o.scope === 'readiness')) freshness.criticalCauses = [];
+  }
+  return freshness;
 }
 
 export async function recordValidation(
@@ -470,16 +491,32 @@ export async function recordValidation(
     subjectId: string;
     note?: string;
     baselines?: ValidationBaselines | null;
+    assessment?: AssessmentInput;
   },
 ) {
+  if (input.assessment) AssessmentInput.parse(input.assessment);
   // Resolve subject existence + fingerprint
   const fingerprint = await currentFingerprint(db, projectId, input.subjectType, input.subjectId);
   const id = newId('val');
   const validatedAt = nowIso();
-  const baselinesJson = serializeBaselines(input.baselines);
+  // Omitted baselines preserve prior evidence; explicit arrays may replace it.
+  const prior = await latestValidations(db, projectId, input.subjectType, input.subjectId);
+  const baselinesJson = serializeBaselines(input.baselines ?? (prior.latestAny ? parseBaselines(prior.latestAny.baselinesJson) : null));
+  const assessment = input.assessment
+    ? await recordAssessment(db, projectId, actor, input.subjectType, input.subjectId, fingerprint, input.assessment)
+    : null;
+  // Failed/inconclusive checks and completion evidence must not renew readiness.
+  if (assessment && (assessment.outcome !== 'passed' || assessment.purpose === 'implementation')) return { assessment };
+
 
   // Auto-capture current doc pins into baselines when caller omitted them
   let baselines = parseBaselines(baselinesJson);
+  if (assessment?.scope === 'repository') {
+    baselines.codeAssessments = [...baselines.codeAssessments.filter(a =>
+      a.repositoryKey !== assessment.repositoryKey || a.branch !== assessment.branch), {
+      repositoryKey: assessment.repositoryKey!, branch: assessment.branch!, baseId: assessment.baseId!, summary: assessment.summary.slice(0, 2000),
+    }];
+  }
   if (!input.baselines?.docPins?.length) {
     const pins = await loadDocPins(db, input.subjectType, input.subjectId);
     baselines = {
@@ -516,7 +553,7 @@ export async function recordValidation(
     ).bind(projectId, input.subjectType, input.subjectId),
   ]);
 
-  return wireValidation({
+  return { assessment, ...wireValidation({
     id,
     projectId,
     subjectType: input.subjectType,
@@ -528,7 +565,7 @@ export async function recordValidation(
     actorName: actor.name,
     baselinesJson: serializeBaselines(baselines),
     note: input.note ?? '',
-  });
+  }) };
 }
 
 export async function listValidations(
@@ -802,6 +839,8 @@ export async function reviewInbox(
              WHERE td.task_id = t.id AND td.pinned_version IS NOT NULL
                AND d.current_version IS NOT NULL AND td.pinned_version != d.current_version
           )
+          OR EXISTS (SELECT 1 FROM entity_assessments a WHERE a.subject_id = t.id AND a.subject_type = 'task')
+          OR EXISTS (SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id WHERE pt.task_id = t.id AND p.readiness_required = 1 AND p.status != 'rejected')
           OR ${dormancyCandidateSql('t')}
           ${neverValidatedCandidate('t', 'task')}
         )`,
@@ -848,6 +887,10 @@ export async function reviewInbox(
         )`,
   ).bind(projectId, clockIso, projectQuiet, projectQuiet).all<InboxCandidate>();
 
+  const evidenceSubjects = await db.prepare(`SELECT subject_type AS type, subject_id AS id FROM entity_assessments WHERE project_id = ?
+    UNION SELECT 'task', pt.task_id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id
+      WHERE p.project_id = ? AND p.readiness_required = 1 AND p.status != 'rejected'`).bind(projectId, projectId).all<{type:string;id:string}>();
+  const evidenceIds = new Set(evidenceSubjects.results.map(s => `${s.type}:${s.id}`));
   const candidates = [
     ...(taskCandidates.results ?? []),
     ...(planCandidates.results ?? []),
@@ -919,7 +962,7 @@ export async function reviewInbox(
           : (docCauses.get(c.id) ?? []);
     const quietSeconds = parseDormancyQuietSeconds(c.overrideQuiet) ?? projectQuiet;
 
-    const freshness = computeFreshness({
+    let freshness = computeFreshness({
       subjectType: c.subjectType,
       subjectId: c.id,
       contentFingerprint: fingerprint,
@@ -933,6 +976,8 @@ export async function reviewInbox(
       createdAt: c.createdAt,
       now: clockIso,
     });
+
+    if (evidenceIds.has(`${c.subjectType}:${c.id}`)) freshness = await attachAssessmentFreshness(db, projectId, c.subjectType, c.id, fingerprint, freshness, storedCauses, { now: clockIso });
 
     // Inbox excludes pure never_validated+impact_unknown with no other signal — those flood.
     // Keep subjects that have content_changed, doc_baseline_moved, superseded, human_flagged,

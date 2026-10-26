@@ -38,6 +38,8 @@ description: >-
 
 # Working with Noriq
 
+Human approval accepts plan direction, not task readiness. Attach assessment evidence when creating tasks/docs or call record_validation with assessment: purpose readiness before work, implementation at completion, document for doc claims. Include outcome, scoped summary, evidence references/results and repositoryKey/branch/baseId for repository work. Non-code assessments explain their scope. Old validation records are attestations, not verified evidence. Later phases need new task assessments after earlier work. Snooze/dismiss only hide reminders; they do not override claim blockers. New plans require task evidence; existing plans keep legacy rollout policy until update_plan {requireTaskEvidence:true} enables the new gates. Before a later phase starts, recheck every task after its predecessors settle. Use record_readiness_override for an explicit exception with scope, reason and expiry (max one day); it cannot approve a plan or bypass unfinished dependencies. Completion of evidence-required tasks needs a current implementation assessment, separate from readiness.
+
 Noriq is the shared coordination layer between you, other agents, and human supervisors.
 Its MCP server is self-teaching: **call \`get_briefing\` first** — it returns the playbook
 plus your live state (held tasks, unresolved comments, what's claimable). For the full
@@ -117,8 +119,8 @@ govern each call.
    Identify the task by either its opaque \`task_…\` id or its \`PLN-##\` display key (both
    resolve), and pass \`projectId\` on every call. The response includes any open comments —
    read them first. Critical freshness causes (\`content_changed\`, \`doc_baseline_moved\`)
-   hard-block the claim; optionally pass \`repositoryKey\`/\`branch\`/\`baseId\` so the claim
-   response can include advisory \`code_assessment_stale\` without blocking.
+   hard-block the claim even when reminders are snoozed or dismissed; optionally pass \`repositoryKey\`/\`branch\`/\`baseId\` so the claim
+   evaluates readiness against that revision; stale evidence blocks evidence-required tasks.
    Then call \`get_task_context\` before non-trivial work so the task, settled docs, relevant
    memory, prior episodes, graph neighborhood, and uncertainty arrive as one bounded pack. Pass
    the canonical \`repositoryKey\`, current \`branch\`, and current opaque \`baseId\` when known;

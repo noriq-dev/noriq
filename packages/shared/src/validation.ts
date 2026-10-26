@@ -1,3 +1,4 @@
+import type { AssessmentState } from './assessment';
 import { z } from 'zod';
 
 /** Subject kinds that carry entity-level validation records (P0 decay/validation). */
@@ -9,6 +10,8 @@ export type ValidationSubjectType = z.infer<typeof ValidationSubjectType>;
  * Critical causes hard-block claim; advisory causes surface in context only.
  */
 export const ReviewCause = z.enum([
+  'readiness_required',
+  'assessment_failed',
   'never_validated',
   'content_changed',
   'doc_baseline_moved',
@@ -21,6 +24,7 @@ export const ReviewCause = z.enum([
 export type ReviewCause = z.infer<typeof ReviewCause>;
 
 export const CRITICAL_REVIEW_CAUSES: ReadonlySet<ReviewCause> = new Set([
+  'readiness_required', 'assessment_failed',
   'content_changed',
   'doc_baseline_moved',
 ]);
@@ -189,9 +193,12 @@ export const SubjectFreshness = z.object({
   lastValidatedAt: z.string().datetime().nullable(),
   matchingValidationId: z.string().nullable(),
   causes: z.array(FreshnessCause),
+  /** Eligibility blockers, independent of reminder snooze/dismissal. */
   criticalCauses: z.array(ReviewCause),
+  blockingCauses: z.array(ReviewCause).optional(),
   impactUnknown: z.boolean(),
   baselines: ValidationBaselines.nullable(),
+  assessment: z.custom<AssessmentState>().optional(),
   docPins: z.array(DocVersionPin.extend({
     currentVersion: z.number().int().positive().nullable(),
     drifted: z.boolean(),

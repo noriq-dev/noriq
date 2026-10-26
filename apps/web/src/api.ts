@@ -1,3 +1,4 @@
+import type { AssessmentInput, AssessmentState } from '@noriq-dev/shared';
 // Thin REST client. Session cookie rides along automatically (same origin).
 
 export class ApiError extends Error {
@@ -598,6 +599,7 @@ export const api = {
    *  callers use a failed promise here to distinguish "the memory store is down" from "it answered
    *  with zero results." */
   memoryHealth: (pid: string) => req<ApiMemoryHealth>('GET', `/api/projects/${pid}/memory/health`),
+  projectHealth: (pid: string, offset = 0) => req<ApiProjectHealth>('GET', `/api/projects/${pid}/health-summary?offset=${offset}`),
   projectIntelligence: (pid: string, input: ApiProjectIntelligenceInput) =>
     req<ApiProjectIntelligence>('POST', `/api/projects/${pid}/memory/intelligence`, input),
   memoryRepositories: (pid: string) => req<{ repositories: ApiMemoryRepository[] }>('GET', `/api/projects/${pid}/memory/repositories`),
@@ -661,8 +663,12 @@ export const api = {
     const query = params.size ? `?${params}` : '';
     return req<ApiEntityReviewInbox>('GET', `/api/projects/${pid}/review-inbox${query}`);
   },
-  recordValidation: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; note?: string }) =>
-    req<ApiValidationRecord>('POST', `/api/projects/${pid}/validations`, body),
+  recordReadinessOverride: (pid: string, body: import('@noriq-dev/shared').ReadinessOverrideInput) =>
+    req<import('@noriq-dev/shared').ReadinessOverrideRecord>('POST', `/api/projects/${pid}/readiness-overrides`, body),
+  recordValidation: (pid: string, body: { subjectType: ApiValidationSubjectType; subjectId: string; note?: string; assessment?: AssessmentInput }) =>
+    req<ApiValidationRecord | { assessment: import('@noriq-dev/shared').AssessmentRecord }>('POST', `/api/projects/${pid}/validations`, body),
+  assessmentHistory: (pid: string, subjectType: ApiValidationSubjectType, subjectId: string) =>
+    req<{ assessments: import('@noriq-dev/shared').AssessmentRecord[]; overrides: import('@noriq-dev/shared').ReadinessOverrideRecord[]; limit: number }>('GET', `/api/projects/${pid}/validations/${subjectType}/${encodeURIComponent(subjectId)}`),
   subjectFreshness: (pid: string, subjectType: ApiValidationSubjectType, subjectId: string) =>
     req<ApiSubjectFreshness>('GET', `/api/projects/${pid}/freshness/${subjectType}/${encodeURIComponent(subjectId)}`),
   setReviewCause: (pid: string, body: {
@@ -1882,6 +1888,8 @@ export interface ApiMemoryReviewQueueItem {
 }
 
 export type ApiReviewCause =
+  | 'readiness_required'
+  | 'assessment_failed'
   | 'never_validated'
   | 'content_changed'
   | 'doc_baseline_moved'
@@ -1899,6 +1907,7 @@ export interface ApiFreshnessCause {
 }
 
 export interface ApiSubjectFreshness {
+  assessment?: AssessmentState;
   subjectType: ApiValidationSubjectType;
   subjectId: string;
   contentFingerprint: string;
@@ -1906,6 +1915,7 @@ export interface ApiSubjectFreshness {
   matchingValidationId: string | null;
   causes: ApiFreshnessCause[];
   criticalCauses: ApiReviewCause[];
+  blockingCauses?: ApiReviewCause[];
   impactUnknown: boolean;
   baselines: { docPins: Array<{ docId: string; version: number }>; codeAssessments: unknown[] } | null;
   docPins: Array<{
@@ -2437,4 +2447,16 @@ export interface ApiGraphEntityPage {
   nextCursor: string | null;
   total: number;
   byType: Record<string, number>;
+}
+
+export interface ApiProjectHealth {
+  observedAt: string; totalOpenTasks: number; activeClaims: number; activeLocks: number;
+  offset: number; nextOffset: number | null; pageSize: number;
+  items: Array<{ id: string; key: string; title: string; status: string; priority: number;
+    readiness: string; implementation: string; evidenceRequired: boolean; checkedAt: string | null; checkedRevision: string | null;
+    claimability: { claimable: boolean; reason: string; reasonCode: string };
+    causes: ApiFreshnessCause[]; blockingCauses: ApiReviewCause[];
+    overrides: import('@noriq-dev/shared').ReadinessOverrideRecord[];
+    phases: Array<{ planId: string; planTitle: string; id: string; title: string; phaseNumber: number; planStatus: string; evidenceRequired: number }>;
+  }>;
 }

@@ -6,7 +6,7 @@
 // distinction — everything else here is supporting plumbing (typing into filters, opening a row).
 //
 // PLNR-287 restructured the view so the star map (not Explore) is what a human lands on; the
-// three behaviours above now live one tab-click into Explore — `switchTab('Explore')` is the new
+// three behaviours above now live one tab-click into Explore — `switchTab('Search')` is the new
 // step every one of those tests takes before doing what it always did. The new describe blocks at
 // the bottom cover what PLNR-287 itself is accountable for: the map is the landing surface, every
 // Phase 8 surface (Explore/Graph/Operations) stays exactly one click away, and a star's own
@@ -73,7 +73,7 @@ const queryInput = () => container.querySelector('input[placeholder^="search mem
 
 /** The sub-tab strip (Map/Explore/Graph/Operations) — clicking is the "one extra interaction"
  *  every Phase 8 surface is now reachable through from the map landing surface. */
-const switchTab = (label: 'Map' | 'Review' | 'Explore' | 'Graph' | 'Operations') => {
+const switchTab = (label: 'Map' | 'Review' | 'Search' | 'Graph' | 'Operations') => {
   const btn = [...container.querySelectorAll('button')].find((b) => b.textContent?.startsWith(label));
   if (!btn) throw new Error(`no "${label}" tab button found`);
   act(() => { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
@@ -103,7 +103,7 @@ describe('the memory view lands on the map (PLNR-287)', () => {
       revision: { contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now' },
       communities: [], routes: [], coverage: { complete: true, reasons: [] },
     });
-    mount(); await tick();
+    mount(); switchTab('Map'); await tick();
     expect(text()).toContain('No memory systems yet');
     expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'use 2D map')).toBe(true);
   });
@@ -113,29 +113,19 @@ describe('the memory view lands on the map (PLNR-287)', () => {
     vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memoryConstellationV2Overview').mockRejectedValue(new Error('HTTP 404'));
-    mount(); await tick(); await tick();
+    mount(); switchTab('Map'); await tick(); await tick();
     expect(text()).toContain('Using the compatible 2D map');
     expect(text()).toContain('Nothing has been recorded yet');
     expect(localStorage.getItem('noriq.memory.mapMode')).toBeNull();
   });
 
-  it('shows the map, search-focused, with Explore/Graph/Operations each one tab away', async () => {
-    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
-    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
-
-    mount();
-    await tick();
-
-    // The map's own search bar, not Explore's — same placeholder prefix, different copy after
-    // the em dash (asserted exactly so this doesn't silently pass if Explore were still default).
-    expect(queryInput().placeholder).toContain('ignites matching stars');
-    expect(document.activeElement).toBe(queryInput()); // "search focused" — no click needed
-    expect(text()).toContain('Nothing has been recorded yet'); // the honest empty-graph state
-
-    // Every Phase 8 surface is reachable — the tab strip itself proves "at most one interaction".
-    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Explore')).toBe(true);
-    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Graph')).toBe(true);
-    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Operations')).toBe(true);
+  it('lands on searchable knowledge and hides operations from readers', async () => {
+    vi.spyOn(api, 'memoryHealth').mockResolvedValue({ projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false });
+    vi.spyOn(api, 'memoryEntities').mockResolvedValue({ memoryRevision: 1, sort: 'newest', items: [], nextCursor: null, total: 0, byType: {} });
+    mount(fakeStore(false)); await tick();
+    expect(queryInput().placeholder).toContain('how do we handle X');
+    expect([...container.querySelectorAll('button')].some(b => b.textContent === 'Map')).toBe(true);
+    expect([...container.querySelectorAll('button')].some(b => b.textContent === 'Operations')).toBe(false);
   });
 
   it('Explore remains a deliberately reachable textual mode, not only a failure fallback', async () => {
@@ -148,7 +138,7 @@ describe('the memory view lands on the map (PLNR-287)', () => {
 
     mount();
     await tick();
-    switchTab('Explore');
+    switchTab('Search');
     await tick(); // Explore's own health probe
 
     expect(queryInput().placeholder).toContain('how do we handle X'); // Explore's own copy, not the map's
@@ -223,7 +213,7 @@ describe('PLNR-339 ordered catalogue', () => {
 
     mount();
     await tick();
-    switchTab('Explore');
+    switchTab('Search');
     await tick();
 
     expect(browse).toHaveBeenCalledWith('prj_1', expect.objectContaining({ type: 'memory', sort: 'newest', limit: 50 }), expect.anything());
@@ -259,6 +249,7 @@ describe('a selected star hands off by URI, through the existing onOpenInspector
     vi.spyOn(api, 'memoryHistory').mockResolvedValue({ versions: [], transitions: [], contradictions: [], feedback: [] });
 
     mount();
+    switchTab('Map');
     await tick(); // map's constellation + repositories fetch
 
     // Reach the star via the accessible list (DOM/keyboard path, per the locked "canvas is never
@@ -290,6 +281,7 @@ describe('a selected star hands off by URI, through the existing onOpenInspector
     });
 
     mount();
+    switchTab('Map');
     await tick();
 
     const listBtn = [...container.querySelectorAll('button')].find((b) => b.textContent === 'accessible list');
@@ -323,6 +315,7 @@ describe('a selected star hands off by URI, through the existing onOpenInspector
     });
 
     mount();
+    switchTab('Map');
     await tick();
     act(() => setInputValue(queryInput(), 'off map'));
     await tick(300);
@@ -346,7 +339,7 @@ describe('an unreachable memory store', () => {
 
     mount();
     await tick();
-    switchTab('Explore');
+    switchTab('Search');
     await tick();
 
     expect(text()).toContain('Project memory is unreachable');
@@ -381,7 +374,7 @@ describe('lead vs. approved decision', () => {
 
     mount();
     await tick();
-    switchTab('Explore');
+    switchTab('Search');
     await tick(); // health + repositories
 
     act(() => setInputValue(queryInput(), 'payment retries'));
@@ -434,7 +427,7 @@ describe('a correction', () => {
 
     mount();
     await tick();
-    switchTab('Explore');
+    switchTab('Search');
     await tick(); // health + repositories
 
     act(() => setInputValue(queryInput(), 'old statement'));

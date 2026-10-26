@@ -17,6 +17,8 @@ description: >-
 
 # Authoring Noriq docs
 
+Human approval accepts plan direction, not task readiness. Attach assessment evidence when creating tasks/docs or call record_validation with assessment: purpose readiness before work, implementation at completion, document for doc claims. Include outcome, scoped summary, evidence references/results and repositoryKey/branch/baseId for repository work. Non-code assessments explain their scope. Old validation records are attestations, not verified evidence. Later phases need new task assessments after earlier work. Snooze/dismiss only hide reminders; they do not override claim blockers. New plans require task evidence; existing plans keep legacy rollout policy. Before a later phase starts, recheck every task after its predecessors settle. Use record_readiness_override for an explicit exception with scope, reason and expiry (max one day); it cannot approve a plan or bypass unfinished dependencies. Completion of evidence-required tasks needs a current implementation assessment, separate from readiness.
+
 A doc is the project's settled knowledge base AND part of the corpus \`semantic_search\`
 retrieves. Tasks finish, plans close, and comments scroll away. Repository indexing may expose
 code and cited source through Project Memory, but it does not turn an arbitrary repo document

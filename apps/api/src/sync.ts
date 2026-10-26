@@ -1,3 +1,4 @@
+import { filterFreshTasks } from './lib/readiness-queue';
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
 import { TASK_NOT_IN_PROPOSED_PLAN, TASK_NOT_PHASE_BLOCKED, TASK_NOT_PROPOSED_SPINOFF, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
@@ -114,7 +115,7 @@ export async function computeUpdates(
   // Dependency-unblocked, unclaimed tasks in the agent's project (user-wide if it has
   // none yet). Computed up front so the "new task available" notice (PLNR-90) can
   // confirm a freshly-created task is actually claimable now (not dependency-gated).
-  const claimable = (
+  const claimable = await filterFreshTasks(env.DB, (
     await env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
@@ -131,7 +132,7 @@ export async function computeUpdates(
        -- ASC is most-urgent-first: priority 0 is P0 (PLNR-231), not the bottom of the scale.
        ORDER BY t.priority ASC, t."order" LIMIT 20`,
     ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['claimable'][number]>()
-  ).results;
+  ).results);
 
   // Nudge eligibility for freshly-created tasks (PLNR-90) is checked against the REAL
   // claimability predicate, not the top-20 display list above — a new task that 20
@@ -155,7 +156,11 @@ export async function computeUpdates(
          AND ${TASK_NOT_PROPOSED_SPINOFF}
          AND ${TASK_NOT_PHASE_BLOCKED}`,
     ).bind(agent.userId, agentProjectId, tokenId, ...newTaskIds).all<{ id: string }>();
-    for (const r of results) nudgeableIds.add(r.id);
+    const ids = results.map(r => r.id);
+    if (ids.length) {
+      const facts = await env.DB.prepare('SELECT id, project_id AS projectId FROM tasks WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(ids)).all<{id:string; projectId:string}>();
+      for (const r of await filterFreshTasks(env.DB, facts.results)) nudgeableIds.add(r.id);
+    }
   }
 
   // Projects the agent's USER can reach — scopes broadcast messages/notices so an

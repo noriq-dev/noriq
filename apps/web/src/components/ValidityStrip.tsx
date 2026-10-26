@@ -1,3 +1,6 @@
+import { AssessmentHistory } from './AssessmentHistory';
+import { ReadinessOverrideForm } from './ReadinessOverrideForm';
+import { AssessmentForm } from './AssessmentForm';
 // Compact Validity strip for subject inspectors (P2-B).
 // Same REST actions as Review → Validity — not a second inbox.
 import { useCallback, useEffect, useState } from 'react';
@@ -15,6 +18,8 @@ import { Button } from './ui';
 import { openReviewValidityTab } from './ReviewInboxChrome';
 
 export const VALIDITY_CAUSES: Array<{ id: ApiReviewCause; label: string; detail: string; color: string }> = [
+  { id: 'readiness_required', label: 'Readiness evidence required', detail: 'Recheck this task against its current phase and repository context', color: 'var(--red-soft)' },
+  { id: 'assessment_failed', label: 'Readiness check failed', detail: 'Resolve the failed assessment or record an explicit exception', color: 'var(--red-soft)' },
   { id: 'content_changed', label: 'Content changed', detail: 'Fingerprint moved past last validation', color: 'var(--red-soft)' },
   { id: 'doc_baseline_moved', label: 'Doc pin drifted', detail: 'Linked settled doc advanced past pin', color: 'var(--red-soft)' },
   { id: 'superseded', label: 'Superseded', detail: 'Replaced by another entity', color: 'var(--amber)' },
@@ -60,6 +65,9 @@ export function ValidityStrip({
   const [loading, setLoading] = useState(!initialFreshness);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [assessing, setAssessing] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [overriding, setOverriding] = useState(false);
   const [superseding, setSuperseding] = useState(false);
   const [snoozing, setSnoozing] = useState(false);
   const [replacementId, setReplacementId] = useState('');
@@ -95,19 +103,6 @@ export function ValidityStrip({
     }).catch(() => { if (!cancelled) setDocs([]); });
     return () => { cancelled = true; };
   }, [projectId, subjectId, subjectType, superseding]);
-
-  const markValidated = async () => {
-    setBusy(true);
-    setError('');
-    try {
-      await api.recordValidation(projectId, { subjectType, subjectId });
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const flag = async () => {
     setBusy(true);
@@ -167,7 +162,7 @@ export function ValidityStrip({
     }
   };
 
-  const causes = freshness?.causes.map((c) => c.code) ?? [];
+  const causes = [...new Set([...(freshness?.causes.map((c) => c.code) ?? []), ...(freshness?.blockingCauses ?? freshness?.criticalCauses ?? [])])];
   const critical = new Set(freshness?.criticalCauses ?? []);
   const lastValidatedAt = freshness?.lastValidatedAt ?? null;
   // Prefer critical, else first non-never/impact cause, else first cause — for snooze target.
@@ -201,8 +196,8 @@ export function ValidityStrip({
         {loading && (
           <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>loading…</span>
         )}
-        {!loading && causes.length === 0 && (
-          <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8.5}>CURRENT</MonoTag>
+        {!loading && causes.length === 0 && freshness?.assessment?.readiness.state === 'passed' && (
+          <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8.5}>EVIDENCE CURRENT</MonoTag>
         )}
         {!loading && causes.map((code) => {
           const meta = causeMeta(code);
@@ -225,20 +220,40 @@ export function ValidityStrip({
         </span>
       </div>
 
+      {!loading && <div style={{ fontSize: 12, marginBottom: 8 }}>
+        <div>{subjectType === 'task' ? 'Readiness' : 'Document evidence'}: {freshness?.assessment?.readiness.state ?? 'missing'}
+          {lastValidatedAt && !freshness?.assessment?.readiness.record ? ' — legacy attestation only' : ''}</div>
+        {subjectType === 'task' && <div>Implementation: {freshness?.assessment?.implementation.state ?? 'missing'}</div>}
+        {[freshness?.assessment?.readiness.record, freshness?.assessment?.implementation.record].filter(Boolean).map(record => <details key={record!.id}>
+          <summary>{record!.purpose} · {record!.actorName} · {new Date(record!.createdAt).toLocaleString()} · actor reported</summary>
+          <p>{record!.summary}</p><p>{record!.repositoryKey} {record!.branch} {record!.baseId}</p>
+          <ul>{record!.evidence.map((item, i) => <li key={i}>{item.kind}: {item.reference} — {item.result}</li>)}</ul>
+        </details>)}
+      </div>}
+      {freshness?.assessment?.overrides?.map(o => <div key={o.id} role="status" style={{ fontSize: 12, marginBottom: 8 }}>
+        {o.scope} exception by {o.actorName} until {new Date(o.expiresAt).toLocaleString()}: {o.reason}
+      </div>)}
+      {overriding && <ReadinessOverrideForm projectId={projectId} subjectId={subjectId} onCancel={() => setOverriding(false)}
+        onSaved={async () => { setOverriding(false); await load(); }} />}
+          <Button variant="ghost" onClick={() => setHistoryOpen(v => !v)}>Evidence history</Button>
+      {historyOpen && <AssessmentHistory projectId={projectId} subjectType={subjectType} subjectId={subjectId} />}
+      {assessing && <AssessmentForm projectId={projectId} subjectType={subjectType} subjectId={subjectId}
+        onCancel={() => setAssessing(false)} onSaved={async () => { setAssessing(false); await load(); }} />}
       {error && (
         <div style={{ color: 'var(--red-soft)', fontSize: 11.5, marginBottom: 8 }}>{error}</div>
       )}
 
-      {canAct && !superseding && !snoozing && (
+      {canAct && !overriding && !assessing && !superseding && !snoozing && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Button
             variant="primary"
             style={{ padding: '4px 10px', fontSize: 11 }}
-            onClick={() => void markValidated()}
+            onClick={() => setAssessing(true)}
             disabled={busy || loading}
           >
-            Validate
+            Record evidence
           </Button>
+          {subjectType === 'task' && <Button variant="ghost" disabled={busy || loading} onClick={() => setOverriding(true)}>Explicit override…</Button>}
           <Button
             variant="ghost"
             style={{ padding: '4px 10px', fontSize: 11 }}
@@ -253,7 +268,7 @@ export function ValidityStrip({
             style={{ padding: '4px 10px', fontSize: 11 }}
             onClick={() => setSnoozing(true)}
             disabled={busy || loading || !snoozeTarget}
-            title="Timed snooze — omit cause from freshness until expiry; does not invent validity"
+            title="Defer the reminder; claim blockers remain in effect"
           >
             Snooze…
           </Button>
@@ -280,7 +295,7 @@ export function ValidityStrip({
       {canAct && snoozing && snoozeTarget && (
         <div style={{ display: 'grid', gap: 8 }}>
           <div style={{ color: 'var(--text-dim)', fontSize: 11.5, lineHeight: 1.45 }}>
-            Snooze {causeMeta(snoozeTarget)?.label ?? snoozeTarget} — omitted until expiry; resurfaces without a new validation.
+            Snooze {causeMeta(snoozeTarget)?.label ?? snoozeTarget} — reminder deferred until expiry; claim blockers remain in effect.
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {SNOOZE_PRESETS.map((preset) => (

@@ -1,6 +1,20 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall as rawMcpCall, authorizeForAllProjects } from './helpers';
+
+// These scenarios isolate plan ordering/archival. Supply current fixture evidence before
+// lifecycle mutations; entity-assessments.test.ts separately proves missing/stale gates.
+const mcpCall: typeof rawMcpCall = async (key, name, args = {}) => {
+  const purpose = name === 'claim_task' ? 'readiness'
+    : (name === 'release_task' && ['done', 'review'].includes(String(args.toStatus))) ||
+      (name === 'update_task' && ['done', 'review'].includes(String(args.status))) ? 'implementation' : null;
+  if (purpose && args.projectId && args.taskId) await rawMcpCall(key, 'record_validation', {
+    projectId: args.projectId, subjectType: 'task', subjectId: args.taskId,
+    assessment: { purpose, outcome: 'passed', scope: 'non_code', summary: 'Plan lifecycle fixture is prepared for this ordering assertion.',
+      evidence: [{ kind: 'inspection', reference: 'test/plans.test.ts', result: 'Synthetic scenario state checked immediately before the mutation.' }] },
+  });
+  return rawMcpCall(key, name, args);
+};
 
 // NOTE: runs in the same shared-storage suite as coordination.test.ts;
 // setup endpoints are exercised first while no users beyond ours may exist.

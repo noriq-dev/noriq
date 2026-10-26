@@ -85,8 +85,9 @@ export async function resetDemo(env: Env): Promise<void> {
       ] },
     ],
   });
-  // Finish phase 1 so phase 2 is claimable and the progress rails show movement.
+  // Simulated historical completion, explicitly excepted rather than invented test evidence.
   for (const tid of plan.phases[0]!.taskIds) {
+    await r.recordReadinessOverride(DEMO_PROJECT_ID, sys, { subjectId: tid, scope: 'implementation', durationSeconds: 60, reason: 'Demo seed: simulated historical completion for the showcase, not verified implementation.' });
     await r.updateTask(DEMO_PROJECT_ID, sys, tid, { status: 'done' });
   }
 

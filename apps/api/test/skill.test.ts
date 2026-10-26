@@ -78,7 +78,7 @@ describe('skill core (PLNR-310)', () => {
 
   it('keeps every skill frontmatter minimal and free of pack-activation guidance', () => {
     const skills = [SKILL_MD, ...Object.values(SKILL_REFERENCES), DOC_SKILL_MD];
-    expect(Object.values(MCP_TOOL_AUDIENCE)).toHaveLength(68);
+    expect(Object.values(MCP_TOOL_AUDIENCE)).toHaveLength(69);
     for (const skill of skills) {
       const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/)?.[1];
       expect(frontmatter).toBeDefined();

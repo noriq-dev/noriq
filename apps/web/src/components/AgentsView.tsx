@@ -1,5 +1,5 @@
 // Copilot lifecycle inventory — live work first, durable history on demand.
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api, type ApiAgent, type ApiAgentEvent, type ApiAgentLifecycleSweep, type ApiAgentRoster,
   type ApiUser,
@@ -35,6 +35,12 @@ const selectStyle = {
 };
 
 export function AgentsView({ store }: { store: AppStore }) {
+  const loadGeneration = useRef(0);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [eventError, setEventError] = useState('');
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventRetry, setEventRetry] = useState(0);
   const [view, setView] = useState<LifecycleView>('active');
   const [agents, setAgents] = useState<ApiAgent[]>([]);
   const [users, setUsers] = useState<ApiUser[]>([]);
@@ -56,21 +62,27 @@ export function AgentsView({ store }: { store: AppStore }) {
     : undefined;
 
   const load = async (cursor?: string, append = false) => {
+    const generation = ++loadGeneration.current;
+    setLoadError('');
+    try {
     // Coordination-only: Agents page lists copilots (OAuth sessions), not runner-spawned agents.
     const result = await api.agents(undefined, 'copilot', {
       view, ownerUserId: ownerUserId || undefined,
       retireReason: retireReason || undefined, activeBefore, cursor, limit: 50,
     });
+    if (generation !== loadGeneration.current) return;
     setAgents((current) => append ? [...current, ...result.agents] : result.agents);
     setAgentCounts(result.counts);
     setNextCursor(result.page.nextCursor);
+    } catch (err) { if (generation === loadGeneration.current) setLoadError(err instanceof Error ? err.message : String(err)); }
+    finally { if (generation === loadGeneration.current) setLoading(false); }
   };
 
   useEffect(() => {
-    setSelected(null);
+    setSelected(null); setLoading(true); setAgents([]); setAgentCounts(null);
     void load().catch(() => {});
     const interval = setInterval(() => void load().catch(() => {}), 15_000);
-    return () => clearInterval(interval);
+    return () => { clearInterval(interval); loadGeneration.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store.modal, store.currentPid, view, ownerUserId, olderThanDays, retireReason]);
 
@@ -79,9 +91,14 @@ export function AgentsView({ store }: { store: AppStore }) {
   }, [isAdmin]);
 
   useEffect(() => {
-    if (selected) void api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));
-    else setEvents([]);
-  }, [selected]);
+    let cancelled = false; setEvents([]); setEventError(''); setEventsLoading(Boolean(selected));
+    if (selected) void api.agentEvents(selected).then(r => { if (!cancelled) setEvents(r.events); })
+      .catch(err => { if (!cancelled) setEventError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { if (!cancelled) setEventsLoading(false); });
+    return () => { cancelled = true; };
+  }, [selected, eventRetry]);
+  const projectClaims = (store.snapshot?.tasks ?? []).filter(t => t.claimedBy && t.claimExpiresAt && Date.parse(t.claimExpiresAt) > Date.now());
+  const projectLocks = (store.snapshot?.locks ?? []).filter(l => Date.parse(l.expiresAt) > Date.now());
 
   const counts = useMemo(() => ({
     active: (agentCounts?.live ?? 0) + (agentCounts?.recent ?? 0),
@@ -121,13 +138,24 @@ export function AgentsView({ store }: { store: AppStore }) {
       <div style={{ overflowY: 'auto', padding: '18px 22px', minWidth: 0 }}>
         <div style={{ maxWidth: 980, margin: '0 auto' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-            <SectionLabel>Copilot lifecycle · {counts.total} recorded</SectionLabel>
+            <SectionLabel>Connected sessions · {counts.total} recorded</SectionLabel>
             <div style={{ flex: 1 }} />
             <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
               live state is presence evidence; history remains durable attribution
             </span>
           </div>
 
+          <p>{isAdmin ? 'Administrator roster across owners and projects.' : 'Your connected sessions across projects.'} Presence means recently connected; it does not establish that work is running in this project.</p>
+          <details style={{ marginBottom: 14 }} open>
+            <summary>Current project activity</summary>
+            {!store.snapshot ? <p>Project activity is not available yet.</p> : <>
+              <p>{projectClaims.length} active claims · {projectLocks.length} file locks</p>
+              {projectClaims.map(t => <p key={t.id}><Button variant="ghost" onClick={() => store.actions.openTask(t.id)}>{t.key} · {t.title}</Button> · {store.snapshot?.agents.find(a => a.id === t.claimedBy)?.name ?? t.claimedBy}</p>)}
+              {projectLocks.map(l => <p key={l.id}>{l.path} · {l.holderName ?? l.agentId} · expires {new Date(l.expiresAt).toLocaleString()}</p>)}
+            </>}
+          </details>
+          {loadError && <div role="alert">Unable to refresh sessions: {loadError} <Button onClick={() => void load()}>Retry</Button></div>}
+          {loading && <p role="status">Loading sessions…</p>}
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 10 }}>
             <Segmented
               values={['active', 'dormant', 'history']}
@@ -159,7 +187,8 @@ export function AgentsView({ store }: { store: AppStore }) {
           </div>
 
           {canCleanCurrentProject && (
-            <div style={{ padding: '10px 12px', marginBottom: 12, borderRadius: 9, border: '1px solid var(--w-07)', background: 'var(--w-02)', fontSize: 11 }}>
+            <details style={{ padding: '10px 12px', marginBottom: 12, borderRadius: 9, border: '1px solid var(--w-07)', background: 'var(--w-02)', fontSize: 11 }}>
+              <summary>Lifecycle maintenance</summary>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <b>Project cleanup preview</b><span style={{ color: 'var(--text-dim)' }}>copilots and presence rows · bounded and dry-run by default</span><div style={{ flex: 1 }} />
                 <Button variant="ghost" disabled={operation === 'sweep'} onClick={() => void runSweep(false)}>dry run</Button>
@@ -172,7 +201,7 @@ export function AgentsView({ store }: { store: AppStore }) {
                   {' '}· reference probe {sweep.referenceCheck.complete ? 'passed' : 'blocked'} · {sweep.complete ? 'complete' : 'more batches available'}
                 </div>
               )}
-            </div>
+            </details>
           )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -182,7 +211,7 @@ export function AgentsView({ store }: { store: AppStore }) {
                 busy={operation === agent.id} onSelect={() => setSelected(selected === agent.id ? null : agent.id)} onAction={reloadAfter}
               />
             ))}
-            {!agents.length && (
+            {!agents.length && !loading && !loadError && (
               <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
                 no {view} copilots in this scope
               </div>
@@ -199,13 +228,15 @@ export function AgentsView({ store }: { store: AppStore }) {
             <button onClick={() => setSelected(null)} className="drawer-x" style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 15, width: 24, height: 24 }}>✕</button>
           </div>
           <div style={{ flex: 1, overflowY: 'auto', padding: '10px 0' }}>
+            {eventsLoading && <p role="status">Loading activity…</p>}
+            {eventError && <div role="alert">Unable to load activity: {eventError} <Button onClick={() => setEventRetry(n => n + 1)}>Retry activity</Button></div>}
             {events.map((event) => (
               <div key={event.id} style={{ padding: '8px 18px', display: 'flex', gap: 10, alignItems: 'baseline' }}>
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>{new Date(event.createdAt).toLocaleString()}</span>
                 <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>{event.verb} · {event.subjectType}:{event.subjectId}</span>
               </div>
             ))}
-            {!events.length && <div style={{ padding: 30, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no activity yet</div>}
+            {!events.length && !eventsLoading && !eventError && <div style={{ padding: 30, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no activity yet</div>}
           </div>
         </div>
       )}

@@ -324,7 +324,7 @@ describe('ReviewView Validity inbox', () => {
     expect(text()).not.toContain('nothing needs validity review');
   });
 
-  it('keeps mark validated and dismiss cause actions', async () => {
+  it('keeps record evidence and dismiss cause actions', async () => {
     mockInbox([inboxItems[0]!]);
     const validate = vi.spyOn(api, 'recordValidation').mockResolvedValue({
       id: 'val_1',
@@ -342,9 +342,11 @@ describe('ReviewView Validity inbox', () => {
     const dismiss = vi.spyOn(api, 'setReviewCause').mockResolvedValue({ ok: true });
     await mount();
 
-    await act(async () => { button('mark validated')!.click(); });
+    await act(async () => { button('record evidence')!.click(); });
     await act(async () => { await Promise.resolve(); });
-    expect(validate).toHaveBeenCalledWith('prj_1', { subjectType: 'task', subjectId: 'task_old' });
+    expect(validate).not.toHaveBeenCalled();
+    expect(container.querySelector('form[aria-label="Record verification evidence"]')).toBeTruthy();
+    await act(async () => { button('Cancel')!.click(); });
 
     await act(async () => { button('dismiss cause')!.click(); });
     await act(async () => { await Promise.resolve(); });

@@ -46,16 +46,24 @@ async function makePlan(title: string) {
   return { planId, taskIds: results.map((r) => r.id) };
 }
 
+async function completeTask(taskId: string) {
+  const recorded = await mcpCall(conn.apiKey, 'record_validation', { projectId: pid, subjectType: 'task', subjectId: taskId,
+    assessment: { purpose: 'implementation', outcome: 'passed', scope: 'non_code', summary: 'Synthetic landing scenario is ready for the completion transition.',
+      evidence: [{ kind: 'inspection', reference: 'test/plan-landing.test.ts', result: 'Fixture prepared for the plan completion assertion.' }] } });
+  expect(recorded.isError).toBe(false);
+  return room(pid).updateTask(pid, actor, taskId, { status: 'done' });
+}
+
 describe('plan completion is recorded (RUN-28)', () => {
   it('does not fire while any task is still open', async () => {
     const { planId, taskIds } = await makePlan('half done');
-    await room(pid).updateTask(pid, actor, taskIds[0]!, { status: 'done' });
+    await completeTask(taskIds[0]!);
     expect(await landing(planId)).toBeNull(); // one task left → not a completed plan
   });
 
   it('records completion when the last task lands', async () => {
     const { planId, taskIds } = await makePlan('finishes');
-    for (const id of taskIds) await room(pid).updateTask(pid, actor, id, { status: 'done' });
+    for (const id of taskIds) await completeTask(id);
     const rec = await landing(planId);
     expect(rec).toBeTruthy();
     expect(rec!.completedAt).toBeTruthy();
@@ -67,10 +75,10 @@ describe('plan completion is recorded (RUN-28)', () => {
     // A runner may reconnect and re-ask many times; a plan completes a single time, or every
     // reconnect opens another PR.
     const { planId, taskIds } = await makePlan('idempotent');
-    for (const id of taskIds) await room(pid).updateTask(pid, actor, id, { status: 'done' });
+    for (const id of taskIds) await completeTask(id);
     const first = await landing(planId);
     await room(pid).updateTask(pid, actor, taskIds[0]!, { status: 'todo' });
-    await room(pid).updateTask(pid, actor, taskIds[0]!, { status: 'done' });
+    await completeTask(taskIds[0]!);
     const second = await landing(planId);
     expect(second!.completedAt).toBe(first!.completedAt); // not re-stamped
   });
@@ -79,7 +87,7 @@ describe('plan completion is recorded (RUN-28)', () => {
     // A plan whose remaining work was explicitly dropped IS finished. Refusing to notice would
     // strand its branch with no merge request, forever.
     const { planId, taskIds } = await makePlan('cancelled tail');
-    await room(pid).updateTask(pid, actor, taskIds[0]!, { status: 'done' });
+    await completeTask(taskIds[0]!);
     await room(pid).updateTask(pid, actor, taskIds[1]!, { status: 'cancelled' });
     expect(await landing(planId)).toBeTruthy();
   });
@@ -95,7 +103,7 @@ describe('plan completion is recorded (RUN-28)', () => {
     const t = await env.DB.prepare(
       `SELECT pt.task_id AS id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
     ).bind(planId).first<{ id: string }>();
-    await room(pid).updateTask(pid, actor, t!.id, { status: 'done' });
+    await completeTask(t!.id);
     expect(await landing(planId)).toBeNull();
   });
 });

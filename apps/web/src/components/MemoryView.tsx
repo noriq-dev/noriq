@@ -1,12 +1,4 @@
-// Project Memory explorer (PLNR-271, restructured by PLNR-287) — Phase 8's ONE new project view.
-// Carries an in-view tab strip (view-local state, never a ViewId or a store field, per the
-// PLNR-271 locked decision that survives this restructuring): Map (PLNR-285/286's star map — the
-// PRIMARY landing surface as of PLNR-287, §5's "searchable constellation"), Explore (this file's
-// own tab — the deliberately-reachable textual mode, same answers, same evidence inspector),
-// Graph (PLNR-272, MemoryGraph.tsx — the ego-network exploration §5 requires) and Operations
-// (PLNR-273, MemoryOps.tsx). Nothing Phase 8 shipped was removed; the map became the front door
-// and the governance queue plus the other three surfaces are each one tab-click away.
-//
+// Searchable project knowledge, with maps and operational tooling as secondary views.
 // The central question this view answers for a human, for ONE memory: why does it exist, what
 // supports it, is that evidence currently verified, and what replaced or contradicts it. Every
 // number/label displayed here (authority, validity, isLead, verificationState) is read straight
@@ -32,9 +24,9 @@ import { TaskSearchSelect } from './TaskSearchSelect';
 type MemorySubTab = 'map' | 'review' | 'explore' | 'graph' | 'operations';
 
 const SUB_TABS: Array<{ id: MemorySubTab; label: string }> = [
+  { id: 'explore', label: 'Search' },
   { id: 'map', label: 'Map' },
   { id: 'review', label: 'Review' },
-  { id: 'explore', label: 'Explore' },
   { id: 'graph', label: 'Graph' },
   { id: 'operations', label: 'Operations' },
 ];
@@ -66,10 +58,7 @@ const FEEDBACK_KINDS: Array<{ id: ApiMemoryFeedbackKind; label: string }> = [
 const shortId = (id: string) => id.slice(-8);
 
 export function MemoryView({ store }: { store: AppStore }) {
-  // Map is the landing surface (PLNR-287): the searchable whole-project constellation, §5's
-  // secondary-but-primary-entry-point view. Explore/Graph/Operations are each one tab-click away —
-  // nothing Phase 8 shipped lost a hop.
-  const [tab, setTab] = useState<MemorySubTab>('map');
+  const [tab, setTab] = useState<MemorySubTab>(() => new URLSearchParams(location.search).has('task') ? 'graph' : 'explore');
   const [mapMode, setMapMode] = useState<'legacy' | 'v2'>(() => {
     try { return localStorage.getItem('noriq.memory.mapMode') === 'legacy' ? 'legacy' : 'v2'; }
     catch { return 'v2'; }
@@ -118,7 +107,7 @@ export function MemoryView({ store }: { store: AppStore }) {
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ flex: 'none', padding: '12px 20px 0', borderBottom: '1px solid var(--line)' }}>
         <div style={{ display: 'inline-flex', gap: 2, background: 'var(--w-04)', border: '1px solid var(--w-06)', borderRadius: 9, padding: 3, marginBottom: 10 }}>
-          {SUB_TABS.map((t) => (
+          {SUB_TABS.filter(t => t.id !== 'operations' || store.permissions?.canManage).map((t) => (
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
@@ -157,7 +146,7 @@ export function MemoryView({ store }: { store: AppStore }) {
         )}
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} onOpenEgoNetwork={openEgoNetwork} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}
-        {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}
+        {tab === 'operations' && store.permissions?.canManage && <MemoryOps pid={store.currentPid} store={store} />}
       </div>
     </div>
   );

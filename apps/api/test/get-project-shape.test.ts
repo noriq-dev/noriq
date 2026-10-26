@@ -60,6 +60,11 @@ describe('get_project shape (PLNR-224)', () => {
     expect(finished.isError).toBeFalsy();
     // Drive the second plan's only task to done → the plan counts as completed.
     const doneTaskId = (await mcpCall(agent.apiKey, 'search_tasks', { projectId: pid, text: 'closed task' })).body.tasks[0].id;
+    for (const purpose of ['readiness', 'implementation']) {
+      expect((await mcpCall(agent.apiKey, 'record_validation', { projectId: pid, subjectType: 'task', subjectId: doneTaskId,
+        assessment: { purpose, outcome: 'passed', scope: 'non_code', summary: 'Synthetic project-shape fixture prepared for completion.',
+          evidence: [{ kind: 'inspection', reference: 'test/get-project-shape.test.ts', result: 'Completed fixture should be omitted from active plans.' }] } })).isError).toBe(false);
+    }
     await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: doneTaskId });
     await mcpCall(agent.apiKey, 'release_task', { projectId: pid, taskId: doneTaskId, toStatus: 'done' });
 

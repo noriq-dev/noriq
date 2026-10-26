@@ -1249,6 +1249,7 @@ describe('timed snooze (PLNR-594 / P2-C)', () => {
       now: '2026-06-01T00:00:00.000Z',
     });
     expect(snoozed.causes.some((c) => c.code === 'content_changed')).toBe(false);
+    expect(snoozed.criticalCauses).toContain('content_changed');
 
     const expired = computeFreshness({
       ...base,
@@ -1268,6 +1269,7 @@ describe('timed snooze (PLNR-594 / P2-C)', () => {
       now: '2026-06-01T00:00:00.000Z',
     });
     expect(dismissed.causes.some((c) => c.code === 'content_changed')).toBe(false);
+    expect(dismissed.criticalCauses).toContain('content_changed');
   });
 
   it('MCP snooze hides cause from freshness/inbox until duration expires; dismiss stays permanent', async () => {
@@ -1346,6 +1348,22 @@ describe('timed snooze (PLNR-594 / P2-C)', () => {
       projectId, subjectType: 'task', subjectId: taskId,
     });
     expect(fresh.body.causes.some((c: { code: string }) => c.code === 'human_flagged')).toBe(false);
+  });
+
+  it.each(['snoozed', 'dismissed'] as const)('keeps content drift claim-blocking when %s', async (status) => {
+    const made = await mcpCall(agent.apiKey, 'create_tasks', {
+      projectId, tasks: [{ title: `suppressed blocker ${status}`, body: 'before', tags: ['claims'], milestoneId }],
+    });
+    const taskId = made.body.created[0].id;
+    await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: taskId });
+    await mcpCall(agent.apiKey, 'update_tasks', { projectId, tasks: [{ taskId, set: { body: 'after' } }] });
+    await mcpCall(agent.apiKey, 'set_review_cause', {
+      projectId, subjectType: 'task', subjectId: taskId, cause: 'content_changed', status,
+      ...(status === 'snoozed' ? { durationSeconds: 3600 } : {}),
+    });
+    const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    expect(claim.isError).toBe(true);
+    expect(claim.text).toContain('content_changed');
   });
 
   it('rejects snoozed without until/duration', async () => {

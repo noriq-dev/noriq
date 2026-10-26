@@ -62,38 +62,27 @@ describe('ValidityStrip', () => {
     const text = container.textContent ?? '';
     expect(text).toContain('Validity');
     expect(text).toContain('NEVER VALIDATED');
-    expect(text).toContain('Validate');
+    expect(text).toContain('Record evidence');
     expect(text).toContain('Flag');
     expect(text).toContain('Snooze');
     expect(text).toContain('Supersede');
     expect(text).toContain('Open in Review');
   });
 
-  it('Validate posts a validation record then refreshes freshness', async () => {
-    const record = vi.spyOn(api, 'recordValidation').mockResolvedValue({
-      id: 'val_1',
-      projectId: 'prj_1',
-      subjectType: 'task',
-      subjectId: 'task_1',
-      contentFingerprint: 'fp',
-      validatedAt: '2026-10-22T00:00:00.000Z',
-      actorKind: 'human',
-      actorId: 'u1',
-      actorName: 'Human',
-      baselines: { docPins: [], codeAssessments: [] },
-      note: '',
-    });
-    const load = vi.spyOn(api, 'subjectFreshness').mockResolvedValue(freshness({
-      lastValidatedAt: '2026-10-22T00:00:00.000Z',
-      causes: [],
-      impactUnknown: false,
-    }));
+  it('requires evidence instead of recording an assertion on click', async () => {
+    const record = vi.spyOn(api, 'recordValidation');
     mount();
-    const validate = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Validate');
-    expect(validate).toBeTruthy();
-    await act(async () => { validate!.click(); });
-    expect(record).toHaveBeenCalledWith('prj_1', { subjectType: 'task', subjectId: 'task_1' });
-    expect(load).toHaveBeenCalled();
+    const button = [...container.querySelectorAll('button')].find(b => b.textContent === 'Record evidence')!;
+    await act(async () => button.click());
+    expect(container.querySelector('form[aria-label="Record verification evidence"]')).toBeTruthy();
+    expect(record).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('Revision checked');
+  });
+
+  it('shows claim blockers even when their reminders are suppressed', () => {
+    mount({ initialFreshness: freshness({ causes: [], criticalCauses: ['content_changed'] }) });
+    expect(container.textContent).toContain('CONTENT CHANGED');
+    expect(container.textContent).not.toContain('CURRENT');
   });
 
   it('Flag opens human_flagged via setReviewCause', async () => {
@@ -151,4 +140,20 @@ describe('ValidityStrip', () => {
       durationSeconds: 86400,
     });
   });
+});
+
+it('lets readers inspect failed evidence history and retry a failed history request', async () => {
+  const history = vi.spyOn(api, 'assessmentHistory').mockRejectedValueOnce(new Error('offline')).mockResolvedValue({ limit: 20, overrides: [], assessments: [{
+    id: 'asm_failed', subjectType: 'task', subjectId: 'task_1', purpose: 'readiness', outcome: 'failed', scope: 'non_code', summary: 'The proposed requirements contradict the agreed contract.',
+    evidence: [{ kind: 'human_review', reference: 'contract section 2', result: 'Acceptance criteria are inconsistent.' }], actorKind: 'human', actorId: 'u1', actorName: 'Reviewer',
+    createdAt: '2026-10-26T10:00:00Z', contentFingerprint: 'old', contextFingerprint: 'old', provenance: 'actor_reported',
+  }] });
+  mount({ canAct: false });
+  expect(container.textContent).not.toContain('Record evidence');
+  await act(async () => [...container.querySelectorAll('button')].find(b => b.textContent === 'Evidence history')!.click());
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('offline');
+  await act(async () => [...container.querySelectorAll('button')].find(b => b.textContent === 'Retry history')!.click());
+  expect(history).toHaveBeenCalledTimes(2);
+  expect(container.textContent).toContain('readiness · failed · Reviewer');
+  expect(container.textContent).toContain('Acceptance criteria are inconsistent.');
 });

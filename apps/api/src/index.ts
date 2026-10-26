@@ -1,3 +1,4 @@
+import { ReadinessOverrideInput, AssessmentInput, ValidationSubjectType as ValidationSubjectSchema, ValidationBaselines as ValidationBaselinesSchema } from '@noriq-dev/shared';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { cors } from 'hono/cors';
@@ -882,15 +883,16 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
   const operationalSurface = ['control', 'graph', 'board', 'plans', 'roadmap', 'review'].includes(surface);
   const planSurface = surface === 'plans';
   const eventSurface = surface === 'control' || surface === 'graph';
-  const lockSurface = surface === 'control' || surface === 'board';
-  const agentSurface = operationalSurface;
+  const sessionSurface = surface === 'agents';
+  const lockSurface = surface === 'control' || surface === 'board' || sessionSurface;
+  const agentSurface = operationalSurface || sessionSurface;
   const taskWhere = docsSurface
     ? 't.project_id = ? AND EXISTS (SELECT 1 FROM task_docs td WHERE td.task_id = t.id)'
-    : 't.project_id = ?';
+    : sessionSurface ? "t.project_id = ? AND t.claimed_by IS NOT NULL AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')" : 't.project_id = ?';
 
   const [tasks, dependencies, extDeps, agents, events, milestones, boards, plans, phases,
     phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
-    rows(taskSurface || docsSurface,
+    rows(taskSurface || docsSurface || sessionSurface,
       `SELECT t.id, t.key, t.title, '' AS body, ${taskWireStatus('t')} AS status,
               t.type, t.priority, t.estimate, t.due_at AS dueAt, t.claimed_by AS claimedBy,
               t.claim_expires_at AS claimExpiresAt, t.parent_task_id AS parentTaskId,
@@ -934,7 +936,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
       'SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?', pid),
     rows(operationalSurface || docsSurface,
       'SELECT id, name, color, "order" FROM tags WHERE project_id = ? ORDER BY "order"', pid),
-    rows(taskSurface || docsSurface,
+    rows(taskSurface || docsSurface || sessionSurface,
       'SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?', pid),
     rows(operationalSurface,
       `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
@@ -1544,19 +1546,22 @@ app.get('/api/projects/:pid/validations/:subjectType/:subjectId', userAuth, asyn
   const limit = Number(c.req.query('limit') ?? 20);
   return c.json({
     records: await room(c.env, pid).listValidations(pid, subjectType, subjectId, Number.isFinite(limit) ? limit : 20),
+    ...await (await import('./lib/entity-assessments')).assessmentHistory(c.env.DB, pid, subjectType, subjectId, limit),
     freshness: await (await import('./lib/entity-validation-store')).subjectFreshness(c.env.DB, pid, subjectType, subjectId),
   });
 });
+app.post('/api/projects/:pid/readiness-overrides', userAuth, async (c) => {
+  const parsed = ReadinessOverrideInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: 'Invalid override', detail: parsed.error.issues }, 400);
+  return c.json(await room(c.env, c.req.param('pid')!).recordReadinessOverride(c.req.param('pid')!, humanActor(c), parsed.data));
+});
 app.post('/api/projects/:pid/validations', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const body = await c.req.json<{
-    subjectType: import('@noriq-dev/shared').ValidationSubjectType;
-    subjectId: string;
-    note?: string;
-    baselines?: import('@noriq-dev/shared').ValidationBaselines;
-  }>();
-  if (!body.subjectType || !body.subjectId) return c.json({ error: 'subjectType and subjectId required' }, 400);
-  return c.json(await room(c.env, pid).recordValidation(pid, humanActor(c), body));
+  const parsed = z.object({ subjectType: ValidationSubjectSchema, subjectId: z.string().min(1),
+    note: z.string().max(2000).optional(), baselines: ValidationBaselinesSchema.optional(), assessment: AssessmentInput.optional(),
+  }).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: 'Invalid validation evidence', detail: parsed.error.issues }, 400);
+  return c.json(await room(c.env, pid).recordValidation(pid, humanActor(c), parsed.data));
 });
 app.post('/api/projects/:pid/review-causes', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
@@ -1728,6 +1733,12 @@ app.get('/api/projects/:pid/memory/analytics/current', userAuth, async (c) => {
 // PLNR-302: a single bounded dashboard packet keeps live and frozen facts visibly separate while
 // avoiding browser-authored joins or denominator arithmetic. Deterministic D1/SQLite reads remain
 // available without Vectorize, Workers AI, Queues, or Workflows.
+app.get('/api/projects/:pid/health-summary', userAuth, async (c) => {
+  const offset = Number(c.req.query('offset') ?? 0);
+  if (!Number.isSafeInteger(offset) || offset < 0) return c.json({ error: 'offset must be a non-negative integer' }, 400);
+  return c.json(await (await import('./lib/project-health')).projectHealth(c.env.DB, c.req.param('pid')!, offset));
+});
+
 app.post('/api/projects/:pid/memory/intelligence', userAuth, async (c) => {
   const parsed = z.object({
     from: z.string().datetime(),

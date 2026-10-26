@@ -107,3 +107,16 @@ describe('surface-scoped UI state (PLNR-400)', () => {
     expect(await response.json()).toEqual({ error: 'unknown UI surface' });
   });
 });
+
+it('connected sessions carries project claims and locks without unrelated task bodies', async () => {
+  const made = await mcpCall(apiKey, 'create_task', { projectId, title: 'Session activity', tags: ['test-fixture'] });
+  const claimed = await mcpCall(apiKey, 'claim_task', { projectId, taskId: made.body.id });
+  expect(claimed.isError).toBe(false);
+  const response = await uiState('agents');
+  const state = await response.json() as { tasks: Array<{ id: string; body: string }>; locks: unknown[]; plans: unknown[] };
+  expect(state.tasks.some(t => t.id === made.body.id)).toBe(true);
+  expect(state.tasks.some(t => t.id === taskId)).toBe(false);
+  expect(state.tasks.every(t => t.body === '')).toBe(true);
+  expect(state.plans).toEqual([]);
+  expect(Array.isArray(state.locks)).toBe(true);
+});
