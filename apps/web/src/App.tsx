@@ -24,7 +24,6 @@ import { ProjectSettingsView } from './components/ProjectSettingsView';
 import { AdminView } from './components/AdminView';
 import { Logo } from './components/Logo';
 import { useState } from 'react';
-import { useTheme } from './theme';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
 import { ResetPassword } from './components/ResetPassword';
@@ -35,25 +34,11 @@ import { AvatarChip, LiveDot } from './components/bits';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from './viewport';
 import { DesktopOnly, isDesktopOnlyView } from './components/DesktopOnly';
 import { MoreView } from './components/MoreView';
+import { ThemeButton } from './components/ThemeButton';
 
-// Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
+// Floating appearance control for unauthenticated screens (login / setup / invite) — no rail there.
 function FloatingTheme() {
-  const [theme, toggle] = useTheme();
-  return (
-    <button
-      onClick={toggle}
-      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-      style={{
-        position: 'fixed', top: 12, right: 14, zIndex: 60,
-        cursor: 'pointer', width: 30, height: 30, borderRadius: 8,
-        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14,
-        background: 'var(--bg-raised)', border: '1px solid var(--line)', color: 'var(--text-mid)',
-      }}
-      className="hover-bright"
-    >
-      {theme === 'dark' ? '☀' : '☾'}
-    </button>
-  );
+  return <ThemeButton floating />;
 }
 
 export function App() {

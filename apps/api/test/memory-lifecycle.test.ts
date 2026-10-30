@@ -162,10 +162,10 @@ describe('auditable deletion sequence', () => {
 
     await room(projectId).deleteProject(projectId, actor);
 
-    // Inline erasure is fire-and-forget — poll briefly, same technique memory-registry.test.ts
-    // uses for the same reason.
+    // Inline erasure is fire-and-forget — poll until the tombstone clears. CI under shard
+    // load can outrun a 500ms window (PR #38 flake); allow ~2s before failing.
     let tombstoneCleared = false;
-    for (let i = 0; i < 10 && !tombstoneCleared; i++) {
+    for (let i = 0; i < 40 && !tombstoneCleared; i++) {
       const row = await appEnv.DB.prepare('SELECT 1 FROM memory_erasure_tombstones WHERE project_id = ?').bind(projectId).first();
       tombstoneCleared = !row;
       if (!tombstoneCleared) await new Promise((r) => setTimeout(r, 50));
