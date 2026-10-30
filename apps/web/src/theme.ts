@@ -1,43 +1,76 @@
-// Theme preference: explicit choice in localStorage, else the system scheme.
+// Theme preference: light | dark | system (follow OS). Persisted in localStorage.
 import { useEffect, useState } from 'react';
 
 const KEY = 'noriq.theme';
 
 export type Theme = 'dark' | 'light';
+export type ThemePreference = Theme | 'system';
 
-export function resolveTheme(): Theme {
-  const stored = localStorage.getItem(KEY);
-  if (stored === 'dark' || stored === 'light') return stored;
+const THEME_EVENT = 'noriq-theme';
+
+function systemTheme(): Theme {
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+/** Stored preference. Missing/unknown → system (same as historic unset behaviour). */
+export function getThemePreference(): ThemePreference {
+  const stored = localStorage.getItem(KEY);
+  if (stored === 'dark' || stored === 'light' || stored === 'system') return stored;
+  return 'system';
+}
+
+/** Resolved applied scheme (never `'system'`). */
+export function resolveTheme(preference: ThemePreference = getThemePreference()): Theme {
+  return preference === 'system' ? systemTheme() : preference;
 }
 
 export function applyTheme(theme: Theme) {
   document.documentElement.dataset.theme = theme;
 }
 
-export function initTheme() {
-  applyTheme(resolveTheme());
-  // Follow system changes only while the user hasn't chosen explicitly.
-  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-    if (!localStorage.getItem(KEY)) applyTheme(resolveTheme());
-  });
+function emitThemeChange() {
+  window.dispatchEvent(new CustomEvent(THEME_EVENT, {
+    detail: { theme: resolveTheme(), preference: getThemePreference() },
+  }));
 }
 
+export function setThemePreference(preference: ThemePreference) {
+  localStorage.setItem(KEY, preference);
+  applyTheme(resolveTheme(preference));
+  emitThemeChange();
+}
+
+/** @deprecated Prefer setThemePreference — kept for any leftover toggle callers. */
 export function toggleTheme(): Theme {
   const next: Theme = resolveTheme() === 'dark' ? 'light' : 'dark';
-  localStorage.setItem(KEY, next);
-  applyTheme(next);
-  window.dispatchEvent(new CustomEvent('noriq-theme', { detail: next }));
+  setThemePreference(next);
   return next;
 }
 
-/** Shared theme state so every toggle button (rail, mobile bar) stays in sync. */
-export function useTheme(): [Theme, () => void] {
-  const [theme, setTheme] = useState(resolveTheme());
+export function initTheme() {
+  applyTheme(resolveTheme());
+  // Follow OS only while preference is system (including legacy unset → system).
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+    if (getThemePreference() !== 'system') return;
+    applyTheme(resolveTheme());
+    emitThemeChange();
+  });
+}
+
+/**
+ * Shared theme state so every control (rail, mobile bar, floating) stays in sync.
+ * Tuple: [resolved scheme, setPreference, stored preference].
+ */
+export function useTheme(): [Theme, (preference: ThemePreference) => void, ThemePreference] {
+  const [theme, setTheme] = useState(resolveTheme);
+  const [preference, setPreferenceState] = useState(getThemePreference);
   useEffect(() => {
-    const onChange = () => setTheme(resolveTheme());
-    window.addEventListener('noriq-theme', onChange);
-    return () => window.removeEventListener('noriq-theme', onChange);
+    const onChange = () => {
+      setTheme(resolveTheme());
+      setPreferenceState(getThemePreference());
+    };
+    window.addEventListener(THEME_EVENT, onChange);
+    return () => window.removeEventListener(THEME_EVENT, onChange);
   }, []);
-  return [theme, () => { toggleTheme(); }];
+  return [theme, setThemePreference, preference];
 }
