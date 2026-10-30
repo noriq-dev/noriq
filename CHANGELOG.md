@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.80.1 - 2026-10-30
+
+### Theme Appearance popup (PLNR-618)
+
+- Theme control opens an Appearance popup with a three-segment **Light · System · Dark** slider.
+- Preference persists in `noriq.theme`; System follows `prefers-color-scheme`.
+
 ## 0.80.0 - 2026-10-26
 
 ### Evidence-backed verification and coordination surfaces (PLNR-609–617)
