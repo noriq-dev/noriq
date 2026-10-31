@@ -3253,7 +3253,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!fields.length) {
         if (assessment) {
           await storeRecordValidation(this.env.DB,projectId,actor,{subjectType:'doc',subjectId:docId,assessment});
-          await this.emit(actor,'doc.updated','doc',docId,{fields:['assessment'],version:doc.version});
+          await this.emit(actor,'doc.updated','doc',docId,await this.assessmentEventPayload(projectId, 'doc', docId, assessment));
         }
         return { ok:true, version:doc.version };
       }
@@ -5988,7 +5988,8 @@ export class ProjectRoom extends DurableObject<Env> {
       const input = ReadinessOverrideInput.parse(raw);
       const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', input.subjectId);
       const result = await recordOverride(this.env.DB, projectId, actor, freshness.assessment!, input);
-      await this.emit(actor, 'task.updated', 'task', input.subjectId, { fields: ['readinessOverride'], overrideId: result.id, reason: input.reason });
+      const task = await this.getTask(input.subjectId);
+      await this.emit(actor, 'task.updated', 'task', input.subjectId, { key: task.key, title: task.title, fields: ['readinessOverride'], overrideId: result.id, reason: input.reason });
       return result;
     });
   }
@@ -6016,6 +6017,18 @@ export class ProjectRoom extends DurableObject<Env> {
     }
   }
 
+  private async assessmentEventPayload(projectId: string, subjectType: ValidationSubjectType, subjectId: string, assessment?: AssessmentInput) {
+    const identity = subjectType === 'task'
+      ? await this.env.DB.prepare('SELECT key, title FROM tasks WHERE id = ? AND project_id = ?').bind(subjectId, projectId).first()
+      : subjectType === 'plan'
+        ? await this.env.DB.prepare('SELECT title FROM plans WHERE id = ? AND project_id = ?').bind(subjectId, projectId).first()
+        : await this.env.DB.prepare('SELECT name, current_version AS version FROM docs WHERE id = ? AND project_id = ?').bind(subjectId, projectId).first();
+    return {
+      ...identity, fields: ['assessment'], purpose: assessment?.purpose ?? 'legacy_attestation',
+      ...(assessment ? { outcome: assessment.outcome, provenance: 'actor_reported' } : {}),
+    };
+  }
+
   async recordValidation(
     projectId: string,
     actor: Actor,
@@ -6030,7 +6043,7 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const result = await storeRecordValidation(this.env.DB, projectId, actor, input);
-      await this.emit(actor, `${input.subjectType}.updated` as EventVerb, input.subjectType, input.subjectId, { fields: ['assessment'], purpose: input.assessment?.purpose ?? 'legacy_attestation' });
+      await this.emit(actor, `${input.subjectType}.updated` as EventVerb, input.subjectType, input.subjectId, await this.assessmentEventPayload(projectId, input.subjectType, input.subjectId, input.assessment));
       return result;
     });
   }

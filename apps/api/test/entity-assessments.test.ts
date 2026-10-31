@@ -209,3 +209,27 @@ it('pages past blocked readiness candidates without declaring the whole queue em
   const next = await mcpCall(agent.apiKey, 'next_claimable', { projectId: queueProject, offset: first.body.nextOffset });
   expect(next.body.task.id).toBe(loose.body.created[0].id);
 });
+
+it('emits subject identity and reported assessment outcomes for task, plan and doc events', async () => {
+  const id = await task();
+  const plan = await mcpCall(agent.apiKey,'create_plan',{projectId,title:'Event plan',phases:[{title:'Phase',taskIds:[id]}]});
+  expect(plan.isError).toBeFalsy();
+  const doc = await mcpCall(agent.apiKey,'create_doc',{projectId,name:'Event contract',body:'The event contains the subject identity.'});
+  expect(doc.isError).toBeFalsy();
+  for (const [subjectType,subjectId,assessment,identity] of [
+    ['task',id,evidence(),{title:'Evidence task'}],
+    ['plan',plan.body.id,evidence('document'),{title:'Event plan'}],
+    ['doc',doc.body.id,{...evidence('document'),outcome:'failed'},{name:'Event contract',version:1}],
+  ] as const) {
+    const result = await mcpCall(agent.apiKey,'record_validation',{projectId,subjectType,subjectId,assessment});
+    expect(result.isError).toBeFalsy();
+    const row = await env.DB.prepare('SELECT payload FROM events WHERE project_id=? AND subject_id=? AND verb=? ORDER BY seq DESC LIMIT 1').bind(projectId,subjectId,`${subjectType}.updated`).first<{payload:string}>();
+    const payload=JSON.parse(row!.payload);
+    expect(payload).toMatchObject({...identity,fields:['assessment'],purpose:assessment.purpose,outcome:assessment.outcome,provenance:'actor_reported'});
+    if(subjectType==='task') expect(payload.key).toMatch(/^EVD-/);
+  }
+  const updated = await mcpCall(agent.apiKey,'update_doc',{projectId,docId:doc.body.id,assessment:evidence('document')});
+  expect(updated.isError).toBeFalsy();
+  const row = await env.DB.prepare("SELECT payload FROM events WHERE project_id=? AND subject_id=? AND verb='doc.updated' ORDER BY seq DESC LIMIT 1").bind(projectId,doc.body.id).first<{payload:string}>();
+  expect(JSON.parse(row!.payload)).toMatchObject({name:'Event contract',version:1,purpose:'document',outcome:'passed'});
+});

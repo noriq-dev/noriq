@@ -61,3 +61,22 @@ describe('event content targets', () => {
     })).contentTarget).toBeUndefined();
   });
 });
+
+describe('assessment events', () => {
+  it.each(['passed', 'failed', 'inconclusive'])('renders the reported %s outcome with a task link', outcome => {
+    expect(eventToVM(event('task.updated', {payload:{key:'PLNR-624',fields:['assessment'],purpose:'implementation',outcome}}))).toMatchObject({
+      verb:'assessment',subject:`PLNR-624 · implementation · ${outcome} (actor-reported)`,contentTarget:{kind:'task',id:'task_1'},
+    });
+  });
+  it('uses retained IDs for old incomplete events without inventing an outcome', () => {
+    expect(eventToVM(event('task.updated',{payload:{fields:['assessment'],purpose:'readiness'}}))).toMatchObject({subject:'task_1 · readiness'});
+    expect(eventToVM(event('task.updated',{payload:{fields:['readinessOverride']}})).subject).toBe('task_1 · readinessOverride');
+  });
+  it('identifies plan and document assessments and preserves doc revision navigation', () => {
+    expect(eventToVM(event('plan.updated',{subjectType:'plan',subjectId:'plan_1',payload:{title:'Release',fields:['assessment'],purpose:'document',outcome:'passed'}})).subject).toBe('Release · document · passed (actor-reported)');
+    expect(eventToVM(event('doc.updated',{subjectType:'doc',subjectId:'doc_1',payload:{name:'Contract',version:2,fields:['assessment'],purpose:'document',outcome:'failed'}}))).toMatchObject({subject:'Contract · document · failed (actor-reported)',contentTarget:{kind:'doc',id:'doc_1',version:2}});
+  });
+  it('keeps legacy attestations distinct from passing evidence', () => {
+    expect(eventToVM(event('task.updated',{payload:{key:'PLNR-1',fields:['assessment'],purpose:'legacy_attestation'}}))).toMatchObject({verb:'attested',subject:'PLNR-1 · legacy attestation'});
+  });
+});

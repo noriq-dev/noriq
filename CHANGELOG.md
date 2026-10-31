@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.81.2 - 2026-10-31
+
+### Validation event labels (PLNR-624)
+
+- Include task keys, plan titles and document names/versions in validation events, alongside assessment purpose and reported outcome.
+- Render assessments distinctly in Mission Control, retaining task/document links and distinguishing legacy attestations from passing evidence.
+- Fall back to the retained subject ID for older incomplete events instead of displaying `undefined`; no event-history rewrite or evidence backfill is needed.
+
 ## 0.81.1 - 2026-10-31
 
 ### Cohesive project settings + evidence UI (PLNR-622)

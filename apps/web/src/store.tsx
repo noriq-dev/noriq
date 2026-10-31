@@ -40,7 +40,7 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'task.proposal_accepted': verb = 'proposal ✓'; subject = `accepted ${p.key} · ${p.title}`; taskId = e.subjectId; break;
     case 'task.proposal_rejected': verb = 'proposal ✗'; subject = `rejected ${p.key} · ${p.title}`; taskId = e.subjectId; break;
     case 'task.status_changed': verb = `status →${p.to}`; subject = `${p.key} · ${p.title ?? ''}`; taskId = e.subjectId; break;
-    case 'task.updated': verb = 'updated'; subject = `${p.key} · ${(p.fields as string[] | undefined)?.join(', ') ?? ''}`; taskId = e.subjectId; break;
+    case 'task.updated': verb = 'updated'; subject = `${p.key ?? e.subjectId} · ${(p.fields as string[] | undefined)?.join(', ') ?? ''}`; taskId = e.subjectId; break;
     case 'comment.posted': verb = String(p.kind ?? 'comment'); subject = `on ${p.taskKey} · “${p.body}”`; taskId = String(p.taskId ?? ''); break;
     case 'comment.resolved': verb = 'resolved'; subject = `${p.taskKey} · ${p.resolution}`; taskId = String(p.taskId ?? ''); break;
     case 'comment.acknowledged': verb = 'acknowledged'; subject = `comments on ${p.taskKey}`; taskId = e.subjectId; break;
@@ -92,6 +92,13 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'lock.expired': verb = 'lock'; subject = `${p.count ?? ''} lock(s) expired`; break;
     case 'lock.renewed': verb = 'lock'; subject = 'renewed a lock'; break;
     default: subject = `${e.verb} ${e.subjectId}`;
+  }
+  if (['task.updated', 'plan.updated', 'doc.updated'].includes(e.verb)
+      && Array.isArray(p.fields) && p.fields.includes('assessment')) {
+    const label = p.key ?? p.name ?? p.title ?? e.subjectId;
+    const purpose = p.purpose === 'legacy_attestation' ? 'legacy attestation' : p.purpose ?? 'assessment';
+    verb = p.purpose === 'legacy_attestation' ? 'attested' : 'assessment';
+    subject = `${label} · ${purpose}${p.outcome ? ` · ${p.outcome} (actor-reported)` : ''}`;
   }
   if (taskId) contentTarget = { kind: 'task', id: taskId };
   return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, contentTarget, dot };
