@@ -41,12 +41,47 @@ function SettingsSection({ title, description, children }: { title: string; desc
   );
 }
 
+function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{
+        fontFamily: 'var(--mono)', fontSize: 9.5, letterSpacing: '.08em', textTransform: 'uppercase',
+        color: 'var(--text-faint)', padding: '0 2px',
+      }}>
+        {label}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function SettingsSubBlock({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
+  return (
+    <div>
+      <div style={{
+        fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.06em', textTransform: 'uppercase',
+        color: 'var(--text-dim)', marginBottom: description ? 4 : 10,
+      }}>
+        {title}
+      </div>
+      {description && (
+        <div style={{ color: 'var(--text-mid)', fontSize: 11.5, lineHeight: 1.55, marginBottom: 12 }}>{description}</div>
+      )}
+      {children}
+    </div>
+  );
+}
+
 function PermissionNote({ children }: { children: ReactNode }) {
   return (
     <div style={{ border: '1px solid var(--w-08)', borderRadius: 9, background: 'var(--w-02)', color: 'var(--text-mid)', padding: '9px 11px', fontFamily: 'var(--mono)', fontSize: 9.5, lineHeight: 1.55 }}>
       {children}
     </div>
   );
+}
+
+function SettingsDivider() {
+  return <div style={{ borderTop: '1px solid var(--w-07)', margin: '18px 0' }} />;
 }
 
 export function ProjectSettingsView({ store }: { store: AppStore }) {
@@ -235,12 +270,14 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
 
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '24px 26px 48px' }}>
-      <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
-        <header style={{ display: 'flex', alignItems: 'flex-start', gap: 14, marginBottom: 4 }}>
+      <div style={{ maxWidth: 860, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
+        <header style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
           <MonoTag color="var(--accent-ink)" bg="rgba(198,242,78,.08)" size={10}>{project.key}</MonoTag>
           <div style={{ minWidth: 0, flex: 1 }}>
             <h1 style={{ fontSize: 21, lineHeight: 1.2, letterSpacing: '-.02em', margin: 0 }}>Project settings</h1>
-            <p style={{ color: 'var(--text-mid)', fontSize: 12.5, margin: '6px 0 0' }}>Configuration for {project.name}. Account and system settings remain separate.</p>
+            <p style={{ color: 'var(--text-mid)', fontSize: 12.5, margin: '6px 0 0' }}>
+              Configuration for {project.name}. Account and system settings remain under Settings.
+            </p>
           </div>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, textTransform: 'uppercase', color: canManage ? 'var(--accent-ink)' : 'var(--text-dim)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '5px 8px' }}>
             {effectiveRole}
@@ -253,7 +290,7 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
           </PermissionNote>
         )}
 
-        <ValidationPolicySettings key={project.id} projectId={project.id} canContribute={store.permissions.canContribute} />
+        <SettingsGroup label="Project">
         <SettingsSection title="General" description="Identity, organization, and the claim lifetime used by agents working in this project.">
           <div className="project-settings-fields">
             <Field label="Name">
@@ -287,90 +324,103 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
             </div>
           )}
         </SettingsSection>
+        </SettingsGroup>
+
+        <SettingsGroup label="Review & evidence">
+        <ValidationPolicySettings key={project.id} projectId={project.id} canContribute={store.permissions.canContribute} />
 
         <SettingsSection
-          title="Validity inbox"
-          description="By default the Review → Validity inbox omits subjects whose only signals are never_validated or impact_unknown (flood control). Opt in to surface pure never_validated; impact_unknown stays omitted."
+          title="Review preferences"
+          description="Inbox flood control and optional dormancy. These are advisory review signals — they never auto-close work or bypass claim gates."
         >
-          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, color: 'var(--text-soft)', cursor: canManage ? 'pointer' : 'default' }}>
-            <input
-              aria-label="Include never_validated in Validity inbox"
-              type="checkbox"
-              checked={includeNeverValidated}
-              disabled={!canManage}
-              onChange={(event) => {
-                setIncludeNeverValidated(event.target.checked);
-                setInboxPolicySaved(false);
-              }}
-              style={{ width: 'auto', marginTop: 2 }}
-            />
-            <span style={{ fontSize: 12.5, lineHeight: 1.45 }}>
-              Include never_validated subjects
-              <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', marginTop: 2 }}>
-                Off by default. Does not change the hard claim gate — never_validated stays advisory.
+          <SettingsSubBlock
+            title="Validity inbox"
+            description="By default Review → Validity omits subjects whose only signals are never_validated or impact_unknown. Opt in to surface pure never_validated; impact_unknown stays omitted."
+          >
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, color: 'var(--text-soft)', cursor: canManage ? 'pointer' : 'default' }}>
+              <input
+                aria-label="Include never_validated in Validity inbox"
+                type="checkbox"
+                checked={includeNeverValidated}
+                disabled={!canManage}
+                onChange={(event) => {
+                  setIncludeNeverValidated(event.target.checked);
+                  setInboxPolicySaved(false);
+                }}
+                style={{ width: 'auto', marginTop: 2 }}
+              />
+              <span style={{ fontSize: 12.5, lineHeight: 1.45 }}>
+                Include never_validated subjects
+                <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', marginTop: 2 }}>
+                  Off by default. Does not change the hard claim gate — never_validated stays advisory.
+                </span>
               </span>
-            </span>
-          </label>
-          {canManage && (
-            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
-              {inboxPolicySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Inbox policy saved</span>}
-              <ErrorNote>{inboxPolicyError}</ErrorNote>
-              <Button disabled={inboxPolicySaving} onClick={() => void saveInboxPolicy()}>{inboxPolicySaving ? 'Saving…' : 'Save inbox policy'}</Button>
-            </div>
-          )}
-        </SettingsSection>
+            </label>
+            {canManage && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
+                {inboxPolicySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Inbox policy saved</span>}
+                <ErrorNote>{inboxPolicyError}</ErrorNote>
+                <Button disabled={inboxPolicySaving} onClick={() => void saveInboxPolicy()}>{inboxPolicySaving ? 'Saving…' : 'Save inbox policy'}</Button>
+              </div>
+            )}
+          </SettingsSubBlock>
 
-        <SettingsSection
-          title="Dormancy"
-          description="Opt-in quiet period for tasks, plans, and docs. When enabled, a long stretch without validation or content change opens an advisory dormant review cause only — nothing is auto-closed."
-        >
-          <Field label="Quiet period" hint="null / off is the default; minimum 1 hour on the API, presets use whole days">
-            <Select
-              aria-label="Dormancy quiet period"
-              value={dormancyPreset}
-              disabled={!canManage}
-              onChange={(event) => {
-                setDormancyPreset(event.target.value);
-                setDormancySaved(false);
-              }}
-            >
-              <option value="off">Off (default)</option>
-              {DORMANCY_PRESETS.map((preset) => (
-                <option key={preset.seconds} value={String(preset.seconds)}>{preset.label}</option>
-              ))}
-              <option value="custom">Custom (days)…</option>
-            </Select>
-          </Field>
-          {dormancyPreset === 'custom' && (
-            <div style={{ marginTop: 12 }}>
-              <Field label="Custom quiet period (days)" hint={`allowed range ≈ ${Math.round(DORMANCY_QUIET_SECONDS_MIN / DAY_SECONDS)}–${Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)} days`}>
-                <TextInput
-                  aria-label="Custom dormancy quiet period in days"
-                  type="number"
-                  min={1}
-                  max={Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)}
-                  value={dormancyCustomDays}
-                  disabled={!canManage}
-                  onChange={(event) => {
-                    setDormancyCustomDays(event.target.value);
-                    setDormancySaved(false);
-                  }}
-                />
-              </Field>
-            </div>
-          )}
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', marginTop: 12, lineHeight: 1.55 }}>
-            Quiet clock uses later(lastValidated, content activity). Flagging is review-only — validate or dismiss in Review; dormancy never auto-closes work.
-          </div>
-          {canManage && (
-            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
-              {dormancySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Dormancy saved</span>}
-              <ErrorNote>{dormancyError}</ErrorNote>
-              <Button disabled={dormancySaving} onClick={() => void saveDormancy()}>{dormancySaving ? 'Saving…' : 'Save dormancy'}</Button>
-            </div>
-          )}
-        </SettingsSection>
+          <SettingsDivider />
 
+          <SettingsSubBlock
+            title="Dormancy"
+            description="Opt-in quiet period for tasks, plans, and docs. A long stretch without validation or content change opens an advisory dormant review cause only."
+          >
+            <Field label="Quiet period" hint="off by default · presets use whole days">
+              <Select
+                aria-label="Dormancy quiet period"
+                value={dormancyPreset}
+                disabled={!canManage}
+                onChange={(event) => {
+                  setDormancyPreset(event.target.value);
+                  setDormancySaved(false);
+                }}
+              >
+                <option value="off">Off (default)</option>
+                {DORMANCY_PRESETS.map((preset) => (
+                  <option key={preset.seconds} value={String(preset.seconds)}>{preset.label}</option>
+                ))}
+                <option value="custom">Custom (days)…</option>
+              </Select>
+            </Field>
+            {dormancyPreset === 'custom' && (
+              <div style={{ marginTop: 12 }}>
+                <Field label="Custom quiet period (days)" hint={`allowed range ≈ ${Math.round(DORMANCY_QUIET_SECONDS_MIN / DAY_SECONDS)}–${Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)} days`}>
+                  <TextInput
+                    aria-label="Custom dormancy quiet period in days"
+                    type="number"
+                    min={1}
+                    max={Math.round(DORMANCY_QUIET_SECONDS_MAX / DAY_SECONDS)}
+                    value={dormancyCustomDays}
+                    disabled={!canManage}
+                    onChange={(event) => {
+                      setDormancyCustomDays(event.target.value);
+                      setDormancySaved(false);
+                    }}
+                  />
+                </Field>
+              </div>
+            )}
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', marginTop: 12, lineHeight: 1.55 }}>
+              Quiet clock uses later(lastValidated, content activity). Flagging is review-only — validate or dismiss in Review; dormancy never auto-closes work.
+            </div>
+            {canManage && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10, marginTop: 14 }}>
+                {dormancySaved && <span role="status" style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>Dormancy saved</span>}
+                <ErrorNote>{dormancyError}</ErrorNote>
+                <Button disabled={dormancySaving} onClick={() => void saveDormancy()}>{dormancySaving ? 'Saving…' : 'Save dormancy'}</Button>
+              </div>
+            )}
+          </SettingsSubBlock>
+        </SettingsSection>
+        </SettingsGroup>
+
+        <SettingsGroup label="Access">
         <SettingsSection title="Visibility" description="Control whether this project also has an unauthenticated, read-only public page.">
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, color: 'var(--text-soft)', cursor: canOwn ? 'pointer' : 'default' }}>
             <input aria-label="Public read-only page" type="checkbox" checked={isPublic} disabled={!canOwn} onChange={(event) => { setIsPublic(event.target.checked); setVisibilitySaved(false); }} style={{ width: 'auto', marginTop: 2 }} />
@@ -463,44 +513,45 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
           )}
           <ErrorNote>{accessError}</ErrorNote>
         </SettingsSection>
+        </SettingsGroup>
 
         {canOwn && (
-          <SettingsSection title="Archive" description="Hide this project from the default project list and navigation. Tasks, plans, and history stay intact — you can restore it later from Home.">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <Button variant="ghost" disabled={archiveWorking} onClick={async () => {
-                if (!(await confirm(`Archive “${project.name}”? It will leave the active project list until restored.`))) return;
-                setArchiveError(null);
-                setArchiveWorking(true);
-                try {
-                  await store.actions.archiveProject(project.id);
-                } catch (error) {
-                  setArchiveError(error instanceof Error ? error.message : 'Could not archive project.');
-                  setArchiveWorking(false);
-                }
-              }}>{archiveWorking ? 'Archiving…' : 'Archive project'}</Button>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>Recoverable — not a delete</span>
-            </div>
-            <ErrorNote>{archiveError}</ErrorNote>
-          </SettingsSection>
-        )}
-
-        {canOwn && (
-          <SettingsSection title="Danger zone" description="Deleting a project permanently removes its tasks, plans, milestones, tags, and history.">
-            <Field label={`Type “${project.name}” to confirm`}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <TextInput aria-label="Confirm project name" value={confirmName} onChange={(event) => setConfirmName(event.target.value)} placeholder={project.name} />
-                <Button variant="danger" disabled={confirmName !== project.name} onClick={async () => {
-                  setDeleteError(null);
+          <SettingsGroup label="Lifecycle">
+            <SettingsSection title="Archive" description="Hide this project from the default project list and navigation. Tasks, plans, and history stay intact — you can restore it later from Home.">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <Button variant="ghost" disabled={archiveWorking} onClick={async () => {
+                  if (!(await confirm(`Archive “${project.name}”? It will leave the active project list until restored.`))) return;
+                  setArchiveError(null);
+                  setArchiveWorking(true);
                   try {
-                    await store.actions.deleteProject(project.id);
+                    await store.actions.archiveProject(project.id);
                   } catch (error) {
-                    setDeleteError(error instanceof Error ? error.message : 'Could not delete project.');
+                    setArchiveError(error instanceof Error ? error.message : 'Could not archive project.');
+                    setArchiveWorking(false);
                   }
-                }}>Delete project</Button>
+                }}>{archiveWorking ? 'Archiving…' : 'Archive project'}</Button>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>Recoverable — not a delete</span>
               </div>
-            </Field>
-            <ErrorNote>{deleteError}</ErrorNote>
-          </SettingsSection>
+              <ErrorNote>{archiveError}</ErrorNote>
+            </SettingsSection>
+
+            <SettingsSection title="Danger zone" description="Deleting a project permanently removes its tasks, plans, milestones, tags, and history.">
+              <Field label={`Type “${project.name}” to confirm`}>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <TextInput aria-label="Confirm project name" value={confirmName} onChange={(event) => setConfirmName(event.target.value)} placeholder={project.name} />
+                  <Button variant="danger" disabled={confirmName !== project.name} onClick={async () => {
+                    setDeleteError(null);
+                    try {
+                      await store.actions.deleteProject(project.id);
+                    } catch (error) {
+                      setDeleteError(error instanceof Error ? error.message : 'Could not delete project.');
+                    }
+                  }}>Delete project</Button>
+                </div>
+              </Field>
+              <ErrorNote>{deleteError}</ErrorNote>
+            </SettingsSection>
+          </SettingsGroup>
         )}
       </div>
     </div>
