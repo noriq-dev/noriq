@@ -221,28 +221,93 @@ export function ValidityStrip({
         </span>
       </div>
 
-      {!loading && <div style={{ fontSize: 12, marginBottom: 8 }}>
-        <div>Project policy: {freshness?.assessment?.projectPolicy ?? 'legacy'}</div>
-        {subjectType === 'task' && freshness?.assessment?.readiness.state === 'missing' && <div>Unverified backlog</div>}
-        {freshness?.assessment?.directionMarkers?.map(m=><div key={m.id}>Recheck before reclaiming: {m.reason}</div>)}
-        <div>{subjectType === 'task' ? 'Readiness' : 'Document evidence'}: {freshness?.assessment?.readiness.state ?? 'missing'}
-          {lastValidatedAt && !freshness?.assessment?.readiness.record ? ' — legacy attestation only' : ''}</div>
-        {subjectType === 'task' && <div>Implementation: {freshness?.assessment?.implementation.state ?? 'missing'}</div>}
-        {[freshness?.assessment?.readiness.record, freshness?.assessment?.implementation.record].filter(Boolean).map(record => <details key={record!.id}>
-          <summary>{record!.purpose} · {record!.actorName} · {new Date(record!.createdAt).toLocaleString()} · actor reported</summary>
-          <p>{record!.summary}</p><p>{record!.repositoryKey} {record!.branch} {record!.baseId}</p>
-          <ul>{record!.evidence.map((item, i) => <li key={i}>{item.kind}: {item.reference} — {item.result}</li>)}</ul>
-        </details>)}
-      </div>}
-      {freshness?.assessment?.overrides?.map(o => <div key={o.id} role="status" style={{ fontSize: 12, marginBottom: 8 }}>
-        {o.scope} exception by {o.actorName} until {new Date(o.expiresAt).toLocaleString()}: {o.reason}
-      </div>)}
-      {overriding && <ReadinessOverrideForm projectId={projectId} subjectId={subjectId} onCancel={() => setOverriding(false)}
-        onSaved={async () => { setOverriding(false); await load(); }} />}
-          <Button variant="ghost" onClick={() => setHistoryOpen(v => !v)}>Evidence history</Button>
+      {!loading && (
+        <div style={{
+          display: 'grid', gap: 6, marginBottom: 10, padding: '8px 10px',
+          borderRadius: 8, background: 'var(--w-03)', border: '1px solid var(--w-06)',
+          fontSize: 11.5, color: 'var(--text-mid)', lineHeight: 1.45,
+        }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, letterSpacing: '.05em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
+              Policy
+            </span>
+            <span>{freshness?.assessment?.projectPolicy ?? 'legacy'}</span>
+            {subjectType === 'task' && freshness?.assessment?.readiness.state === 'missing' && (
+              <MonoTag color="var(--text-dim)" bg="var(--w-06)" size={8}>UNVERIFIED BACKLOG</MonoTag>
+            )}
+          </div>
+          {freshness?.assessment?.directionMarkers?.map((marker) => (
+            <div key={marker.id} style={{ color: 'var(--amber)' }}>
+              Recheck before reclaiming: {marker.reason}
+            </div>
+          ))}
+          <div>
+            {subjectType === 'task' ? 'Readiness' : 'Document evidence'}:{' '}
+            <b style={{ color: 'var(--text-soft)', fontWeight: 500 }}>{freshness?.assessment?.readiness.state ?? 'missing'}</b>
+            {lastValidatedAt && !freshness?.assessment?.readiness.record ? ' — legacy attestation only' : ''}
+          </div>
+          {subjectType === 'task' && (
+            <div>
+              Implementation:{' '}
+              <b style={{ color: 'var(--text-soft)', fontWeight: 500 }}>{freshness?.assessment?.implementation.state ?? 'missing'}</b>
+            </div>
+          )}
+          {[freshness?.assessment?.readiness.record, freshness?.assessment?.implementation.record].filter(Boolean).map((record) => (
+            <details key={record!.id} style={{ marginTop: 2 }}>
+              <summary style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-soft)' }}>
+                {record!.purpose} · {record!.actorName} · {new Date(record!.createdAt).toLocaleString()} · actor reported
+              </summary>
+              <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+                <p style={{ margin: 0 }}>{record!.summary}</p>
+                <p style={{ margin: 0, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+                  {[record!.repositoryKey, record!.branch, record!.baseId].filter(Boolean).join(' ')}
+                </p>
+                <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                  {record!.evidence.map((item, index) => (
+                    <li key={index}>{item.kind}: {item.reference} — {item.result}</li>
+                  ))}
+                </ul>
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
+      {freshness?.assessment?.overrides?.map((override) => (
+        <div
+          key={override.id}
+          role="status"
+          style={{
+            fontSize: 11.5, marginBottom: 8, padding: '7px 10px', borderRadius: 8,
+            border: '1px solid rgba(245,166,35,.25)', background: 'rgba(245,166,35,.07)',
+            color: 'var(--text-mid)', lineHeight: 1.45,
+          }}
+        >
+          {override.scope} exception by {override.actorName} until {new Date(override.expiresAt).toLocaleString()}: {override.reason}
+        </div>
+      ))}
+      {overriding && (
+        <ReadinessOverrideForm
+          projectId={projectId}
+          subjectId={subjectId}
+          onCancel={() => setOverriding(false)}
+          onSaved={async () => { setOverriding(false); await load(); }}
+        />
+      )}
+      <div style={{ marginBottom: historyOpen || assessing ? 0 : 8 }}>
+        <Button variant="ghost" style={{ padding: '4px 10px', fontSize: 11 }} onClick={() => setHistoryOpen((value) => !value)}>
+          {historyOpen ? 'Hide evidence history' : 'Evidence history'}
+        </Button>
+      </div>
       {historyOpen && <AssessmentHistory projectId={projectId} subjectType={subjectType} subjectId={subjectId} />}
-      {assessing && <AssessmentForm projectId={projectId} subjectType={subjectType} subjectId={subjectId}
-        onCancel={() => setAssessing(false)} onSaved={async () => { setAssessing(false); await load(); }} />}
+      {assessing && (
+        <AssessmentForm
+          projectId={projectId}
+          subjectType={subjectType}
+          subjectId={subjectId}
+          onCancel={() => setAssessing(false)}
+          onSaved={async () => { setAssessing(false); await load(); }}
+        />
+      )}
       {error && (
         <div style={{ color: 'var(--red-soft)', fontSize: 11.5, marginBottom: 8 }}>{error}</div>
       )}
