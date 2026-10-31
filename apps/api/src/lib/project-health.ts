@@ -24,6 +24,8 @@ export async function projectHealth(db: D1Database, projectId: string, offset = 
       readiness: freshness.assessment?.readiness.state ?? 'missing',
       implementation: freshness.assessment?.implementation.state ?? 'missing',
       evidenceRequired: freshness.assessment?.required ?? false,
+      projectPolicy: freshness.assessment?.projectPolicy ?? 'legacy',
+      directionMarkers: freshness.assessment?.directionMarkers ?? [],
       checkedAt: freshness.assessment?.readiness.record?.createdAt ?? null,
       checkedRevision: freshness.assessment?.readiness.record?.baseId ?? null,
       causes: freshness.causes, blockingCauses: freshness.blockingCauses ?? freshness.criticalCauses,

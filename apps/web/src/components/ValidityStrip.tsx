@@ -18,6 +18,7 @@ import { Button } from './ui';
 import { openReviewValidityTab } from './ReviewInboxChrome';
 
 export const VALIDITY_CAUSES: Array<{ id: ApiReviewCause; label: string; detail: string; color: string }> = [
+  { id: 'direction_changed', label: 'Recheck before reclaiming', detail: 'Reconcile explicit direction changes with current task intent', color: 'var(--red-soft)' },
   { id: 'readiness_required', label: 'Readiness evidence required', detail: 'Recheck this task against its current phase and repository context', color: 'var(--red-soft)' },
   { id: 'assessment_failed', label: 'Readiness check failed', detail: 'Resolve the failed assessment or record an explicit exception', color: 'var(--red-soft)' },
   { id: 'content_changed', label: 'Content changed', detail: 'Fingerprint moved past last validation', color: 'var(--red-soft)' },
@@ -221,6 +222,9 @@ export function ValidityStrip({
       </div>
 
       {!loading && <div style={{ fontSize: 12, marginBottom: 8 }}>
+        <div>Project policy: {freshness?.assessment?.projectPolicy ?? 'legacy'}</div>
+        {subjectType === 'task' && freshness?.assessment?.readiness.state === 'missing' && <div>Unverified backlog</div>}
+        {freshness?.assessment?.directionMarkers?.map(m=><div key={m.id}>Recheck before reclaiming: {m.reason}</div>)}
         <div>{subjectType === 'task' ? 'Readiness' : 'Document evidence'}: {freshness?.assessment?.readiness.state ?? 'missing'}
           {lastValidatedAt && !freshness?.assessment?.readiness.record ? ' — legacy attestation only' : ''}</div>
         {subjectType === 'task' && <div>Implementation: {freshness?.assessment?.implementation.state ?? 'missing'}</div>}

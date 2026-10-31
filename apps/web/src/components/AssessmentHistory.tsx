@@ -14,7 +14,7 @@ export function AssessmentHistory({ projectId, subjectType, subjectId }: { proje
   if (!data) return <p role="status">Loading evidence history…</p>;
   return <section><h4>Recent evidence and exceptions</h4><p>Up to {data.limit} of each, newest first. Actor-reported evidence; historical records do not establish current validity.</p>
     {!data.assessments.length && <p>No structured assessments recorded.</p>}
-    {data.assessments.map(r => <details key={r.id}><summary>{r.purpose} · {r.outcome} · {r.actorName} · {new Date(r.createdAt).toLocaleString()}</summary><p>{r.summary}</p><p>{r.scope} · {r.repositoryKey} {r.branch} {r.baseId}</p>{r.evidence.map((e, i) => <p key={i}>{e.kind}: {e.reference} — {e.result}</p>)}</details>)}
+    {data.assessments.map(r => <details key={r.id}><summary>{r.purpose} · {r.outcome} · {r.actorName} · {new Date(r.createdAt).toLocaleString()}</summary><p>{r.summary}</p>{r.reconciliation && <p>Reconciled direction: {r.reconciliation.directionIds.join(", ")} — {r.reconciliation.summary}</p>}<p>{r.scope} · {r.repositoryKey} {r.branch} {r.baseId}</p>{r.evidence.map((e, i) => <p key={i}>{e.kind}: {e.reference} — {e.result}</p>)}</details>)}
     {data.overrides.map(r => <p key={r.id}>Recorded {r.scope} exception · {r.actorName} · {r.reason} · expires {new Date(r.expiresAt).toLocaleString()}. Applies only while its recorded context matches.</p>)}
   </section>;
 }

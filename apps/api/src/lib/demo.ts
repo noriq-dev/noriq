@@ -85,9 +85,9 @@ export async function resetDemo(env: Env): Promise<void> {
       ] },
     ],
   });
-  // Simulated historical completion, explicitly excepted rather than invented test evidence.
+  // Demo-only simulated history uses legacy plan policy; do not invent evidence or human exceptions.
+  await env.DB.prepare('UPDATE plans SET readiness_required = 0 WHERE id = ?').bind(plan.id).run();
   for (const tid of plan.phases[0]!.taskIds) {
-    await r.recordReadinessOverride(DEMO_PROJECT_ID, sys, { subjectId: tid, scope: 'implementation', durationSeconds: 60, reason: 'Demo seed: simulated historical completion for the showcase, not verified implementation.' });
     await r.updateTask(DEMO_PROJECT_ID, sys, tid, { status: 'done' });
   }
 

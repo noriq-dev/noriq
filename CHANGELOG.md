@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.81.0 - 2026-10-31
+
+### Enforceable project validation (PLNR-620)
+
+- Opt projects into strict validation in Project Settings, with a human contributor reason and audit event. Existing and new projects default to legacy; independent plan requirements remain enforced.
+- Strict activation and explicit changed-direction markers release agent claims and task locks, preserve history, and tell holders to stop, reassess and reclaim. Readiness gates cover standalone tasks, renewals, status transitions, queue selection and Project health.
+- Require separate readiness and implementation evidence, preserving starting versus resulting revisions. Agents use claim/release; only human contributors grant scoped, expiring exceptions.
+- Mark changed direction on comments or task-linked input answers; reconcile marker IDs and current intent with passing readiness evidence. Informational comments and comment resolution do not clear direction gates.
+- Require passing assessments for agent-authored settled docs and substantive updates in strict projects. Commit immutable document versions and evidence atomically; plan working drafts remain available.
+- Expose policy and direction remediation in context, settings, task and Review surfaces. MCP catalog revision 7 includes update assessments and direction markers; both discovery protocols are tested against their actual tool schemas.
+
+**Upgrade:** apply additive migration `0125_project_validation_policy.sql`, then deploy the application. This release does not enable strict policy or backfill evidence for any project. Old agent-authored exceptions no longer authorize work. Follow [the rollout checklist](apps/api/VALIDATION-ROLLOUT.md), verify the connected host catalog, then enable NOD and Noriq through the human settings control. Evidence remains actor-reported; Noriq does not independently establish that a cited test proves its claim.
+
 ## 0.80.1 - 2026-10-30
 
 ### Theme Appearance popup (PLNR-618)

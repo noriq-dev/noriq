@@ -47,6 +47,9 @@ async function makePlan(title: string) {
 }
 
 async function completeTask(taskId: string) {
+  const readiness = await mcpCall(conn.apiKey, 'record_validation', {projectId:pid,subjectType:'task',subjectId:taskId,
+    assessment:{purpose:'readiness',outcome:'passed',scope:'non_code',summary:'Synthetic coordination fixture has current plan intent.',evidence:[{kind:'inspection',reference:'test/plan-landing.test.ts',result:'Fixture inspected before its simulated transition.'}]}});
+  expect(readiness.isError).toBe(false);
   const recorded = await mcpCall(conn.apiKey, 'record_validation', { projectId: pid, subjectType: 'task', subjectId: taskId,
     assessment: { purpose: 'implementation', outcome: 'passed', scope: 'non_code', summary: 'Synthetic landing scenario is ready for the completion transition.',
       evidence: [{ kind: 'inspection', reference: 'test/plan-landing.test.ts', result: 'Fixture prepared for the plan completion assertion.' }] } });
@@ -103,7 +106,7 @@ describe('plan completion is recorded (RUN-28)', () => {
     const t = await env.DB.prepare(
       `SELECT pt.task_id AS id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
     ).bind(planId).first<{ id: string }>();
-    await completeTask(t!.id);
+    await expect(completeTask(t!.id)).rejects.toThrow(/approval required/);
     expect(await landing(planId)).toBeNull();
   });
 });

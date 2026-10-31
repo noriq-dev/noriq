@@ -1,4 +1,4 @@
-import { ReadinessOverrideInput, AssessmentInput, ValidationSubjectType as ValidationSubjectSchema, ValidationBaselines as ValidationBaselinesSchema } from '@noriq-dev/shared';
+import { ValidationPolicyInput, DirectionMarkerInput, ReadinessOverrideInput, AssessmentInput, ValidationSubjectType as ValidationSubjectSchema, ValidationBaselines as ValidationBaselinesSchema } from '@noriq-dev/shared';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { cors } from 'hono/cors';
@@ -869,7 +869,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
   queryCount += 1;
   const project = await c.env.DB.prepare(
     `SELECT p.id, p.key, p.name, p.description, p.claim_ttl_seconds AS claimTtlSeconds,
-            p.lock_ttl_seconds AS lockTtlSeconds, p.file_locking_enabled AS fileLockingEnabled,
+            p.validation_policy AS validationPolicy, p.lock_ttl_seconds AS lockTtlSeconds, p.file_locking_enabled AS fileLockingEnabled,
             p.dormancy_quiet_seconds AS dormancyQuietSeconds,
             p.inbox_include_never_validated AS inboxIncludeNeverValidated, p.repo_url AS repoUrl,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'review' AND t.archived_at IS NULL) AS reviewTasks,
@@ -1029,7 +1029,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
   await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
   const [project, tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
-    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, dormancy_quiet_seconds AS dormancyQuietSeconds, inbox_include_never_validated AS inboxIncludeNeverValidated, repo_url AS repoUrl FROM projects WHERE id = ?')
+    c.env.DB.prepare('SELECT id, key, name, description, validation_policy AS validationPolicy, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, dormancy_quiet_seconds AS dormancyQuietSeconds, inbox_include_never_validated AS inboxIncludeNeverValidated, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
     // display* concern — filtering it out here silently drained every derived aggregate
@@ -1349,10 +1349,10 @@ app.post('/api/projects/:pid/messages', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks/:tid/comments', userAuth, async (c) => {
-  const { kind, body, parentCommentId } = await c.req.json<{ kind?: string; body: string; parentCommentId?: string }>();
+  const { kind, body, parentCommentId, directionReason } = await c.req.json<{ kind?: string; body: string; parentCommentId?: string; directionReason?: string }>();
   if (!body) return c.json({ error: 'body required' }, 400);
   const k = ['comment', 'question', 'instruction', 'reply'].includes(kind ?? '') ? (kind as never) : 'comment';
-  const result = await room(c.env, c.req.param('pid')!).postComment(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, k, body, parentCommentId);
+  const result = await room(c.env, c.req.param('pid')!).postComment(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, k, body, parentCommentId, directionReason);
   return c.json(result);
 });
 
@@ -1387,13 +1387,14 @@ app.delete('/api/projects/:pid/tasks/:tid/dependencies/:depId', userAuth, async 
 // PLNR-185: `answers` is the structured per-question form ([{question, answer}], answer =
 // string | string[] | number | boolean); `response` stays the plain-text form. Either works.
 app.post('/api/projects/:pid/signals/:sid/answer', userAuth, async (c) => {
-  const { response, answers } = await c.req.json<{
+  const { response, answers, directionReason } = await c.req.json<{
     response?: string;
+    directionReason?: string;
     answers?: Array<{ question: string; answer: string | string[] | number | boolean }>;
   }>();
   if (!response?.trim() && !answers?.length) return c.json({ error: 'response or answers required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).answerSignal(
-    c.req.param('pid')!, humanActor(c), c.req.param('sid')!, response?.trim() ?? '', answers,
+    c.req.param('pid')!, humanActor(c), c.req.param('sid')!, response?.trim() ?? '', answers, directionReason,
   );
   return c.json(result);
 });
@@ -1549,6 +1550,19 @@ app.get('/api/projects/:pid/validations/:subjectType/:subjectId', userAuth, asyn
     ...await (await import('./lib/entity-assessments')).assessmentHistory(c.env.DB, pid, subjectType, subjectId, limit),
     freshness: await (await import('./lib/entity-validation-store')).subjectFreshness(c.env.DB, pid, subjectType, subjectId),
   });
+});
+app.get('/api/projects/:pid/validation-policy', userAuth, async (c) => {
+  return c.json(await (await import('./lib/validation-policy')).projectValidationPolicy(c.env.DB, c.req.param('pid')!));
+});
+app.post('/api/projects/:pid/validation-policy', userAuth, async (c) => {
+  const parsed = ValidationPolicyInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({error:'Invalid policy', detail:parsed.error.issues},400);
+  return c.json(await room(c.env,c.req.param('pid')!).setValidationPolicy(c.req.param('pid')!,humanActor(c),parsed.data));
+});
+app.post('/api/projects/:pid/direction-markers', userAuth, async (c) => {
+  const parsed = DirectionMarkerInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({error:'Invalid direction marker', detail:parsed.error.issues},400);
+  return c.json(await room(c.env,c.req.param('pid')!).markChangedDirection(c.req.param('pid')!,humanActor(c),parsed.data));
 });
 app.post('/api/projects/:pid/readiness-overrides', userAuth, async (c) => {
   const parsed = ReadinessOverrideInput.safeParse(await c.req.json());

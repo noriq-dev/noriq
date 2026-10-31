@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { DirectionMarkerAction } from './DirectionMarkerAction';
 import { api } from '../api';
 import { KIND_META } from '../design';
 import { mapTaskComment, type AppStore } from '../store';
@@ -65,9 +66,9 @@ export function CollapsibleMarkdown({ source, lines = 8, compact }: { source: st
 }
 
 function CommentCard({
-  c, store, pid, compactBody, canResolve,
+  c, store, pid, taskId, compactBody, canResolve,
 }: {
-  c: CommentVM; store: AppStore; pid: string; compactBody: boolean; canResolve: boolean;
+  c: CommentVM; store: AppStore; pid: string; taskId:string; compactBody: boolean; canResolve: boolean;
 }) {
   const kind = KIND_META[c.kind] ?? KIND_META.comment;
   const statusColor =
@@ -94,6 +95,7 @@ function CommentCard({
             </button>
           )}
         </div>
+        {store.permissions.canContribute && <DirectionMarkerAction projectId={pid} taskId={taskId} sourceType="comment" sourceId={c.id} />}
         <div
           style={{
             fontSize: 12.5, lineHeight: 1.55, color: 'var(--text-soft)',
@@ -180,11 +182,11 @@ export function DrawerComments({
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 18 }}>
           {nest(needsYou).map(({ parent, replies }) => (
             <div key={parent.id}>
-              <CommentCard c={parent} store={store} pid={pid} compactBody={false} canResolve />
+              <CommentCard taskId={task.id} c={parent} store={store} pid={pid} compactBody={false} canResolve />
               {replies.length > 0 && (
                 <div style={{ marginLeft: 36, marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
                   {replies.map((r) => (
-                    <CommentCard key={r.id} c={r} store={store} pid={pid} compactBody={false} canResolve={false} />
+                    <CommentCard taskId={task.id} key={r.id} c={r} store={store} pid={pid} compactBody={false} canResolve={false} />
                   ))}
                 </div>
               )}
@@ -201,10 +203,10 @@ export function DrawerComments({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {nest(discussion).map(({ parent, replies }) => (
               <div key={parent.id}>
-                <CommentCard c={parent} store={store} pid={pid} compactBody canResolve={false} />
+                <CommentCard taskId={task.id} c={parent} store={store} pid={pid} compactBody canResolve={false} />
                 {replies.map((r) => (
                   <div key={r.id} style={{ marginLeft: 36, marginTop: 8 }}>
-                    <CommentCard c={r} store={store} pid={pid} compactBody canResolve={false} />
+                    <CommentCard taskId={task.id} c={r} store={store} pid={pid} compactBody canResolve={false} />
                   </div>
                 ))}
               </div>
@@ -220,7 +222,7 @@ export function DrawerComments({
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 10 }}>
             {activityNewest.map((c) => (
-              <CommentCard key={c.id} c={c} store={store} pid={pid} compactBody canResolve={false} />
+              <CommentCard taskId={task.id} key={c.id} c={c} store={store} pid={pid} compactBody canResolve={false} />
             ))}
           </div>
         </div>

@@ -6,6 +6,7 @@ import { DORMANCY_QUIET_SECONDS_MAX, DORMANCY_QUIET_SECONDS_MIN } from '@noriq-d
 import { api, type ApiUser } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
+import { ValidationPolicySettings } from './ValidationPolicySettings';
 import { confirm } from './Dialog';
 import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 
@@ -252,6 +253,7 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
           </PermissionNote>
         )}
 
+        <ValidationPolicySettings key={project.id} projectId={project.id} canContribute={store.permissions.canContribute} />
         <SettingsSection title="General" description="Identity, organization, and the claim lifetime used by agents working in this project.">
           <div className="project-settings-fields">
             <Field label="Name">

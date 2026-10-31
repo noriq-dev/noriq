@@ -1,5 +1,5 @@
 import { filterFreshTasks } from './lib/readiness-queue';
-import { AssessmentInput, ReadinessOverrideInput } from '@noriq-dev/shared';
+import { DirectionMarkerInput, AssessmentInput, ReadinessOverrideInput } from '@noriq-dev/shared';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from './env';
@@ -169,7 +169,7 @@ from 1, matching the Plans view (\`get_plans\` reports \`order: 1\` for the firs
 use dependsOn only for real, hand-picked orderings. A dependency may cross projects: ids and display
 keys are globally unique, so dependsOn/update_tasks.addDependsOn accept a blocker from any project
 you can access, and the claim gate works identically across the boundary.
-Human approval accepts plan direction, not task readiness. Attach assessment evidence when creating tasks/docs or call record_validation with assessment: purpose readiness before work, implementation at completion, document for doc claims. Include outcome, scoped summary, evidence references/results and repositoryKey/branch/baseId for repository work. Non-code assessments explain their scope. Old validation records are attestations, not verified evidence. Later phases need new task assessments after earlier work. Snooze/dismiss only hide reminders; they do not override claim blockers. New plans require task evidence; existing plans keep legacy rollout policy until update_plan {requireTaskEvidence:true} enables the new gates. Before a later phase starts, recheck every task after its predecessors settle. Use record_readiness_override for an explicit exception with scope, reason and expiry (max one day); it cannot approve a plan or bypass unfinished dependencies. Completion of evidence-required tasks needs a current implementation assessment, separate from readiness.
+Strict project policy requires current passing readiness before claiming any task, including standalone and existing plan tasks, plus separate implementation evidence before completion. Legacy projects retain independently required plan evidence. Unverified backlog creation is allowed. Human plan approval establishes direction, not task readiness. Record actor-reported evidence using record_validation or creation/update assessment inputs: purpose, outcome, scope, summary, evidence references/results, and repositoryKey/branch/baseId for repository work. Claim with starting revision coordinates; implementation evidence uses the resulting revision. Never invent retrospective pre-start checks. Agents must claim/release instead of directly entering work states. Only human contributors may change policy or grant scoped, expiring exceptions; ask them in the task UI. Exceptions cannot approve plans, bypass dependencies or steal ownership. mark_changed_direction (or post_comment directionReason) releases claims and task locks; stop implementation until task intent is reconciled with every unresolved marker ID in passing readiness evidence and you reclaim. Resolving or snoozing comments does not reconcile direction. Strict agent-authored settled docs and substantive update_doc writes require passing document assessments bound to the resulting version; plan working drafts remain unrestricted. Noriq checks recorded context and workflow compliance, not whether cited tests actually prove their claims. If validation tools or assessment inputs are absent, refresh/reconnect the MCP catalog; do not bypass gates.
 Priority runs 0 = MOST urgent to 4 = someday, as P0/P1 read everywhere else: P0 means drop
 everything, 2 is the default "normal". The number goes DOWN as urgency goes UP, so filing
 real work as P4 buries it.
@@ -266,7 +266,7 @@ export const GET_BRIEFING_PLAYBOOK: readonly string[] = [
   'After blocking request_input, do not wait or repeat the question in chat: the task is parked, so call next_claimable and keep working elsewhere. With blocking:false, keep the current claim and continue independent work while the answer is pending.',
   'get_task returns unresolved comments in full plus a short recent tail; list_comments pages older notes (status/authorKind/before). post_comment is a delta the next reader needs — what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Do not rewrite the whole task body as a changelog; keep a short current-checkpoint section and update that.',
   'Plan phases are numbered from 1, matching the Plans view. get_plans reports `order: 1` for the first phase, never 0 — a user who says "start phase 3" means order 3, not the fourth phase.',
-  'Human approval accepts plan direction, not task readiness. Attach assessment evidence when creating tasks/docs or call record_validation with assessment: purpose readiness before work, implementation at completion, document for doc claims. Include outcome, scoped summary, evidence references/results and repositoryKey/branch/baseId for repository work. Non-code assessments explain their scope. Old validation records are attestations, not verified evidence. Later phases need new task assessments after earlier work. Snooze/dismiss only hide reminders; they do not override claim blockers. New plans require task evidence; existing plans keep legacy rollout policy until update_plan {requireTaskEvidence:true} enables the new gates. Before a later phase starts, recheck every task after its predecessors settle. Use record_readiness_override for an explicit exception with scope, reason and expiry (max one day); it cannot approve a plan or bypass unfinished dependencies. Completion of evidence-required tasks needs a current implementation assessment, separate from readiness.',
+  'Strict project policy requires current passing readiness before claiming any task, including standalone and existing plan tasks, plus separate implementation evidence before completion. Legacy projects retain independently required plan evidence. Unverified backlog creation is allowed. Human plan approval establishes direction, not task readiness. Record actor-reported evidence using record_validation or creation/update assessment inputs: purpose, outcome, scope, summary, evidence references/results, and repositoryKey/branch/baseId for repository work. Claim with starting revision coordinates; implementation evidence uses the resulting revision. Never invent retrospective pre-start checks. Agents must claim/release instead of directly entering work states. Only human contributors may change policy or grant scoped, expiring exceptions; ask them in the task UI. Exceptions cannot approve plans, bypass dependencies or steal ownership. mark_changed_direction (or post_comment directionReason) releases claims and task locks; stop implementation until task intent is reconciled with every unresolved marker ID in passing readiness evidence and you reclaim. Resolving or snoozing comments does not reconcile direction. Strict agent-authored settled docs and substantive update_doc writes require passing document assessments bound to the resulting version; plan working drafts remain unrestricted. Noriq checks recorded context and workflow compliance, not whether cited tests actually prove their claims. If validation tools or assessment inputs are absent, refresh/reconnect the MCP catalog; do not bypass gates.',
   'Entity validity loop: after you change a task body/executionSpec, plan body/phases, or doc content, call `record_validation` once you have re-confirmed the subject still holds — comments/title/tags do not renew lastValidatedAt. Critical freshness causes (`content_changed`, `doc_baseline_moved`) hard-block `claim_task` until re-validated (or the underlying condition clears). Pass your current opaque `baseId` (and `repositoryKey`/`branch` when known) on `get_freshness` and `get_task_context` so `code_assessment_stale` can be derived from agent-declared assessments; `claim_task` accepts the same optionally and evaluates readiness against that revision; mismatched evidence blocks evidence-required tasks. `get_plans` and `get_doc` embed the same freshness/supersession block as `get_task` — no follow-up `get_freshness` needed for those subjects.',
 ];
 
@@ -420,7 +420,7 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   create_plan: WRITE, create_plan_doc: WRITE, create_milestone: WRITE,
   list_boards: READ, create_board: WRITE, rename_board: WRITE_IDEMPOTENT, delete_board: WRITE_DESTRUCTIVE,
   record_memory: WRITE,
-  create_orchestration: WRITE, record_validation: WRITE, record_readiness_override: WRITE,
+  create_orchestration: WRITE, mark_changed_direction: WRITE, record_validation: WRITE, record_readiness_override: WRITE,
 
   // Both operations discard relationships or vocabulary that cannot be reconstructed from the
   // result alone. Their descriptions explain the exact loss, so clients can confirm appropriately.
@@ -437,7 +437,7 @@ export const MCP_TOOL_AUDIENCE: Record<string, ToolAudience> = {
   release_lock: 'core', check_locks: 'core', list_locks: 'core', post_comment: 'core', acknowledge_comment: 'core',
   resolve_comment: 'core', send_message: 'core', request_input: 'core', raise_alert: 'core', get_plans: 'core',
   get_plan_doc: 'core', record_memory: 'core', search_project_memory: 'core', explain_project_area: 'core', get_task_context: 'core',
-  record_validation: 'core', record_readiness_override: 'core', get_validation: 'core', get_freshness: 'core', set_review_cause: 'core',
+  mark_changed_direction: 'core', record_validation: 'core', record_readiness_override: 'core', get_validation: 'core', get_freshness: 'core', set_review_cause: 'core',
   list_review_inbox: 'core', set_plan_doc_pins: 'core', set_supersedes: 'core', get_supersession: 'core',
   save_template: 'planning', list_templates: 'planning', create_doc: 'planning', update_doc: 'planning',
   create_plan: 'planning', update_plan: 'planning', create_plan_doc: 'planning', update_plan_doc: 'planning', create_milestone: 'planning',
@@ -477,7 +477,7 @@ export const SERVER_INFO = {
   description:
     'AI-native project management — MCP coordination for agents, mission control for humans. Call get_briefing first; claim before work; boardId is required on create_tasks (the UI All board is virtual and not a boardId).',
   websiteUrl: 'https://plan.frs.llc',
-  catalogRevision: 6,
+  catalogRevision: 7,
 };
 
 /** Discovery metadata for the deployed catalogue. */
@@ -1078,7 +1078,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Record a SETTLED decision or established fact as a project doc (markdown). FIRST doc of your session? Read the authoring guide first — resources/read noriq://skill/doc-authoring (or GET /skill/docs.md) — it covers what belongs in a doc, the shapes that work, and placement. The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". An undecided point is never encoded as fact: settle it (request_input) if it blocks the doc\'s central claim, or scope the doc to exclude it and ship what IS settled. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_tasks/update_tasks docIds. For revising an existing doc use update_doc.',
     {
       projectId: z.string(),
-      assessment: AssessmentInput.optional(),
+      assessment: AssessmentInput.optional().describe('Passing document evidence required for agent-authored substantive writes in strict projects; bound atomically to the resulting version'),
       name: z.string().min(1).max(120).describe('Doc title, 1-120 chars — the name agents scan in list_docs'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown'),
@@ -1097,6 +1097,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). Every effective update appends an immutable version while only the current version remains searchable. Archived docs are read-only until a human restores them. A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended — for a substantial rewrite, read the authoring guide first (resources/read noriq://skill/doc-authoring).',
     {
       projectId: z.string(),
+      assessment: AssessmentInput.optional().describe('Passing document evidence required for agent-authored substantive writes in strict projects; bound atomically to the resulting version'),
       docId: z.string(),
       name: z.string().min(1).max(120).optional().describe('New doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
@@ -1107,10 +1108,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       removeTags: z.array(z.string()).optional().describe('Remove these tags, keeping the rest'),
       allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
-    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags, allowNewTags }) => {
+    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags, allowNewTags, assessment }) => {
       validateTagNames(tags);
       validateTagNames(addTags);
-      return room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags, allowNewTags });
+      return room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags, allowNewTags, assessment });
     }),
   );
 
@@ -1131,7 +1132,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt, description FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
-        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking, dormancy_quiet_seconds AS dormancyQuietSeconds, inbox_include_never_validated AS inboxIncludeNeverValidated FROM projects WHERE id = ?')
+        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, validation_policy AS validationPolicy, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking, dormancy_quiet_seconds AS dormancyQuietSeconds, inbox_include_never_validated AS inboxIncludeNeverValidated FROM projects WHERE id = ?')
           .bind(projectId).first<Record<string, unknown>>(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name, description, current_version AS version, updated_at AS updatedAt FROM docs WHERE project_id = ? AND archived_at IS NULL ORDER BY updated_at DESC').bind(projectId).all(),
@@ -1777,7 +1778,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       repositoryKey: z.string().optional()
         .describe('Canonical repository key for revision-scoped readiness at claim time'),
       branch: z.string().optional()
-        .describe('Your current branch — scopes advisory assessment freshness at claim time'),
+        .describe('Your current branch; required with repositoryKey and baseId when repository readiness evidence is enforced'),
       baseId: z.string().optional()
         .describe('Your current opaque VCS revision — when present and differing from a stored assessment baseId, readiness is evaluated against that revision; stale evidence blocks evidence-required tasks'),
     },
@@ -1961,16 +1962,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'post_comment',
-    'Post your own non-blocking comment or reply to an existing task thread. A progress note is a delta: what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Use request_input for a human decision.',
+    'Post your own non-blocking comment or reply to an existing task thread. A progress note is a delta: what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Use request_input for a human decision. Set directionReason only for explicit changed intent: it revokes the claim and task locks until readiness reconciliation and reclaim.',
     {
       projectId: z.string(),
       taskId: z.string().describe('Task id or display key'),
       kind: z.enum(['comment', 'reply']).default('comment').describe('comment = new thread; reply = answer inside the thread given by parentCommentId'),
       body: z.string().min(1).max(COMMENT_BODY_MAX).describe('Comment text, markdown; a delta, not a dumped report (max 4000)'),
       parentCommentId: z.string().optional(),
+      directionReason: DirectionMarkerInput.shape.reason.optional().describe('Explicit changed direction: releases ownership and requires reconciliation before reclaim'),
     },
-    tool(async ({ projectId, taskId, kind, body, parentCommentId }) =>
-      room(env, projectId).postComment(projectId, actor, await resolveTaskId(env, projectId, taskId), kind, body, parentCommentId),
+    tool(async ({ projectId, taskId, kind, body, parentCommentId, directionReason }) =>
+      room(env, projectId).postComment(projectId, actor, await resolveTaskId(env, projectId, taskId), kind, body, parentCommentId, directionReason),
     ),
   );
 
@@ -2353,15 +2355,22 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   // ---- entity validation / decay (PLNR-576..580) ---------------------------
 
   defineTool(
+    'mark_changed_direction',
+    'Mark changed task intent in an existing comment or answered task-linked input. Releases ownership and task locks: stop implementation until current readiness reconciles all marker IDs and the task is reclaimed. Resolving the comment does not reconcile direction.',
+    {projectId:z.string(), ...DirectionMarkerInput.shape},
+    tool(async ({projectId,...input}) => room(env,projectId).markChangedDirection(projectId,actor,{...input,taskId:await resolveTaskId(env,projectId,input.taskId)})),
+  );
+
+  defineTool(
     'record_readiness_override',
-    'Explicit, audited exception for task readiness or implementation evidence. Requires a reason and expires within one day. Bound to current content, dependency/phase context and latest assessments; subsequent changes invalidate it. This does not approve a proposed plan or bypass dependencies. Snoozing is not an override.',
+    'Human-only, audited exception for readiness or implementation evidence. Agent calls are rejected; request an exception from a human contributor through the task or Review UI. Requires a reason and expires within one day. Bound to current content, dependency/phase context and latest assessments; subsequent changes invalidate it. This does not approve a proposed plan or bypass dependencies. Snoozing is not an override.',
     { projectId: z.string(), ...ReadinessOverrideInput.shape },
     tool(async ({ projectId, ...input }) => room(env, projectId).recordReadinessOverride(projectId, actor, input)),
   );
 
   defineTool(
     'record_validation',
-    'Write a validation record for a task, plan, or doc (humans and copilots). Binds the current content fingerprint (task: body+executionSpec; plan: body+phase intent; doc: version) plus optional baselines (doc pins / code assessments). Renews lastValidatedAt only for the matching fingerprint — comments/title/tags/priority do not. Use after confirming assumptions still hold, or when attaching baselines after re-review. Noriq does NOT index repos: attach baselines.codeAssessments with the repositoryKey/branch/baseId YOU reasoned against so later get_freshness/get_task_context can detect code_assessment_stale when your declared baseId drifts. Missing assessments surface impact_unknown (advisory; inbox does not flood on it).',
+    'Write a validation record for a task, plan, or doc (humans and copilots). Binds the current content fingerprint (task: body+executionSpec; plan: body+phase intent; doc: version) plus optional baselines (doc pins / code assessments). Renews lastValidatedAt only for the matching fingerprint — comments/title/tags/priority do not. Use after confirming assumptions still hold, or when attaching baselines after re-review. Noriq does NOT index repos: attach baselines.codeAssessments with the repositoryKey/branch/baseId YOU reasoned against so later get_freshness/get_task_context can detect code_assessment_stale when your declared baseId drifts. Unverified backlog is allowed, but missing readiness blocks strict projects and evidence-required plans. Completion requires separate implementation evidence. Reconcile all unresolved direction IDs in a passing readiness assessment.',
     {
       projectId: z.string(),
       subjectType: ValidationSubjectType.describe('task | plan | doc'),

@@ -1,5 +1,7 @@
-import { recordOverride } from '../lib/entity-assessments';
-import { AssessmentInput, ReadinessOverrideInput } from '@noriq-dev/shared';
+import { filterFreshTasks } from '../lib/readiness-queue';
+import { projectValidationPolicy } from '../lib/validation-policy';
+import { recordOverride, prepareAssessment } from '../lib/entity-assessments';
+import { AssessmentInput, ReadinessOverrideInput, ValidationPolicyInput, DirectionMarkerInput } from '@noriq-dev/shared';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso, sha256Hex } from '../lib/util';
@@ -526,17 +528,14 @@ export class ProjectRoom extends DurableObject<Env> {
     // working agent never needs a standalone heartbeat (PLNR: stop the per-minute ping).
     // A no-op when the agent holds nothing; the pending alarm re-checks and reschedules.
     if (actor.kind === 'agent') {
+      const eligible = await this.renewableClaims(pid, actor.id);
+      const ids = JSON.stringify(eligible.map(t => t.id));
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
       stmts.push(
-        this.env.DB.prepare(
-          "UPDATE tasks SET claim_expires_at = ? WHERE project_id = ? AND claimed_by = ? AND status = 'in_progress' AND claim_expires_at IS NOT NULL",
-        ).bind(expiresAt, pid, actor.id),
-        this.env.DB.prepare(
-          `UPDATE claims SET expires_at = ? WHERE agent_id = ? AND released_at IS NULL
-           AND task_id IN (SELECT id FROM tasks WHERE project_id = ? AND claimed_by = ? AND status = 'in_progress')`,
-        ).bind(expiresAt, actor.id, pid, actor.id),
-        this.env.DB.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').bind(createdAt, actor.id),
+        this.env.DB.prepare("UPDATE tasks SET claim_expires_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND claimed_by = ? AND status = 'in_progress'").bind(expiresAt,ids,actor.id),
+        this.env.DB.prepare('UPDATE claims SET expires_at = ? WHERE agent_id = ? AND released_at IS NULL AND task_id IN (SELECT value FROM json_each(?))').bind(expiresAt,actor.id,ids),
+        this.env.DB.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').bind(createdAt,actor.id),
       );
     }
     await this.env.DB.batch(stmts);
@@ -1076,7 +1075,17 @@ export class ProjectRoom extends DurableObject<Env> {
             JSON.stringify(comparable(field, current[field])) !== JSON.stringify(comparable(field, value)));
         if (stale) throw new Error(`${task.key} changed since this action was proposed; review the current task and try again`);
       }
-      if (patch.status === 'review' || patch.status === 'done') await this.requireImplementationEvidence(projectId, taskId, undefined, patch);
+      if (patch.status && patch.status !== task.status && ['in_progress','review','done'].includes(patch.status)) {
+        const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', taskId);
+        if (freshness.assessment?.required || freshness.assessment?.directionMarkers?.length) {
+          if (actor.kind === 'agent') throw new Error('Missing ownership workflow: evidence-required work uses claim_task to start and release_task to finish. Record readiness first; refresh/reconnect your MCP catalog if validation tools are unavailable.');
+          if (task.claimed_by && actor.id !== task.claimed_by) throw new Error('Task is held by an agent; release its claim before changing work status');
+          await this.requireTaskActionGates(projectId, taskId);
+          if (freshness.criticalCauses.length) throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses, freshness.assessment?.readiness.state));
+          if (patch.body !== undefined || patch.executionSpec !== undefined || patch.docIds !== undefined || patch.addDocIds !== undefined || patch.removeDocIds !== undefined) throw new Error('Update task intent first, then assess before changing work status');
+        }
+        if (patch.status === 'review' || patch.status === 'done') await this.requireImplementationEvidence(projectId, taskId, undefined, patch);
+      }
       // A claimed task's status is not editable via MCP (PLNR-226): the claim protects
       // in-flight work, and an agent restatusing it — even to the "right" status — stomps the
       // holder's work loop. Agent actors only: `actor.kind === 'agent'` is exactly "via MCP"
@@ -1609,8 +1618,10 @@ export class ProjectRoom extends DurableObject<Env> {
       // re-asserts; surface the same codes so the agent knows why.
       {
         const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', task.id, { declaredRevision: metadata });
+        const record = freshness.assessment?.readiness.record;
+        if (freshness.assessment?.required && record?.scope === 'repository' && (!metadata.repositoryKey || !metadata.branch || !metadata.baseId)) throw new Error('Repository readiness requires repositoryKey, branch and baseId on claim_task; refresh/reconnect your client catalog if these inputs are unavailable');
         if (freshness.criticalCauses.length) {
-          throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses));
+          throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses, freshness.assessment?.readiness.state));
         }
       }
       const ttl = await this.claimTtlSeconds();
@@ -1691,7 +1702,7 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
-      if (!task.claimed_by) throw new Error(`${task.key} has no live claim`);
+      if (!task.claimed_by || !task.claim_expires_at || task.claim_expires_at <= nowIso()) throw new Error(`${task.key} has no live claim; reassess and reclaim before release`);
       // Only the holder may release its own claim; a human is the override (PLNR-116). Without
       // this, any agent could force-release a peer's in-flight task — fine as a supervisor
       // action, but agent↔agent it's a claim steal.
@@ -1699,7 +1710,11 @@ export class ProjectRoom extends DurableObject<Env> {
         throw new Error(`${task.key} is held by another agent — you can't release a claim you don't own`);
       }
       const toStatus = opts.toStatus ?? 'todo';
-      if (toStatus === 'review' || toStatus === 'done') await this.requireImplementationEvidence(projectId, taskId, opts.commitId);
+      if (toStatus === 'review' || toStatus === 'done') {
+        const freshness = await storeSubjectFreshness(this.env.DB,projectId,'task',taskId);
+        if (task.claimed_by !== actor.id && (freshness.assessment?.required || freshness.assessment?.directionMarkers?.length)) throw new Error('Another actor owns this work. Release to todo before a human completion transition; validation exceptions cannot bypass ownership');
+        await this.requireImplementationEvidence(projectId, taskId, opts.commitId);
+      }
       if (!['todo', 'review', 'done', 'blocked'].includes(toStatus)) throw new Error(`invalid release status: ${toStatus}`);
       const liveClaim = await this.env.DB.prepare(
         `SELECT c.id, c.agent_id AS agentId, a.kind AS agentKind
@@ -1780,15 +1795,19 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  private async renewableClaims(projectId:string, agentId:string) {
+    const {results} = await this.env.DB.prepare("SELECT id,key FROM tasks WHERE project_id=? AND claimed_by=? AND status='in_progress' AND claim_expires_at > ?")
+      .bind(projectId,agentId,nowIso()).all<{id:string;key:string}>();
+    return filterFreshTasks(this.env.DB, results.map(task => ({...task,projectId})));
+  }
+
   /** Renew every live claim held by this agent in this project. */
   async heartbeat(projectId: string, actor: Actor, agentId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
-      const { results } = await this.env.DB.prepare(
-        "SELECT id, key FROM tasks WHERE project_id = ? AND claimed_by = ? AND status = 'in_progress'",
-      ).bind(this.projectId, agentId).all<{ id: string; key: string }>();
+      const results = await this.renewableClaims(projectId,agentId);
       if (results.length) {
         const now = nowIso();
         await this.env.DB.batch(
@@ -2197,8 +2216,9 @@ export class ProjectRoom extends DurableObject<Env> {
     kind: 'comment' | 'question' | 'instruction' | 'reply',
     body: string,
     parentCommentId?: string | null,
+    directionReason?: string,
   )  {
-    return this.ctx.blockConcurrencyWhile(() => this._postCommentLocked(projectId, actor, taskId, kind, body, parentCommentId));
+    return this.ctx.blockConcurrencyWhile(() => this._postCommentLocked(projectId, actor, taskId, kind, body, parentCommentId, directionReason));
   }
 
   /** Body of postComment, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
@@ -2209,9 +2229,11 @@ export class ProjectRoom extends DurableObject<Env> {
     kind: 'comment' | 'question' | 'instruction' | 'reply',
     body: string,
     parentCommentId?: string | null,
+    directionReason?: string,
   )  {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      if (directionReason !== undefined) DirectionMarkerInput.shape.reason.parse(directionReason);
       const id = newId('cmt');
       // An agent's own plain comment is a note (self-authored), not something a human
       // must resolve — so it doesn't count as an open/unresolved comment. Questions and
@@ -2225,6 +2247,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'comment.posted', 'comment', id, {
         taskId, taskKey: task.key, kind, body: body.slice(0, 140), holder: task.claimed_by,
       });
+      if (directionReason !== undefined) await this.markChangedDirectionLocked(projectId, actor, {taskId, sourceType:'comment', sourceId:id, reason:directionReason});
       return { id, taskKey: task.key, status };
   }
 
@@ -2344,6 +2367,7 @@ export class ProjectRoom extends DurableObject<Env> {
   async answerSignal(
     projectId: string, actor: Actor, signalId: string, response: string,
     answers?: Array<{ question: string; answer: string | string[] | number | boolean }>,
+    directionReason?: string,
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -2354,6 +2378,10 @@ export class ProjectRoom extends DurableObject<Env> {
         'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title, body, blocking FROM signals WHERE id = ? AND project_id = ?',
       ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null; blocking: number }>();
       if (!sig) throw new Error('signal not found');
+      if (directionReason !== undefined) {
+        DirectionMarkerInput.shape.reason.parse(directionReason);
+        if (!sig.taskId || sig.type !== 'input_request') throw new Error('Changed direction requires a task-linked input answer');
+      }
       if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
       const missionQuestion = await this.env.DB.prepare(
         `SELECT id, runner_id AS runnerId, root_run_id AS rootRunId, attempt_id AS attemptId,
@@ -2419,6 +2447,7 @@ export class ProjectRoom extends DurableObject<Env> {
           }
         }
       }
+      if (directionReason !== undefined) await this.markChangedDirectionLocked(projectId, actor, {taskId:sig.taskId!, sourceType:'signal', sourceId:signalId, reason:directionReason});
       // Mirror to the Run (RUN-18): the answer returns a blocked Run to running.
       //
       // RUN-30 changed what that means. It used to assume the agent process was still alive and
@@ -3007,6 +3036,10 @@ export class ProjectRoom extends DurableObject<Env> {
         throw new Error(`${task.key} is a proposed task awaiting human acceptance — it cannot be handed off until accepted`);
       }
 
+      const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', taskId);
+      if (freshness.criticalCauses.length) throw new Error(claimBlockedByFreshnessMessage(task.key, freshness.criticalCauses, freshness.assessment?.readiness.state));
+      if (freshness.assessment?.required) throw new Error('Evidence-required work must be released to todo, then the recipient must claim with their current repository context; handoff cannot substitute for reassessment');
+
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
       await this.env.DB.batch([
@@ -3082,6 +3115,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const boardId = await this.defaultBoardId(toProjectId);
 
       await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE task_direction_markers SET project_id = ? WHERE task_id = ?').bind(toProjectId,task.id),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(task.id),
@@ -3148,122 +3182,97 @@ export class ProjectRoom extends DurableObject<Env> {
     return folder.split('/').map((s) => s.trim()).filter(Boolean).join('/');
   }
 
-  /** Replace a doc's tag set (PLNR-188) — same vocabulary as task tags (resolveTag
-   *  auto-creates), so one set of words filters both tasks and docs. */
-  private async setDocTags(projectId: string, actor: Actor, docId: string, names: string[], allowNew = false) {
-    const ids: string[] = [];
-    for (const n of names) {
-      if (n.trim()) ids.push(await this._resolveTagLocked(projectId, actor, n, allowNew));
-    }
-    const stmts = [this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId)];
-    for (const tid of ids) {
-      stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
-    }
-    await this.env.DB.batch(stmts);
-  }
-
-  /** Snapshot the current doc row after a successful write. Historical revisions are D1-only:
-   *  search always reindexes the stable doc id from the current docs row, never these rows. */
-  private async appendDocVersion(docId: string, actor: Actor) {
-    const doc = await this.env.DB.prepare(
-      `SELECT id, current_version AS version, name, description, body, folder
-         FROM docs WHERE id = ? AND project_id = ?`,
-    ).bind(docId, this.projectId).first<{
-      id: string; version: number; name: string; description: string; body: string; folder: string;
-    }>();
-    if (!doc) throw new Error('doc not found in this project');
-    const { results: tags } = await this.env.DB.prepare(
-      `SELECT g.name FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id
-        WHERE dt.doc_id = ? ORDER BY g.name`,
-    ).bind(docId).all<{ name: string }>();
-    await this.env.DB.prepare(
-      `INSERT INTO doc_versions
-         (doc_id, version, name, description, body, folder, tags_json, author_kind, author_name)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(doc.id, doc.version, doc.name, doc.description, doc.body, doc.folder,
-      JSON.stringify(tags.map((tag) => tag.name)), actor.kind, actor.name).run();
-    return doc.version;
-  }
-
   /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
    *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
+  private docVersionStatement(docId: string, actor: Actor) {
+    return this.env.DB.prepare(`INSERT INTO doc_versions (doc_id,version,name,description,body,folder,tags_json,author_kind,author_name)
+      SELECT id,current_version,name,description,body,folder,
+      COALESCE((SELECT json_group_array(name) FROM (SELECT g.name FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = docs.id ORDER BY g.name)), '[]'), ?, ?
+      FROM docs WHERE id = ? AND project_id = ?`).bind(actor.kind,actor.name,docId,this.projectId);
+  }
+
+  private async docEvidenceStatements(projectId: string, actor: Actor, docId: string, version: number, assessment?: AssessmentInput) {
+    if (!assessment) return [];
+    const fingerprint = `v:${version}`;
+    const prepared = await prepareAssessment(this.env.DB, projectId, actor, 'doc', docId, fingerprint, assessment);
+    const statements = [prepared.statement];
+    if (assessment.outcome === 'passed') statements.push(this.env.DB.prepare(`INSERT INTO entity_validations
+      (id,project_id,subject_type,subject_id,content_fingerprint,validated_at,actor_kind,actor_id,actor_name,baselines_json,note)
+      VALUES (?,?,'doc',?,?,?,?,?,?,?,?)`).bind(newId('val'),projectId,docId,fingerprint,prepared.record.createdAt,actor.kind,actor.id,actor.name,
+      JSON.stringify({ docPins: [], codeAssessments: assessment.scope === 'repository' ? [{repositoryKey:assessment.repositoryKey,branch:assessment.branch,baseId:assessment.baseId,summary:assessment.summary.slice(0,2000)}] : [] }),assessment.summary));
+    return statements;
+  }
+
+  private async docTagStatements(projectId: string, actor: Actor, docId: string, names: string[], allowNew?: boolean) {
+    const ids = new Set<string>();
+    for (const name of names) if (name.trim()) ids.add(await this._resolveTagLocked(projectId, actor, name, allowNew));
+    return [this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId),
+      ...[...ids].map(id => this.env.DB.prepare('INSERT INTO doc_tags (doc_id,tag_id) VALUES (?,?)').bind(docId,id))];
+  }
+
+  private async checkDocEvidence(projectId: string, actor: Actor, substantive: boolean, raw?: AssessmentInput) {
+    const assessment = raw ? AssessmentInput.parse(raw) : undefined;
+    if (assessment && (assessment.purpose !== 'document' || assessment.reconciliation)) throw new Error('Docs require document evidence, without task reconciliation');
+    if (actor.kind === 'agent' && substantive && (await projectValidationPolicy(this.env.DB, projectId)).mode === 'strict' && assessment?.outcome !== 'passed') {
+      throw new Error('Strict project: settled document writes require passing document assessment evidence. Use plan working docs for drafts; refresh/reconnect the MCP catalog if assessment inputs are unavailable.');
+    }
+    return assessment;
+  }
+
   async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean; assessment?: AssessmentInput }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      if (input.assessment) { AssessmentInput.parse(input.assessment); if (input.assessment.purpose !== 'document') throw new Error('Docs require document assessments'); }
-      requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
-      const id = newId('doc');
-      const created = nowIso();
-      await this.env.DB.prepare(
-        'INSERT INTO docs (id, project_id, name, description, body, folder, author_kind, author_name, created_at, updated_at, content_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '',
-        ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name, created, created, created).run();
-      if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags, input.allowNewTags);
-      const version = await this.appendDocVersion(id, actor);
-      await this.emit(actor, 'doc.created', 'doc', id, { name: input.name, version });
-      if (input.assessment) await storeRecordValidation(this.env.DB, projectId, actor, { subjectType: 'doc', subjectId: id, assessment: input.assessment });
-      this.reindexSearch('doc', id);
-      return { id, name: input.name, version };
+      const assessment = await this.checkDocEvidence(projectId, actor, true, input.assessment);
+      requireDecisionOnlyDoc(input.body);
+      const id = newId('doc'), created = nowIso();
+      const evidence = await this.docEvidenceStatements(projectId, actor, id, 1, assessment);
+      const tags = await this.docTagStatements(projectId, actor, id, input.tags ?? [], input.allowNewTags);
+      await this.env.DB.batch([
+        this.env.DB.prepare(`INSERT INTO docs (id,project_id,name,description,body,folder,author_kind,author_name,created_at,updated_at,content_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+          .bind(id,projectId,input.name,input.description ?? '',input.body ?? '',ProjectRoom.normalizeFolder(input.folder ?? ''),actor.kind,actor.name,created,created,created),
+        ...tags, this.docVersionStatement(id,actor), ...evidence,
+      ]);
+      await this.emit(actor,'doc.created','doc',id,{name:input.name,version:1});
+      this.reindexSearch('doc',id);
+      return { id, name: input.name, version: 1 };
     });
   }
 
-  async updateDoc(
-    projectId: string, actor: Actor, docId: string,
-    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[]; allowNewTags?: boolean },
-  ) {
+  async updateDoc(projectId: string, actor: Actor, docId: string,
+    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[]; allowNewTags?: boolean; assessment?: AssessmentInput }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const doc = await this.env.DB.prepare('SELECT id, name, archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?')
-        .bind(docId, this.projectId).first<{ id: string; name: string; archivedAt: string | null }>();
+      const doc = await this.env.DB.prepare('SELECT id,name,description,body,folder,current_version AS version,archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?')
+        .bind(docId,projectId).first<{id:string;name:string;description:string;body:string;folder:string;version:number;archivedAt:string|null}>();
       if (!doc) throw new Error('doc not found in this project');
       if (doc.archivedAt) throw new Error('archived docs are read-only — restore this doc before updating it');
-      requireDecisionOnlyDoc(patch.body); // PLNR-183: docs state decisions, not questions
-      let touched = false;
-      // Tag edits (PLNR-188), mirroring the task patterns: `tags` replaces; add/remove edit.
-      if (patch.tags !== undefined) {
-        await this.setDocTags(projectId, actor, docId, patch.tags, patch.allowNewTags);
-        touched = true;
-      } else if (patch.addTags?.length || patch.removeTags?.length) {
-        const stmts = [];
-        for (const n of patch.addTags ?? []) {
-          if (!n.trim()) continue;
-          const tid = await this._resolveTagLocked(projectId, actor, n, patch.allowNewTags);
-          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
+      const substantive = ['name','description','body'].some(key => patch[key as 'name'|'description'|'body'] !== undefined && patch[key as 'name'|'description'|'body'] !== doc[key as 'name'|'description'|'body']);
+      const assessment = await this.checkDocEvidence(projectId,actor,substantive,patch.assessment);
+      requireDecisionOnlyDoc(patch.body);
+      const fields = Object.keys(patch).filter(k => k !== 'assessment' && k !== 'allowNewTags' && patch[k as keyof typeof patch] !== undefined && !((k === 'addTags' || k === 'removeTags') && !patch[k]?.length));
+      if (!fields.length) {
+        if (assessment) {
+          await storeRecordValidation(this.env.DB,projectId,actor,{subjectType:'doc',subjectId:docId,assessment});
+          await this.emit(actor,'doc.updated','doc',docId,{fields:['assessment'],version:doc.version});
         }
-        for (const n of patch.removeTags ?? []) {
-          const trimmed = n.trim().toLowerCase();
-          if (!trimmed) continue;
-          stmts.push(this.env.DB.prepare(
-            'DELETE FROM doc_tags WHERE doc_id = ? AND tag_id IN (SELECT id FROM tags WHERE project_id = ? AND name = ?)',
-          ).bind(docId, this.projectId, trimmed));
-        }
-        if (stmts.length) { await this.env.DB.batch(stmts); touched = true; }
+        return { ok:true, version:doc.version };
       }
-      const sets: string[] = [];
-      const binds: unknown[] = [];
-      if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
-      if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
-      if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
-      if (patch.folder !== undefined) { sets.push('folder = ?'); binds.push(ProjectRoom.normalizeFolder(patch.folder)); }
-      // Doc fingerprint is the version — any bump is content activity for dormancy (PLNR-585).
-      const bumpAt = nowIso();
-      if (!sets.length) {
-        if (!touched) return { ok: true };
-        sets.push('updated_at = ?', 'content_activity_at = ?', 'current_version = current_version + 1');
-        binds.push(bumpAt, bumpAt, docId);
-        await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-        const version = await this.appendDocVersion(docId, actor);
-        await this.emit(actor, 'doc.updated', 'doc', docId, { name: doc.name, fields: ['tags'], version });
-        this.reindexSearch('doc', docId);
-        return { ok: true, version };
+      const version = doc.version + 1, at = nowIso();
+      const evidence = await this.docEvidenceStatements(projectId,actor,docId,version,assessment);
+      let tagStatements: D1PreparedStatement[] = [];
+      if (patch.tags !== undefined || patch.addTags?.length || patch.removeTags?.length) {
+        const existing = (await this.env.DB.prepare('SELECT g.name FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = ?').bind(docId).all<{name:string}>()).results.map(r=>r.name);
+        const names = [...(patch.tags ?? existing), ...(patch.addTags ?? [])].filter(n => !(patch.removeTags ?? []).some(r=>r.trim().toLowerCase()===n.trim().toLowerCase()));
+        tagStatements = await this.docTagStatements(projectId,actor,docId,names,patch.allowNewTags);
       }
-      sets.push('updated_at = ?', 'content_activity_at = ?', 'current_version = current_version + 1');
-      binds.push(bumpAt, bumpAt, docId);
-      await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-      const version = await this.appendDocVersion(docId, actor);
-      await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch), version });
-      this.reindexSearch('doc', docId);
-      return { ok: true, version };
+      await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE docs SET name=?,description=?,body=?,folder=?,current_version=?,updated_at=?,content_activity_at=? WHERE id=? AND project_id=?')
+          .bind(patch.name ?? doc.name,patch.description ?? doc.description,patch.body ?? doc.body,patch.folder === undefined ? doc.folder : ProjectRoom.normalizeFolder(patch.folder),version,at,at,docId,projectId),
+        ...tagStatements, this.docVersionStatement(docId,actor), ...evidence,
+      ]);
+      await this.emit(actor,'doc.updated','doc',docId,{name:patch.name ?? doc.name,fields,version});
+      this.reindexSearch('doc',docId);
+      return {ok:true,version};
     });
   }
 
@@ -5908,9 +5917,74 @@ export class ProjectRoom extends DurableObject<Env> {
   // Entity validation / supersession / review inbox (PLNR-576..580)
   // ---------------------------------------------------------------------------
 
+  async setValidationPolicy(projectId: string, actor: Actor, raw: { mode: 'legacy' | 'strict'; reason: string }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (actor.kind !== 'human') throw new Error('Human contributor required to change validation policy');
+      const input = ValidationPolicyInput.parse(raw);
+      const previous = await projectValidationPolicy(this.env.DB, projectId);
+      if (previous.mode === input.mode) return { ...previous, releasedTaskIds: [] };
+      const held = input.mode === 'strict' ? (await this.env.DB.prepare('SELECT id, key, claimed_by AS holder FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL').bind(projectId).all<{id:string;key:string;holder:string}>()).results : [];
+      const at = nowIso();
+      const statements = [
+        this.env.DB.prepare('UPDATE projects SET validation_policy = ?, validation_generation = validation_generation + 1 WHERE id = ?').bind(input.mode, projectId),
+        ...this.validationReleaseStatements(held.map(t => t.id), at, 'validation_policy_enabled'),
+      ];
+      await this.emit(actor, 'project.updated', 'project', projectId, { fields: ['validationPolicy'], previousMode: previous.mode, mode: input.mode, reason: input.reason, releasedTaskIds: held.map(t => t.id) }, statements);
+      for (const task of held) await this.emit(actor, 'task.requeued', 'task', task.id, { key: task.key, previousHolder: task.holder, reason: 'validation_policy_enabled', instruction: 'Stop implementation. Reassess readiness and reclaim before resuming.' });
+      return { mode: input.mode, generation: previous.generation + 1, releasedTaskIds: held.map(t => t.id) };
+    });
+  }
+
+  private validationReleaseStatements(taskIds: string[], at: string, reason: string) {
+    if (!taskIds.length) return [];
+    const ids = JSON.stringify(taskIds);
+    return [
+      this.env.DB.prepare(`UPDATE claims SET released_at = ?, release_status = 'todo', release_reason = ? WHERE task_id IN (SELECT value FROM json_each(?)) AND released_at IS NULL`).bind(at, reason, ids),
+      this.env.DB.prepare(`UPDATE file_locks SET released_at = ? WHERE task_id IN (SELECT value FROM json_each(?)) AND released_at IS NULL`).bind(at, ids),
+      this.env.DB.prepare(`UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL,
+        status = CASE WHEN status IN ('done','cancelled') THEN status ELSE 'todo' END, updated_at = ?
+        WHERE id IN (SELECT value FROM json_each(?))`).bind(at, ids),
+    ];
+  }
+
+  async markChangedDirection(projectId: string, actor: Actor, raw: { taskId: string; sourceType: 'comment' | 'signal'; sourceId: string; reason: string }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return this.markChangedDirectionLocked(projectId, actor, raw);
+    });
+  }
+
+  private async markChangedDirectionLocked(projectId: string, actor: Actor, raw: { taskId: string; sourceType: 'comment' | 'signal'; sourceId: string; reason: string }) {
+    const input = DirectionMarkerInput.parse(raw);
+    const task = await this.getTask(input.taskId);
+    const source = input.sourceType === 'comment'
+      ? await this.env.DB.prepare('SELECT id FROM comments WHERE id = ? AND task_id = ?').bind(input.sourceId, task.id).first()
+      : await this.env.DB.prepare("SELECT id FROM signals WHERE id = ? AND task_id = ? AND project_id = ? AND type = 'input_request' AND status = 'answered'").bind(input.sourceId, task.id, projectId).first();
+    if (!source) throw new Error('Direction source must be a comment or answered input on this task');
+    const prior = await this.env.DB.prepare('SELECT id FROM task_direction_markers WHERE task_id = ? AND source_type = ? AND source_id = ?').bind(task.id, input.sourceType, input.sourceId).first<{id:string}>();
+    if (prior) return { id: prior.id, alreadyMarked: true };
+    const id = newId('dir'), at = nowIso();
+    const statements = [
+      this.env.DB.prepare(`INSERT INTO task_direction_markers (id,project_id,task_id,source_type,source_id,reason,actor_kind,actor_id,actor_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,task.id,input.sourceType,input.sourceId,input.reason,actor.kind,actor.id,actor.name,at),
+      this.env.DB.prepare('UPDATE tasks SET direction_generation = direction_generation + 1 WHERE id = ?').bind(task.id),
+      ...this.validationReleaseStatements(task.claimed_by ? [task.id] : [], at, 'direction_changed'),
+    ];
+    await this.emit(actor, task.claimed_by ? 'task.requeued' : 'task.updated', 'task', task.id, { key: task.key, previousHolder: task.claimed_by, fields: ['direction'], markerId: id, reason: 'direction_changed', instruction: 'Stop implementation. Reconcile the changed direction, record readiness and reclaim before resuming.' }, statements);
+    return { id, releasedClaim: !!task.claimed_by };
+  }
+
+  private async requireTaskActionGates(projectId: string, taskId: string) {
+    const task = await this.getTask(taskId);
+    const proposed = await this.env.DB.prepare(`SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id WHERE pt.task_id = ? AND p.status = 'proposed'`).bind(taskId).first();
+    if (task.proposed_at || proposed) throw new Error('Plan/task approval required; validation exceptions cannot waive approval');
+    if ((await this.unfinishedDeps(taskId)).length) throw new Error('Unfinished dependencies or earlier phases block this transition; validation exceptions cannot waive dependencies');
+  }
+
   async recordReadinessOverride(projectId: string, actor: Actor, raw: ReadinessOverrideInput) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (actor.kind !== 'human') throw new Error('Human contributor required for validation exceptions; request a human exception in the task UI');
       const input = ReadinessOverrideInput.parse(raw);
       const freshness = await storeSubjectFreshness(this.env.DB, projectId, 'task', input.subjectId);
       const result = await recordOverride(this.env.DB, projectId, actor, freshness.assessment!, input);
@@ -5922,7 +5996,11 @@ export class ProjectRoom extends DurableObject<Env> {
   private async requireImplementationEvidence(projectId: string, taskId: string, commitId?: string, patch?: TaskPatch) {
     const f = await storeSubjectFreshness(this.env.DB, projectId, 'task', taskId);
     const state = f.assessment!;
-    if (!state.required && state.implementation.record?.outcome !== 'failed') return;
+    if (!state.required && !state.directionMarkers?.length && state.implementation.record?.outcome !== 'failed') return;
+    if (state.required || state.directionMarkers?.length) {
+      await this.requireTaskActionGates(projectId, taskId);
+      if (f.criticalCauses.length) throw new Error(claimBlockedByFreshnessMessage(taskId, f.criticalCauses, f.assessment?.readiness.state));
+    }
     if (patch) {
       const current = await this.env.DB.prepare('SELECT body, execution_spec AS spec FROM tasks WHERE id = ?').bind(taskId).first<{body:string;spec:string|null}>();
       const nextFingerprint = await taskContentFingerprint(patch.body ?? current!.body,
@@ -5932,7 +6010,7 @@ export class ProjectRoom extends DurableObject<Env> {
       }
     }
     if (state.overrides?.some(o => o.scope === 'implementation' && (!commitId || o.revision?.baseId === commitId))) return;
-    if (state.implementation.state !== 'passed') throw new Error(`Implementation evidence is ${state.implementation.state}; record an implementation assessment or an explicit implementation override before completion`);
+    if (state.implementation.state !== 'passed') throw new Error(`Implementation evidence is ${state.implementation.state}; record an implementation assessment or request a human implementation exception before completion; refresh/reconnect your MCP catalog if assessment tools are unavailable`);
     if (commitId && state.implementation.record?.scope === 'repository' && state.implementation.record.baseId !== commitId) {
       throw new Error('Implementation evidence does not match the released commitId');
     }

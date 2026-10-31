@@ -514,8 +514,11 @@ export const api = {
       }>;
       overdue: Array<{ id: string; key: string; title: string; dueAt: string; status: string; projectId: string; projectKey: string }>;
     }>('GET', '/api/attention'),
-  answerSignal: (pid: string, sid: string, response: string, answers?: ApiSignalAnswer[]) =>
-    req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response, answers }),
+  validationPolicy: (pid: string) => req<{mode:'legacy'|'strict'; generation:number}>('GET', `/api/projects/${pid}/validation-policy`),
+  setValidationPolicy: (pid: string, mode: 'legacy'|'strict', reason: string) => req<{mode:'legacy'|'strict';releasedTaskIds:string[]}>('POST', `/api/projects/${pid}/validation-policy`, {mode,reason}),
+  markChangedDirection: (pid: string, input: {taskId:string;sourceType:'comment'|'signal';sourceId:string;reason:string}) => req('POST', `/api/projects/${pid}/direction-markers`, input),
+  answerSignal: (pid: string, sid: string, response: string, answers?: ApiSignalAnswer[], directionReason?: string) =>
+    req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response, answers, directionReason }),
   /** The rounds of a threaded gate (PLNR-185), oldest first. */
   signalThread: (pid: string, sid: string) =>
     req<{ thread: Array<{
@@ -1888,6 +1891,7 @@ export interface ApiMemoryReviewQueueItem {
 }
 
 export type ApiReviewCause =
+  | 'direction_changed'
   | 'readiness_required'
   | 'assessment_failed'
   | 'never_validated'

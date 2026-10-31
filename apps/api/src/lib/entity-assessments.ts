@@ -1,3 +1,4 @@
+import { projectValidationPolicy, unresolvedDirections } from './validation-policy';
 import { AssessmentInput, type AssessmentRecord, type AssessmentState, ReadinessOverrideInput, type ReadinessOverrideRecord, type ValidationSubjectType } from '@noriq-dev/shared';
 import { newId, nowIso, sha256Hex } from './util';
 
@@ -6,8 +7,11 @@ type Actor = { kind: string; id: string; name: string };
 /** Includes dependency state and doc versions, never comment/title/claim activity. */
 export async function assessmentContext(db: D1Database, projectId: string, type: ValidationSubjectType, id: string, fingerprint: string) {
   const facts: unknown[] = [fingerprint];
-  let required = false;
+  const policy = await projectValidationPolicy(db, projectId);
+  let required = policy.mode === 'strict';
   if (type === 'task') {
+    const direction = await db.prepare('SELECT direction_generation AS generation FROM tasks WHERE id = ? AND project_id = ?').bind(id, projectId).first<{generation:number}>();
+    if (policy.generation || direction?.generation) facts.push({ policyGeneration: policy.generation, directionGeneration: direction?.generation ?? 0 });
     const deps = await db.prepare(`SELECT t.id, t.status, t.content_activity_at, t.readiness_generation,
       (SELECT group_concat(ref) FROM (SELECT ref FROM task_refs WHERE task_id = t.id AND kind = 'commit' ORDER BY ref)) AS commits
       FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id WHERE d.task_id = ? ORDER BY t.id`).bind(id).all();
@@ -24,7 +28,7 @@ export async function assessmentContext(db: D1Database, projectId: string, type:
       JOIN phases prev ON prev.plan_id = p.id AND prev."order" < ph."order"
       JOIN phase_tasks pt ON pt.phase_id = prev.id JOIN tasks t ON t.id = pt.task_id
       WHERE mine.task_id = ? AND p.status != 'rejected' ORDER BY p.id, prev.id, t.id`).bind(id).all();
-    required = membership.results.some(p => !!p.readiness_required);
+    required = required || membership.results.some(p => !!p.readiness_required);
     facts.push(deps.results, docs.results, membership.results, previous.results);
   }
   if (type === 'plan') {
@@ -32,10 +36,10 @@ export async function assessmentContext(db: D1Database, projectId: string, type:
       FROM plan_doc_refs r JOIN docs d ON d.id = r.doc_id WHERE r.plan_id = ? ORDER BY d.id`).bind(id).all();
     facts.push(docs.results);
   }
-  return { fingerprint: await sha256Hex(JSON.stringify(facts)), required };
+  return { fingerprint: await sha256Hex(JSON.stringify(facts)), required, projectPolicy: policy.mode };
 }
 
-export async function recordAssessment(db: D1Database, projectId: string, actor: Actor,
+export async function prepareAssessment(db: D1Database, projectId: string, actor: Actor,
   type: ValidationSubjectType, id: string, fingerprint: string, raw: AssessmentInput) {
   const input = AssessmentInput.parse(raw);
   if (type === 'task' && input.purpose === 'document') throw new Error('Task assessments use readiness or implementation');
@@ -46,12 +50,28 @@ export async function recordAssessment(db: D1Database, projectId: string, actor:
     contextFingerprint: context.fingerprint, actorKind: actor.kind, actorId: actor.id, actorName: actor.name,
     createdAt: nowIso(), provenance: 'actor_reported',
   };
-  await db.prepare(`INSERT INTO entity_assessments
+  const statement = db.prepare(`INSERT INTO entity_assessments
     (id, project_id, subject_type, subject_id, purpose, content_fingerprint, context_fingerprint,
      assessment_json, actor_kind, actor_id, actor_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(record.id, projectId, type, id, input.purpose, fingerprint, context.fingerprint,
-      JSON.stringify(input), actor.kind, actor.id, actor.name, record.createdAt).run();
-  return record;
+      JSON.stringify(input), actor.kind, actor.id, actor.name, record.createdAt);
+  return { record, statement };
+}
+
+export async function recordAssessment(db: D1Database, projectId: string, actor: Actor,
+  type: ValidationSubjectType, id: string, fingerprint: string, raw: AssessmentInput) {
+  const prepared = await prepareAssessment(db, projectId, actor, type, id, fingerprint, raw);
+  const statements = [prepared.statement];
+  if (raw.reconciliation) {
+    if (type !== 'task' || raw.purpose !== 'readiness' || raw.outcome !== 'passed') throw new Error('Direction reconciliation requires passing task readiness evidence');
+    const pending = await unresolvedDirections(db, projectId, id);
+    const ids = [...new Set(raw.reconciliation.directionIds)].sort();
+    if (JSON.stringify(ids) !== JSON.stringify(pending.map(m => m.id).sort())) throw new Error('Reconciliation must cover every current unresolved direction marker; refresh task context');
+    statements.push(db.prepare(`UPDATE task_direction_markers SET resolved_assessment_id = ?, resolved_at = ?
+      WHERE project_id = ? AND task_id = ? AND resolved_at IS NULL`).bind(prepared.record.id, prepared.record.createdAt, projectId, id));
+  }
+  await db.batch(statements);
+  return prepared.record;
 }
 
 export async function assessmentState(db: D1Database, projectId: string, type: ValidationSubjectType, id: string,
@@ -76,7 +96,7 @@ export async function assessmentState(db: D1Database, projectId: string, type: V
     const stale = record.contentFingerprint !== fingerprint || record.contextFingerprint !== context.fingerprint || revisionMismatch;
     return { state: stale ? 'stale' : record.outcome, record };
   };
-  return { required: context.required, contextFingerprint: context.fingerprint,
+  return { required: context.required, projectPolicy: context.projectPolicy, directionMarkers: type === 'task' ? await unresolvedDirections(db, projectId, id) : [], contextFingerprint: context.fingerprint,
     readiness: view(type === 'task' ? 'readiness' : 'document'), implementation: view('implementation') };
 }
 
@@ -88,7 +108,7 @@ export async function activeOverrides(db: D1Database, projectId: string, subject
   revision?: { repositoryKey?: string | null; branch?: string | null; baseId?: string | null } | null): Promise<ReadinessOverrideRecord[]> {
   const context = await overrideContext(state);
   const { results } = await db.prepare(`SELECT * FROM entity_readiness_overrides WHERE project_id = ? AND subject_id = ?
-    AND context_fingerprint = ? AND expires_at > ? ORDER BY created_at DESC, rowid DESC LIMIT 20`)
+    AND actor_kind = 'human' AND context_fingerprint = ? AND expires_at > ? ORDER BY created_at DESC, rowid DESC LIMIT 20`)
     .bind(projectId, subjectId, context, nowIso()).all<any>();
   return results.filter(row => {
     const expected = row.revision_json ? JSON.parse(row.revision_json) : null;

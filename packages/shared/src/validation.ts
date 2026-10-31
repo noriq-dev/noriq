@@ -10,7 +10,7 @@ export type ValidationSubjectType = z.infer<typeof ValidationSubjectType>;
  * Critical causes hard-block claim; advisory causes surface in context only.
  */
 export const ReviewCause = z.enum([
-  'readiness_required',
+  'direction_changed', 'readiness_required',
   'assessment_failed',
   'never_validated',
   'content_changed',
@@ -24,7 +24,7 @@ export const ReviewCause = z.enum([
 export type ReviewCause = z.infer<typeof ReviewCause>;
 
 export const CRITICAL_REVIEW_CAUSES: ReadonlySet<ReviewCause> = new Set([
-  'readiness_required', 'assessment_failed',
+  'direction_changed', 'readiness_required', 'assessment_failed',
   'content_changed',
   'doc_baseline_moved',
 ]);

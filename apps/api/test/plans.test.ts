@@ -292,7 +292,8 @@ describe('plans & groups', () => {
       ] }],
     });
     const [doneId, todoId, claimedId] = plan.body.phases[0].taskIds as [string, string, string];
-    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: doneId, status: 'done' });
+    expect((await mcpCall(planner.apiKey, 'claim_task', {projectId,taskId:doneId})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'release_task', {projectId,taskId:doneId,toStatus:'done'})).isError).toBe(false);
     expect((await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: claimedId })).isError).toBe(false);
 
     const archived = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
@@ -320,8 +321,10 @@ describe('plans & groups', () => {
       ] }],
     });
     const [doneId, reviewId, todoId] = plan.body.phases[0].taskIds as [string, string, string];
-    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: doneId, status: 'done' });
-    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: reviewId, status: 'review' });
+    expect((await mcpCall(planner.apiKey, 'claim_task', {projectId,taskId:doneId})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'release_task', {projectId,taskId:doneId,toStatus:'done'})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'claim_task', {projectId,taskId:reviewId})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'release_task', {projectId,taskId:reviewId,toStatus:'review'})).isError).toBe(false);
 
     const archived = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
       method: 'POST',
@@ -372,8 +375,10 @@ describe('plans & groups', () => {
       ] }],
     });
     const [doneId, reviewId] = plan.body.phases[0].taskIds as [string, string];
-    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: doneId, status: 'done' });
-    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: reviewId, status: 'review' });
+    expect((await mcpCall(planner.apiKey, 'claim_task', {projectId,taskId:doneId})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'release_task', {projectId,taskId:doneId,toStatus:'done'})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'claim_task', {projectId,taskId:reviewId})).isError).toBe(false);
+    expect((await mcpCall(planner.apiKey, 'release_task', {projectId,taskId:reviewId,toStatus:'review'})).isError).toBe(false);
 
     const response = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}`, {
       method: 'DELETE', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -636,7 +641,8 @@ describe('plans & groups', () => {
     const stillBlocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
     expect(stillBlocked.isError).toBe(true);
 
-    await mcpCall(worker.apiKey, 'update_task', { projectId, taskId: base, status: 'done' });
+    const accepted=await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks/${base}`,{method:'PATCH',headers:{Cookie:cookie,'Content-Type':'application/json'},body:JSON.stringify({status:'done'})});
+    expect(accepted.status).toBe(200);
     expect((await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent })).isError).toBe(false);
   });
 

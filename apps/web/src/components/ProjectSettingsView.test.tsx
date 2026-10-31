@@ -53,6 +53,7 @@ function fakeStore({
 }
 
 function render(node: ReactNode) {
+  vi.spyOn(api,'validationPolicy').mockResolvedValue({mode:'legacy',generation:0});
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);

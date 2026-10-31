@@ -96,7 +96,7 @@ describe('server/discover', () => {
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
     expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
     expect(r._meta[SERVER_INFO_KEY]).toMatchObject({
-      catalogRevision: 6,
+      catalogRevision: 7,
       title: 'Noriq',
       description: expect.stringContaining('get_briefing'),
       websiteUrl: 'https://plan.frs.llc',
@@ -120,7 +120,7 @@ describe('server/discover', () => {
     expect(toolBody(configured.body.result)).not.toHaveProperty('toolPacks');
     expect(toolBody(configured.body.result)).not.toHaveProperty('catalogChanged');
     const discovered = await modern(configuredAgent.apiKey, 'server/discover');
-    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 6 });
+    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 7 });
     expect(discovered.body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 });
@@ -131,7 +131,7 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result.resultType).toBe('complete');
     expect(body.result._meta[SERVER_INFO_KEY].name).toBe('noriq');
-    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 6 });
+    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 7 });
     expect(body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
     expect(toolBody(body.result).you.name).toBeDefined();
   });
@@ -181,6 +181,11 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(body.result.ttlMs).toBe(60_000);
     expect(body.result.cacheScope).toBe('private');
     expect(body.result.tools.length).toBeGreaterThan(10);
+    const tool=(name:string)=>body.result.tools.find((t:any)=>t.name===name);
+    for(const name of ['create_doc','update_doc','record_validation']) expect(tool(name).inputSchema.properties).toHaveProperty('assessment');
+    expect(JSON.stringify(tool('create_tasks').inputSchema)).toContain('assessment');
+    expect(tool('mark_changed_direction').inputSchema.properties).toHaveProperty('reason');
+    expect(JSON.stringify(tool('record_validation').inputSchema)).toContain('reconciliation');
   });
 
   it('advertises zod string limits and field descriptions in tools/list (PLNR-549)', async () => {
@@ -307,7 +312,7 @@ describe('dual-era coexistence', () => {
       : JSON.parse(raw);
     expect(data.result.protocolVersion).toBe('2025-11-25');
     expect(data.result.serverInfo).toMatchObject({
-      name: 'noriq', catalogRevision: 6,
+      name: 'noriq', catalogRevision: 7,
     });
     expect(data.result.serverInfo).not.toHaveProperty('toolPacks');
   });

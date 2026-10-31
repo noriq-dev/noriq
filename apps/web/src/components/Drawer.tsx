@@ -56,6 +56,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const tasks = helpers.tasksOf(currentPid);
   const task = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : null;
 
+  const [directionReasons,setDirectionReasons]=useState<Record<string,string>>({});
   const [editing, setEditing] = useState(false);
   const [eTitle, setETitle] = useState('');
   const [eBody, setEBody] = useState('');
@@ -610,17 +611,20 @@ export function Drawer({ store }: { store: AppStore }) {
                       </div>
                       <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
                       {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 3, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
+                      {gate && store.permissions.canContribute && <label style={{display:'block',marginTop:8}}>Changed direction (optional)
+                        <textarea aria-label="Changed direction reason" placeholder="Explain changed intent; answering releases the claim and requires reconciliation" minLength={10} maxLength={2000} value={directionReasons[s.id] ?? ''} onChange={e=>setDirectionReasons({...directionReasons,[s.id]:e.target.value})} />
+                      </label>}
                       {gate && s.followUpTo && <SignalThreadHistory pid={currentPid} signalId={s.id} />}
                       {gate && s.questions && s.questions.length > 0 && (
-                        <QuestionForm questions={s.questions} onSubmit={(r, a) => actions.answerSignal(s.id, r, a)} />
+                        <QuestionForm questions={s.questions} onSubmit={(r, a) => actions.answerSignal(s.id, r, a, directionReasons[s.id] || undefined)} />
                       )}
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                         {gate && !(s.questions && s.questions.length > 0) ? (
                           <>
                             {(s.options ?? []).map((opt) => (
-                              <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
+                              <button key={opt} onClick={() => void actions.answerSignal(s.id, opt, undefined, directionReasons[s.id] || undefined)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
                             ))}
-                            <SignalAnswer onAnswer={(v) => void actions.answerSignal(s.id, v)} />
+                            <SignalAnswer onAnswer={(v) => void actions.answerSignal(s.id, v, undefined, directionReasons[s.id] || undefined)} />
                           </>
                         ) : gate ? null : (
                           <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-soft)', background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 10px' }}>Acknowledge</button>

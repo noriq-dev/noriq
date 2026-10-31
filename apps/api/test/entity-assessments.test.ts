@@ -1,6 +1,6 @@
-import { env } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, loginSession, mcpCall } from './helpers';
 import { AssessmentInput } from '@noriq-dev/shared';
 
 let agent: { id: string; apiKey: string }, projectId: string, milestoneId: string;
@@ -22,6 +22,11 @@ const task = async (assessment?: unknown) => {
 };
 const freshness = async (subjectId: string) => (await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId })).body;
 
+async function humanOverride(input: Record<string,unknown>) {
+  const cookie=await loginSession('agent-mint@example.com','longenough1');
+  const res=await SELF.fetch(`https://noriq.test/api/projects/${projectId}/readiness-overrides`,{method:'POST',headers:{cookie,'Content-Type':'application/json'},body:JSON.stringify(input)});
+  return {isError:!res.ok,body:await res.json() as any};
+}
 describe('evidence-backed assessments', () => {
   it('requires meaningful evidence and repository scope', () => {
     expect(AssessmentInput.safeParse({ ...evidence(), evidence: [] }).success).toBe(false);
@@ -80,7 +85,7 @@ describe('phase readiness and explicit exceptions', () => {
     expect(made.isError).toBeFalsy();
     const first = made.body.phases[0].taskIds[0], second = made.body.phases[1].taskIds[0];
     expect((await freshness(first)).assessment.required).toBe(true);
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: first, baseId: 'base-a' })).isError).toBeFalsy();
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: first, baseId: 'base-a' })).isError).toBeFalsy();
     const noCompletion = await mcpCall(agent.apiKey, 'release_task', { projectId, taskId: first, toStatus: 'done' });
     expect(noCompletion.isError).toBe(true);
     expect(noCompletion.text).toContain('Implementation evidence');
@@ -89,12 +94,12 @@ describe('phase readiness and explicit exceptions', () => {
     const f = await freshness(second);
     expect(f.assessment.readiness.state).toBe('stale');
     expect(f.criticalCauses).toContain('readiness_required');
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: second })).isError).toBe(true);
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: second })).isError).toBe(true);
     await mcpCall(agent.apiKey, 'record_validation', { projectId, subjectType: 'task', subjectId: second,
       assessment: { ...evidence(), baseId: 'base-b', summary: 'Rechecked after phase one landed; its new interface matches this task.' } });
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: second, baseId: 'base-b' })).isError).toBeFalsy();
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: second, baseId: 'base-b' })).isError).toBeFalsy();
     // A new revision is a request for reassessment, not inferred proof that the work is wrong.
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: second, baseId: 'base-c' })).isError).toBe(true);
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: second, baseId: 'base-c' })).isError).toBe(true);
     await mcpCall(agent.apiKey, 'release_task', { projectId, taskId: second, toStatus: 'todo' });
   });
 
@@ -102,21 +107,21 @@ describe('phase readiness and explicit exceptions', () => {
     const made = await mcpCall(agent.apiKey, 'create_plan', { projectId, title: 'Override evidence workflow',
       taskDefaults: { milestoneId, tags: ['testing'] }, phases: [{ title: 'First', newTasks: [{ title: 'Exception task' }] }] });
     const id = made.body.phases[0].taskIds[0];
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id })).isError).toBe(true);
-    const override = await mcpCall(agent.apiKey, 'record_readiness_override', { projectId, subjectId: id,
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id })).isError).toBe(true);
+    const override = await humanOverride( { projectId, subjectId: id,
       scope: 'readiness', reason: 'Investigating a production issue before all evidence is available.', durationSeconds: 3600 });
     expect(override.isError).toBeFalsy();
     expect(override.body.actorName).toBeTruthy();
     expect((await freshness(id)).assessment.overrides).toHaveLength(1);
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id })).isError).toBeFalsy();
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id })).isError).toBeFalsy();
     await mcpCall(agent.apiKey, 'release_task', { projectId, taskId: id, toStatus: 'todo' });
     await env.DB.prepare('UPDATE entity_readiness_overrides SET expires_at = ? WHERE id = ?').bind('2020-01-01T00:00:00.000Z', override.body.id).run();
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id })).isError).toBe(true);
-    await mcpCall(agent.apiKey, 'record_readiness_override', { projectId, subjectId: id,
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id })).isError).toBe(true);
+    await humanOverride( { projectId, subjectId: id,
       scope: 'readiness', reason: 'Accept this specific task intent for the investigation.', durationSeconds: 3600 });
     await mcpCall(agent.apiKey, 'update_tasks', { projectId, tasks: [{ taskId: id, set: { body: 'Materially changed scope' } }] });
     expect((await freshness(id)).assessment.overrides).toHaveLength(0);
-    expect((await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id })).isError).toBe(true);
+    expect((await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id })).isError).toBe(true);
     const rows = await env.DB.prepare('SELECT COUNT(*) AS n FROM entity_readiness_overrides WHERE subject_id = ?').bind(id).first<{n:number}>();
     expect(rows?.n).toBe(2);
   });
@@ -125,9 +130,9 @@ describe('phase readiness and explicit exceptions', () => {
     const made = await mcpCall(agent.apiKey, 'create_plan', { projectId, title: 'Proposed evidence workflow', proposed: true,
       taskDefaults: { milestoneId, tags: ['testing'] }, phases: [{ title: 'First', newTasks: [{ title: 'Proposed task' }] }] });
     const id = made.body.phases[0].taskIds[0];
-    await mcpCall(agent.apiKey, 'record_readiness_override', { projectId, subjectId: id,
+    await humanOverride( { projectId, subjectId: id,
       scope: 'readiness', reason: 'Checking that this exception does not grant plan approval.', durationSeconds: 3600 });
-    const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id });
+    const claim = await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id });
     expect(claim.isError).toBe(true);
     expect(claim.text).toMatch(/approv|proposed/);
   });
@@ -167,7 +172,7 @@ it('does not let plan archival remove evidence gates', async () => {
   const id = plan.body.phases[0].taskIds[0];
   await env.DB.prepare('UPDATE plans SET archived_at = ? WHERE id = ?').bind(new Date().toISOString(), plan.body.id).run();
   expect((await freshness(id)).criticalCauses).toContain('readiness_required');
-  const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: id });
+  const claim = await mcpCall(agent.apiKey, 'claim_task', { repositoryKey:'repo', branch:'main', projectId, taskId: id });
   expect(claim.isError).toBe(true);
 });
 

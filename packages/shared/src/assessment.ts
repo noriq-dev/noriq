@@ -9,12 +9,14 @@ export const AssessmentInput = z.object({
   repositoryKey: z.string().trim().min(1).max(500).optional(),
   branch: z.string().trim().min(1).max(500).optional(),
   baseId: z.string().trim().min(1).max(500).optional(),
+  reconciliation: z.object({ directionIds: z.array(z.string().min(1)).min(1).max(100), summary: z.string().trim().min(10).max(4000) }).optional(),
   evidence: z.array(z.object({
     kind: z.enum(['inspection', 'test', 'ci', 'human_review']),
     reference: z.string().trim().min(1).max(2000),
     result: z.string().trim().min(1).max(4000),
   })).min(1).max(30),
 }).superRefine((value, ctx) => {
+  if (value.reconciliation && (value.purpose !== 'readiness' || value.outcome !== 'passed')) ctx.addIssue({ code: 'custom', message: 'Reconciliation requires passing readiness evidence' });
   if (value.scope === 'repository' && (!value.repositoryKey || !value.branch || !value.baseId)) {
     ctx.addIssue({ code: 'custom', message: 'Repository assessments require repositoryKey, branch, and baseId' });
   }
@@ -28,6 +30,8 @@ export type AssessmentRecord = AssessmentInput & {
 };
 export type AssessmentState = {
   required: boolean;
+  projectPolicy?: 'legacy' | 'strict';
+  directionMarkers?: DirectionMarker[];
   contextFingerprint: string;
   readiness: { state: 'missing' | 'stale' | 'passed' | 'failed' | 'inconclusive'; record: AssessmentRecord | null };
   overrides?: ReadinessOverrideRecord[];
@@ -48,3 +52,12 @@ export type ReadinessOverrideRecord = { id: string; scope: 'readiness' | 'implem
   actorKind: string; actorId: string; actorName: string; createdAt: string; expiresAt: string;
   contextFingerprint: string; revision: { repositoryKey?: string; branch?: string; baseId?: string } | null;
 };
+
+export const ValidationPolicyInput = z.object({ mode: z.enum(['legacy', 'strict']), reason: z.string().trim().min(10).max(2000) });
+export const DirectionMarkerInput = z.object({
+  taskId: z.string().min(1).describe('Non-empty task id or display key'),
+  sourceType: z.enum(['comment', 'signal']).describe('Existing task comment or answered task-linked input signal'),
+  sourceId: z.string().min(1).describe('Non-empty comment or answered signal id'),
+  reason: z.string().trim().min(10).max(2000).describe('What changed in task direction, 10-2000 characters'),
+});
+export type DirectionMarker = { id: string; taskId: string; sourceType: 'comment' | 'signal'; sourceId: string; reason: string; actorKind: string; actorId: string; actorName: string; createdAt: string };

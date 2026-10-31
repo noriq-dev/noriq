@@ -183,8 +183,8 @@ export async function computeUpdates(
   let maxRid = cursor;
   for (const e of rawEvents) {
     maxRid = Math.max(maxRid, e.rid);
-    if (e.actorId === agent.id) continue; // own actions aren't news
     const p = JSON.parse(e.payload) as Record<string, unknown>;
+    if (e.actorId === agent.id && !(e.verb === 'task.requeued' && p.previousHolder === agent.id && p.instruction)) continue; // explicit ownership revocation must reach even its author
     if (e.verb === 'comment.posted' && !runtimeDelivered.has(e.subjectId) && typeof p.taskId === 'string' && heldTaskIds.has(p.taskId)) {
       notices.push(`New ${p.kind} on ${p.taskKey} (your task): "${p.body}"`);
     } else if (e.verb === 'message.sent' && !runtimeDelivered.has(e.subjectId) && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
@@ -194,7 +194,7 @@ export async function computeUpdates(
       // the notices channel like a comment does (not the idle-only nudge path).
       notices.push(`${p.actorName ?? 'An agent'} handed you ${p.key}: "${p.title}"${p.note ? ` — ${p.note}` : ''}. It is claimed under your name — work it, or release it if you can't.`);
     } else if (e.verb === 'task.requeued' && p.previousHolder === agent.id) {
-      notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
+      notices.push(p.instruction ? `Your claim on ${p.key} was released (${p.reason}). ${p.instruction}` : `Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
     } else if (e.verb === 'task.released' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} was force-released by ${p.actorName ?? 'a supervisor'}.`);
     } else if (e.verb === 'signal.answered' && p.agentId === agent.id) {

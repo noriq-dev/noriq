@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AssessmentInput } from '@noriq-dev/shared';
 import { api, type ApiValidationSubjectType } from '../api';
 import { Button } from './ui';
@@ -11,11 +11,15 @@ export function AssessmentForm({ projectId, subjectType, subjectId, onSaved, onC
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [scope, setScope] = useState('repository');
+  const [markers,setMarkers]=useState<Array<{id:string;reason:string}>>([]);
+  const [contextReady,setContextReady]=useState(subjectType !== 'task');
+  useEffect(()=>{let live=true;if(subjectType==='task') api.subjectFreshness(projectId,subjectType,subjectId).then(f=>{if(live){setMarkers(f.assessment?.directionMarkers ?? []);setContextReady(true);}}).catch(e=>{if(live)setError(String(e));});return()=>{live=false;};},[projectId,subjectType,subjectId]);
   return <form aria-label="Record verification evidence" style={{ display: 'grid', gap: 8, padding: 12 }} onSubmit={async e => {
     e.preventDefault(); setError('');
     const data = new FormData(e.currentTarget);
     const value = (key: string) => String(data.get(key) ?? '');
     const parsed = AssessmentInput.safeParse({
+      ...(markers.length && value('reconciliation').trim() ? {reconciliation:{directionIds:markers.map(m=>m.id),summary:value('reconciliation')}} : {}),
       purpose: value('purpose'), outcome: value('outcome'), scope, summary: value('summary'),
       ...(scope === 'repository' ? { repositoryKey: value('repositoryKey'), branch: value('branch'), baseId: value('baseId') } : {}),
       evidence: [{ kind: value('kind'), reference: value('reference'), result: value('result') }],
@@ -40,11 +44,12 @@ export function AssessmentForm({ projectId, subjectType, subjectId, onSaved, onC
       <label>Branch <input name="branch" required /></label>
       <label>Revision checked <input name="baseId" required /></label>
     </>}
+    {markers.length>0 && <fieldset><legend>Recheck before reclaiming</legend>{markers.map(m=><p key={m.id}>{m.reason}</p>)}<label>How current task intent reflects these changes <textarea name="reconciliation" minLength={10} maxLength={4000} /></label><small>Fill this for a passing readiness assessment to reconcile all listed markers. Failed checks remain in history.</small></fieldset>}
     <label>Assessment and scope <textarea name="summary" required minLength={10} maxLength={4000} placeholder="What assumptions or acceptance criteria did you check? For non-code work, explain why repository evidence is not applicable." /></label>
     <label>Evidence type <select name="kind"><option value="inspection">Code/document inspection</option><option value="test">Test results</option><option value="ci">CI result</option><option value="human_review">Human review</option></select></label>
     <label>Evidence reference <input name="reference" required placeholder="File and lines, test command, or CI/report URL" /></label>
     <label>Observed result <textarea name="result" required maxLength={2000} placeholder="What did the check establish? Include failures or limits." /></label>
     {error && <div role="alert">{error}</div>}
-    <div><Button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save assessment'}</Button> <Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button></div>
+    <div><Button type="submit" disabled={busy || !contextReady}>{busy ? 'Saving…' : 'Save assessment'}</Button> <Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button></div>
   </form>;
 }

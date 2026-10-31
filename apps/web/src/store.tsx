@@ -932,9 +932,9 @@ export function useAppStore() {
       refresh();
     },
 
-    async answerSignal(signalId: string, response: string, answers?: import('./api').ApiSignalAnswer[]) {
+    async answerSignal(signalId: string, response: string, answers?: import('./api').ApiSignalAnswer[], directionReason?: string) {
       if (!pidRef.current || (!response.trim() && !answers?.length)) return;
-      await api.answerSignal(pidRef.current, signalId, response.trim(), answers);
+      await api.answerSignal(pidRef.current, signalId, response.trim(), answers, directionReason);
       refresh();
     },
 

@@ -475,6 +475,10 @@ async function attachAssessmentFreshness(db: D1Database, projectId: string, subj
       if (!storedCauses.some(c => c.cause === code && isReviewCauseSuppressed(c.status, c.snoozedUntil))) freshness.causes.push({ code, severity: 'critical', detail: `Task readiness is ${state.readiness.state}; record current evidence before work` });
       freshness.criticalCauses.push(code);
     }
+    if (state.directionMarkers?.length) {
+      freshness.causes.push({ code: 'direction_changed', severity: 'critical', detail: 'Reconcile changed direction into task intent and record fresh readiness before reclaiming' });
+      freshness.criticalCauses.push('direction_changed');
+    }
     freshness.blockingCauses = [...freshness.criticalCauses];
     state.overrides = await activeOverrides(db, projectId, subjectId, state, opts?.declaredRevision);
     if (state.overrides.some(o => o.scope === 'readiness')) freshness.criticalCauses = [];
@@ -840,7 +844,9 @@ export async function reviewInbox(
                AND d.current_version IS NOT NULL AND td.pinned_version != d.current_version
           )
           OR EXISTS (SELECT 1 FROM entity_assessments a WHERE a.subject_id = t.id AND a.subject_type = 'task')
-          OR EXISTS (SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id WHERE pt.task_id = t.id AND p.readiness_required = 1 AND p.status != 'rejected')
+          OR EXISTS (SELECT 1 FROM projects pr WHERE pr.id = t.project_id AND pr.validation_policy = 'strict')
+          OR EXISTS (SELECT 1 FROM task_direction_markers dm WHERE dm.task_id = t.id AND dm.resolved_at IS NULL)
+          OR EXISTS (SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id WHERE pt.task_id = t.id AND (p.readiness_required = 1 OR EXISTS (SELECT 1 FROM projects pr WHERE pr.id = p.project_id AND pr.validation_policy = 'strict')) AND p.status != 'rejected')
           OR ${dormancyCandidateSql('t')}
           ${neverValidatedCandidate('t', 'task')}
         )`,
@@ -889,8 +895,10 @@ export async function reviewInbox(
 
   const evidenceSubjects = await db.prepare(`SELECT subject_type AS type, subject_id AS id FROM entity_assessments WHERE project_id = ?
     UNION SELECT 'task', pt.task_id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id
-      WHERE p.project_id = ? AND p.readiness_required = 1 AND p.status != 'rejected'`).bind(projectId, projectId).all<{type:string;id:string}>();
+      WHERE p.project_id = ? AND (p.readiness_required = 1 OR EXISTS (SELECT 1 FROM projects pr WHERE pr.id = p.project_id AND pr.validation_policy = 'strict')) AND p.status != 'rejected'`).bind(projectId, projectId).all<{type:string;id:string}>();
   const evidenceIds = new Set(evidenceSubjects.results.map(s => `${s.type}:${s.id}`));
+  const strictSubjects = await db.prepare("SELECT t.id FROM tasks t JOIN projects p ON p.id = t.project_id WHERE p.id = ? AND (p.validation_policy = 'strict' OR EXISTS (SELECT 1 FROM task_direction_markers dm WHERE dm.task_id = t.id AND dm.resolved_at IS NULL))").bind(projectId).all<{id:string}>();
+  for (const row of strictSubjects.results) evidenceIds.add(`task:${row.id}`);
   const candidates = [
     ...(taskCandidates.results ?? []),
     ...(planCandidates.results ?? []),

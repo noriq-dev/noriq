@@ -15,10 +15,10 @@ describe('complete MCP tool contract audit', () => {
     const audit = auditMcpCatalog(specs);
     expect(audit.findings).toEqual([]);
     expect(audit.valid).toBe(true);
-    expect(audit.toolCount).toBe(69);
+    expect(audit.toolCount).toBe(70);
     expect(Object.keys(MCP_TOOL_POLICIES).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
     expect(Object.keys(MCP_TOOL_AUDIENCE).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
-    expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(44);
+    expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(45);
   });
 
   it('Copilots receive the full tool catalog by default', async () => {
@@ -31,7 +31,7 @@ describe('complete MCP tool contract audit', () => {
     }>;
     const specs = mcpReferenceSpecs();
     expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
-    expect(live).toHaveLength(69);
+    expect(live).toHaveLength(70);
     expect(live.some((tool) => tool.name === 'can_claim')).toBe(false);
     const freshSession = await mcpList(token, 'fresh-copilot-session');
     expect(freshSession.map((tool) => tool.name).sort()).toEqual(live.map((tool) => tool.name).sort());
@@ -44,6 +44,12 @@ describe('complete MCP tool contract audit', () => {
       expect(tool.inputSchema.properties, tool.name).toBeDefined();
     }
     expect(live.find((tool) => tool.name === 'request_input')!.inputSchema.properties).toHaveProperty('blocking');
+    for (const name of ['create_doc','update_doc','record_validation']) expect(live.find(t=>t.name===name)!.inputSchema.properties).toHaveProperty('assessment');
+    expect(live.find(t=>t.name==='create_tasks')!.inputSchema.properties).toHaveProperty('tasks');
+    expect(JSON.stringify(live.find(t=>t.name==='create_tasks')!.inputSchema)).toContain('assessment');
+    expect(JSON.stringify(live.find(t=>t.name==='record_validation')!.inputSchema)).toContain('reconciliation');
+    expect(live.some(t=>t.name==='mark_changed_direction')).toBe(true);
+
   });
 
   it('rejects every removed tool name instead of preserving hidden aliases', async () => {
@@ -64,7 +70,7 @@ describe('complete MCP tool contract audit', () => {
       name: string;
       inputSchema: { properties?: Record<string, unknown> };
     }>;
-    expect(live).toHaveLength(69);
+    expect(live).toHaveLength(70);
     expect(live.some((tool) => tool.name === 'create_plan')).toBe(true);
     expect(live.some((tool) => tool.name === 'create_project')).toBe(true);
     expect(live.some((tool) => tool.name === 'create_orchestration')).toBe(true);
@@ -76,7 +82,7 @@ describe('complete MCP tool contract audit', () => {
     const rejected = await mcpCall(token, 'configure_agent', { toolPacks: ['planning'] });
     expect(rejected.isError).toBe(true);
     expect(rejected.text).toMatch(/requires at least one field/i);
-    expect(await mcpList(token)).toHaveLength(69);
+    expect(await mcpList(token)).toHaveLength(70);
   });
 
   it('requires contributor access on both sides of a cross-project task move', async () => {

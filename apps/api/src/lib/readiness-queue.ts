@@ -4,6 +4,8 @@ import { subjectFreshness } from './entity-validation-store';
 export async function filterFreshTasks<T extends { id: string; projectId: string }>(db: D1Database, tasks: T[]): Promise<T[]> {
   if (!tasks.length) return [];
   const { results } = await db.prepare(`SELECT t.id FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) AND (
+    EXISTS (SELECT 1 FROM projects p WHERE p.id = t.project_id AND p.validation_policy = 'strict') OR
+    EXISTS (SELECT 1 FROM task_direction_markers dm WHERE dm.task_id = t.id AND dm.resolved_at IS NULL) OR
     EXISTS (SELECT 1 FROM entity_validations v WHERE v.subject_id = t.id AND v.subject_type = 'task') OR
     EXISTS (SELECT 1 FROM entity_assessments a WHERE a.subject_id = t.id AND a.subject_type = 'task') OR
     EXISTS (SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans p ON p.id = ph.plan_id

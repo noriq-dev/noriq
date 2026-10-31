@@ -473,6 +473,6 @@ export type ReviewInboxItem = {
   ageSinceValidationSeconds: number | null;
 };
 
-export function claimBlockedByFreshnessMessage(taskKey: string, critical: ReviewCause[]): string {
-  return `${taskKey} cannot be claimed — critical freshness causes: ${critical.join(', ')}. Record current readiness evidence, resolve doc pins, or record an explicit readiness override before claiming.`;
+export function claimBlockedByFreshnessMessage(taskKey: string, critical: ReviewCause[], readinessState?: string): string {
+  return `${taskKey} cannot be claimed — critical freshness causes: ${critical.join(', ')}.${readinessState ? ` Readiness evidence is ${readinessState}.` : ''} Record current readiness evidence with record_validation, reconcile unresolved direction markers and resolve doc pins, or request a human contributor exception. Refresh/reconnect the MCP catalog if assessment tools or inputs are missing.`;
 }

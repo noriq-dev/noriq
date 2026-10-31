@@ -1,3 +1,4 @@
+import { ReadinessOverrideForm } from './ReadinessOverrideForm';
 import { AssessmentForm } from './AssessmentForm';
 // Review queue (PLNR-124) — the human's backlog: everything agents released to
 // `review`, as a focused list with one-click accept / send-back instead of drag
@@ -208,6 +209,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
     else store.actions.setView('plans');
   };
 
+  const [overrideItem,setOverrideItem]=useState<ApiEntityReviewInboxItem|null>(null);
   const [assessmentItem, setAssessmentItem] = useState<ApiEntityReviewInboxItem | null>(null);
   const markValidated = async (item: ApiEntityReviewInboxItem) => { setAssessmentItem(item); };
 
@@ -278,6 +280,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
 
   return (
     <>
+      {overrideItem && <ReadinessOverrideForm projectId={pid} subjectId={overrideItem.subjectId} onCancel={()=>setOverrideItem(null)} onSaved={async()=>{setOverrideItem(null);await load(false);}} />}
       {assessmentItem && <AssessmentForm projectId={pid} subjectType={assessmentItem.subjectType} subjectId={assessmentItem.subjectId}
         onCancel={() => setAssessmentItem(null)} onSaved={async () => { setAssessmentItem(null); await load(false); }} />}
       <div style={{ marginBottom: 14 }}>
@@ -345,6 +348,7 @@ function ValidityInbox({ store }: { store: AppStore }) {
                   pid={pid}
                   busy={acting === item.subjectId}
                   onOpen={() => openSubject(item)}
+                  onOverride={store.permissions.canContribute && item.subjectType === "task" ? ()=>setOverrideItem(item) : undefined}
                   onValidate={() => void markValidated(item)}
                   onDismiss={(c) => void dismissCause(item, c)}
                   onSnooze={(c, seconds) => void snoozeCause(item, c, seconds)}
@@ -391,12 +395,13 @@ const SNOOZE_PRESETS: Array<{ label: string; seconds: number }> = [
 ];
 
 function ValidityRow({
-  item, pid, busy, onOpen, onValidate, onDismiss, onSnooze, onSupersede,
+  item, pid, busy, onOpen, onValidate, onDismiss, onSnooze, onSupersede, onOverride,
 }: {
   item: ApiEntityReviewInboxItem;
   pid: string;
   busy: boolean;
   onOpen: () => void;
+  onOverride?: () => void;
   onValidate: () => void;
   onDismiss: (cause: ApiReviewCause) => void;
   onSnooze: (cause: ApiReviewCause, durationSeconds: number) => void;
@@ -458,6 +463,7 @@ function ValidityRow({
           <Button variant="primary" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onValidate}>
             record evidence
           </Button>
+          {onOverride && <Button variant="ghost" onClick={onOverride}>Explicit exception</Button>}
           <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={onOpen}>
             open
           </Button>
