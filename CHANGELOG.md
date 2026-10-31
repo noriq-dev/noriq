@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.81.1 - 2026-10-31
+
+### Cohesive project settings + evidence UI (PLNR-622)
+
+- Align Validation policy, Validity inbox, Dormancy, and evidence forms with Project Settings chrome (SectionLabel / Field kit).
+- Group settings sections so validation sits with other policy controls instead of competing as a bare island.
+- Restyle AssessmentForm, AssessmentHistory, ReadinessOverrideForm, DirectionMarkerAction, and ValidityStrip assessment summary to match drawer/Review language.
+
 ## 0.81.0 - 2026-10-31
 
 ### Enforceable project validation (PLNR-620)
