@@ -33,7 +33,11 @@ import {
   AskActionConflictError, AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
   ASK_TASK_ACTION_EXECUTORS, approveAskAction, listAskActions, rejectAskAction,
 } from './ask-actions';
-import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
+import {
+  verifyUploadToken, verifyDocBodyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken,
+  type IngestClaims,
+} from './lib/upload-token';
+import { DOC_BODY_SOFT_MAX_BYTES } from './lib/doc-body-ops';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
   groupRoleAllows, projectRoleAllows, resolveAccountCapabilities, resolveGroupRole, resolveProjectAccess,
@@ -4116,6 +4120,71 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
 // the authorization, minted by attach_files upload mode for exactly this (agent, task,
 // file). Bytes stream straight to R2, never through the model context. Mirrors the POST
 // route above, including the PLNR-98 real-size check (Content-Length is client-controlled).
+// Large doc body upload (PLNR-627 / Design B). Token typ=doc_body minted by create_doc /
+// update_doc bodySource.kind=upload. Bytes are UTF-8 markdown committed through ProjectRoom
+// (lint + version + index) — D1 remains canonical storage; the token is only a staging conduit.
+app.put('/api/docs/upload/:token', async (c) => {
+  const secret = resolveUploadSecret(c.env);
+  if (!secret) return c.json({ error: 'uploads not enabled' }, 503);
+  const claims = await verifyDocBodyUploadToken(secret, c.req.param('token')!, Math.floor(Date.now() / 1000));
+  if (!claims) return c.json({ error: 'invalid or expired upload token' }, 401);
+  if (Number(c.req.header('Content-Length') ?? '0') > claims.max) {
+    return c.json({ error: `doc body exceeds ${claims.max} bytes` }, 413);
+  }
+  const raw = await c.req.arrayBuffer();
+  if (raw.byteLength === 0 || raw.byteLength > claims.max) {
+    return c.json({ error: `doc body must be 1 byte – ${claims.max} bytes (got ${raw.byteLength})` }, 413);
+  }
+  if (raw.byteLength > DOC_BODY_SOFT_MAX_BYTES) {
+    return c.json({ error: `doc body exceeds soft max ${DOC_BODY_SOFT_MAX_BYTES} bytes` }, 413);
+  }
+  const body = new TextDecoder().decode(raw);
+  const agentRow = await c.env.DB.prepare('SELECT id, COALESCE(label, name) AS name FROM agents WHERE id = ?')
+    .bind(claims.agentId).first<{ id: string; name: string }>();
+  if (!agentRow) return c.json({ error: 'agent not found' }, 401);
+  const actor: Actor = { kind: 'agent', id: agentRow.id, name: agentRow.name };
+  try {
+    if (claims.op === 'create') {
+      if (!claims.name?.trim()) return c.json({ error: 'upload token missing doc name' }, 400);
+      let assessment: ReturnType<typeof AssessmentInput.parse> | undefined;
+      if (claims.assessmentJson) {
+        try { assessment = AssessmentInput.parse(JSON.parse(claims.assessmentJson)); }
+        catch { return c.json({ error: 'upload token assessment is invalid' }, 400); }
+      }
+      let tags: string[] | undefined;
+      if (claims.tagsJson) {
+        try { tags = JSON.parse(claims.tagsJson) as string[]; }
+        catch { return c.json({ error: 'upload token tags are invalid' }, 400); }
+      }
+      const created = await room(c.env, claims.pid).createDoc(claims.pid, actor, {
+        id: claims.docId,
+        name: claims.name,
+        description: claims.description,
+        body,
+        folder: claims.folder,
+        tags,
+        allowNewTags: claims.allowNewTags,
+        assessment,
+      });
+      return c.json({ ...created, ok: true, resource: `noriq://doc/${claims.docId}` });
+    }
+    const updated = await room(c.env, claims.pid).updateDoc(claims.pid, actor, claims.docId, {
+      mode: 'replace',
+      body,
+      expectedVersion: claims.expectedVersion,
+      requireExpectedVersion: true,
+    });
+    return c.json({ ...updated, ok: true, docId: claims.docId, resource: `noriq://doc/${claims.docId}` });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = /conflict|expectedVersion|already exists/i.test(message) ? 409
+      : /not found/i.test(message) ? 404
+      : /rejected|too large|exceeds|doclint|open-ended/i.test(message) ? 400
+      : 400;
+    return c.json({ error: message }, status);
+  }
+});
+
 app.put('/api/attachments/upload/:token', async (c) => {
   if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
   const secret = resolveUploadSecret(c.env);

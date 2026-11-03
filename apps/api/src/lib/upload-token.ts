@@ -49,6 +49,32 @@ export interface IngestClaims {
   exp: number; // expiry, epoch seconds
 }
 
+/**
+ * Capability token for large markdown doc body create/replace (PLNR-627 / Design B).
+ * Minted by create_doc / update_doc with bodySource.kind=upload; consumed by
+ * PUT /api/docs/upload/:token which commits UTF-8 markdown through ProjectRoom.
+ */
+export interface DocBodyUploadClaims {
+  typ: 'doc_body';
+  op: 'create' | 'replace';
+  pid: string;
+  /** Existing doc id for replace; pre-allocated id for create. */
+  docId: string;
+  agentId: string;
+  /** Required for create — name is fixed at mint time. */
+  name?: string;
+  description?: string;
+  folder?: string;
+  tagsJson?: string;
+  allowNewTags?: boolean;
+  /** For replace — optimistic concurrency when set. */
+  expectedVersion?: number;
+  /** Serialized AssessmentInput for create commits (strict projects). */
+  assessmentJson?: string;
+  max: number;
+  exp: number;
+}
+
 const enc = new TextEncoder();
 
 function b64url(bytes: Uint8Array): string {
@@ -114,6 +140,10 @@ export const verifyUploadToken = (secret: string, token: string, nowSec: number)
 export const signIngestToken = (secret: string, claims: IngestClaims): Promise<string> => signToken(secret, claims);
 export const verifyIngestToken = (secret: string, token: string, nowSec: number): Promise<IngestClaims | null> =>
   verifyToken<IngestClaims>(secret, token, nowSec, 'ingest');
+
+export const signDocBodyUploadToken = (secret: string, claims: DocBodyUploadClaims): Promise<string> => signToken(secret, claims);
+export const verifyDocBodyUploadToken = (secret: string, token: string, nowSec: number): Promise<DocBodyUploadClaims | null> =>
+  verifyToken<DocBodyUploadClaims>(secret, token, nowSec, 'doc_body');
 
 /** The ONE place both the mint side (mcp.ts, the ingest capability route) and the consume side
  *  (the attachment/ingest routes here) resolve the signing secret — previously duplicated as the

@@ -71,7 +71,16 @@ export interface SearchBackend { embedder: EmbeddingClient; store: VectorStore }
 
 const EMBEDDING_MODEL = '@cf/baai/bge-m3';
 const CHUNK_CHARS = 1500;
-const MAX_DOC_CHUNKS = 32; // ~48k chars of a doc get embedded; beyond that is ignored
+/** PLNR-627: 64 × 1500 ≈ 96k chars embedded — covers typical 72k large docs. */
+export const MAX_DOC_CHUNKS = 64;
+export const DOC_CHUNK_CHARS = CHUNK_CHARS;
+export const DOC_SEARCH_INDEX_SOFT_CHARS = MAX_DOC_CHUNKS * CHUNK_CHARS;
+
+/** How much of a doc body is indexed, and whether the tail was truncated. */
+export function docSearchCoverage(bodyChars: number): { searchIndexedChars: number; searchTruncated: boolean } {
+  const searchIndexedChars = Math.min(bodyChars, DOC_SEARCH_INDEX_SOFT_CHARS);
+  return { searchIndexedChars, searchTruncated: bodyChars > DOC_SEARCH_INDEX_SOFT_CHARS };
+}
 
 // PLNR-281: Vectorize hard-rejects `topK > 50` whenever a query asks for `returnValues: true`
 // or `returnMetadata: 'all'` (VECTOR_QUERY_ERROR, code 40025) — every adapter here always asks

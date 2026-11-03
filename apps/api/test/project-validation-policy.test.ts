@@ -63,9 +63,9 @@ describe('strict project policy',()=>{
  it('settled doc writes require assessed versions, metadata stays available',async()=>{
   expect((await call('create_doc',{name:'Unverified doc',body:'The protocol uses JSON.'})).isError).toBe(true);
   const r=await call('create_doc',{name:'Assessed doc',body:'The protocol uses JSON.',assessment:evidence('document')});expect(r.isError).toBeFalsy();const docId=r.body.id;
-  expect((await call('update_doc',{docId,body:'The protocol uses CBOR.'})).isError).toBe(true);
+  expect((await call('update_doc',{docId,expectedVersion:1,body:'The protocol uses CBOR.'})).isError).toBe(true);
   expect((await call('get_doc',{docId})).body.body).toBe('The protocol uses JSON.');
-  expect((await call('update_doc',{docId,body:'The protocol uses CBOR.',assessment:evidence('document')})).isError).toBeFalsy();
+  expect((await call('update_doc',{docId,expectedVersion:1,body:'The protocol uses CBOR.',assessment:evidence('document')})).isError).toBeFalsy();
   expect((await call('get_doc',{docId})).body.freshness.assessment.readiness.state).toBe('passed');
   expect((await call('update_doc',{docId,folder:'Contracts'})).isError).toBeFalsy();
   expect((await call('update_doc',{docId,tags:['alpha'],addTags:['beta'],removeTags:['alpha']})).isError).toBeFalsy();
@@ -105,7 +105,7 @@ describe('strict project policy',()=>{
   const before=await call('get_doc',{docId});
   await env.DB.exec("CREATE TRIGGER reject_test_evidence BEFORE INSERT ON entity_assessments WHEN json_extract(NEW.assessment_json,'$.summary') = 'Injected persistence failure' BEGIN SELECT RAISE(ABORT,'injected evidence failure'); END;");
   try {
-   expect((await call('update_doc',{docId,body:'The transport uses CBOR.',assessment:{...evidence('document'),summary:'Injected persistence failure'}})).isError).toBe(true);
+   expect((await call('update_doc',{docId,expectedVersion:1,body:'The transport uses CBOR.',assessment:{...evidence('document'),summary:'Injected persistence failure'}})).isError).toBe(true);
   } finally {await env.DB.exec('DROP TRIGGER reject_test_evidence');}
   const after=await call('get_doc',{docId});expect(after.body.body).toBe(before.body.body);expect(after.body.currentVersion).toBe(before.body.currentVersion);expect(after.body.versions).toHaveLength(before.body.versions.length);
  });

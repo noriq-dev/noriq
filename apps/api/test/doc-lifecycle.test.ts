@@ -39,6 +39,7 @@ describe('project doc versions and archive lifecycle', () => {
     const updated = await mcpCall(agent.apiKey, 'update_doc', {
       projectId,
       docId: made.body.id,
+      expectedVersion: 1,
       name: 'Runtime protocol contract',
       description: 'the current settled contract',
       body: 'The runtime uses protocol two.',

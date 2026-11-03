@@ -271,7 +271,9 @@ blocks the doc's central claim, or narrow the doc's scope and ship what IS settl
 — an open question elsewhere does not block documenting a settled component.
 
 \`list_docs\` shows the index (check it before working unfamiliar ground); \`get_doc\`
-reads one, including the tasks that cite it. Docs are organized two ways: **tags**
+reads one (prefer \`view: "outline"\` then \`section\` on large docs — partial reads
+include a segment map of unloaded peers; use \`grep_docs\` to find enclosing heading
+blocks). Docs are organized two ways: **tags**
 (the SAME shared vocabulary as task tags — 1–3 reused tags per doc, filter with
 \`list_docs {tag}\`) and a **folder** path ("design/networking") that exists purely
 for human browsing — you never need it to address a doc, the id does that; reuse
@@ -280,12 +282,15 @@ existing folders rather than minting near-duplicates. Tasks and docs link both w
 follow, and READ a task's related docs (\`get_task\` → \`docs\`) before starting it —
 they are the design decisions your work is expected to honor. When you establish
 something durable the next agent should know, \`create_doc\` the outcome (or bring an
-existing doc to the current truth with \`update_doc\`) instead of leaving it buried in
+existing doc to the current truth with \`update_doc\` — prefer \`mode: "patch"\` +
+\`expectedVersion\`, never resend a 50k+ body for a paragraph change; use
+\`bodySource.kind=upload\` for large create/replace) instead of leaving it buried in
 a comment.
 
 Before your first doc of a session, read the **doc-authoring guide** — what belongs
-in a doc, the shapes that work, and how to write bodies that last: the MCP resource
-\`noriq://skill/doc-authoring\` (resources/read), or \`GET /skill/docs.md\`.
+in a doc, the shapes that work, large-doc outline→section→patch workflow, and how to
+write bodies that last: the MCP resource \`noriq://skill/doc-authoring\` (resources/read),
+or \`GET /skill/docs.md\`.
 
 ## Project memory
 

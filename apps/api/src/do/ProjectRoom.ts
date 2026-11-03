@@ -12,6 +12,16 @@ import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { requireDecisionOnlyDoc } from '../lib/doclint';
 import {
+  assertDocBodySize,
+  bodyMeta,
+  hashDocBody,
+  inlineBodySteerHint,
+  resolveDocWriteBody,
+  DocBodyError,
+  type DocPatchEdit,
+  type DocWriteMode,
+} from '../lib/doc-body-ops';
+import {
   normalizePattern, patternsOverlap, branchScopesOverlap, LOCK_LIMITS,
   type NormalizedPattern, type BranchScope,
 } from '../lib/lockmatch';
@@ -3219,43 +3229,124 @@ export class ProjectRoom extends DurableObject<Env> {
     return assessment;
   }
 
-  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean; assessment?: AssessmentInput }) {
+  async createDoc(projectId: string, actor: Actor, input: {
+    name: string; description?: string; body?: string; folder?: string; tags?: string[];
+    allowNewTags?: boolean; assessment?: AssessmentInput;
+    /** Pre-allocated id for bodySource upload mint → PUT commit. */
+    id?: string;
+  }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const assessment = await this.checkDocEvidence(projectId, actor, true, input.assessment);
-      requireDecisionOnlyDoc(input.body);
-      const id = newId('doc'), created = nowIso();
+      const body = input.body ?? '';
+      assertDocBodySize(body);
+      requireDecisionOnlyDoc(body);
+      const id = input.id ?? newId('doc'), created = nowIso();
+      if (input.id) {
+        const clash = await this.env.DB.prepare('SELECT id FROM docs WHERE id = ?').bind(id).first();
+        if (clash) throw new Error(`doc ${id} already exists — upload token was already committed or id collision`);
+      }
       const evidence = await this.docEvidenceStatements(projectId, actor, id, 1, assessment);
       const tags = await this.docTagStatements(projectId, actor, id, input.tags ?? [], input.allowNewTags);
       await this.env.DB.batch([
         this.env.DB.prepare(`INSERT INTO docs (id,project_id,name,description,body,folder,author_kind,author_name,created_at,updated_at,content_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-          .bind(id,projectId,input.name,input.description ?? '',input.body ?? '',ProjectRoom.normalizeFolder(input.folder ?? ''),actor.kind,actor.name,created,created,created),
+          .bind(id,projectId,input.name,input.description ?? '',body,ProjectRoom.normalizeFolder(input.folder ?? ''),actor.kind,actor.name,created,created,created),
         ...tags, this.docVersionStatement(id,actor), ...evidence,
       ]);
       await this.emit(actor,'doc.created','doc',id,{name:input.name,version:1});
       this.reindexSearch('doc',id);
-      return { id, name: input.name, version: 1 };
+      const contentHash = await hashDocBody(body);
+      const meta = bodyMeta(body, contentHash);
+      const hint = inlineBodySteerHint(body);
+      return {
+        id, name: input.name, version: 1, currentVersion: 1, ...meta,
+        ...(hint ? { hint } : {}),
+      };
     });
   }
 
   async updateDoc(projectId: string, actor: Actor, docId: string,
-    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[]; allowNewTags?: boolean; assessment?: AssessmentInput }) {
+    patch: {
+      name?: string; description?: string; body?: string; folder?: string;
+      tags?: string[]; addTags?: string[]; removeTags?: string[]; allowNewTags?: boolean;
+      assessment?: AssessmentInput;
+      mode?: DocWriteMode;
+      edits?: DocPatchEdit[];
+      /** When set, reject if the live current_version differs (optimistic concurrency). */
+      expectedVersion?: number;
+      /** MCP requires expectedVersion on body changes; REST SPA may omit (last-write-wins). */
+      requireExpectedVersion?: boolean;
+    }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const doc = await this.env.DB.prepare('SELECT id,name,description,body,folder,current_version AS version,archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?')
         .bind(docId,projectId).first<{id:string;name:string;description:string;body:string;folder:string;version:number;archivedAt:string|null}>();
       if (!doc) throw new Error('doc not found in this project');
       if (doc.archivedAt) throw new Error('archived docs are read-only — restore this doc before updating it');
-      const substantive = ['name','description','body'].some(key => patch[key as 'name'|'description'|'body'] !== undefined && patch[key as 'name'|'description'|'body'] !== doc[key as 'name'|'description'|'body']);
+
+      let nextBody = doc.body;
+      let bodyChanged = false;
+      let writeMode: DocWriteMode | undefined;
+      const touchingBody = patch.body !== undefined || patch.mode === 'append' || patch.mode === 'patch' || (patch.edits?.length ?? 0) > 0;
+      if (touchingBody) {
+        try {
+          const resolved = resolveDocWriteBody({
+            mode: patch.mode, body: patch.body, edits: patch.edits, currentBody: doc.body,
+          });
+          nextBody = resolved.nextBody;
+          bodyChanged = resolved.bodyChanged;
+          writeMode = resolved.mode;
+        } catch (err) {
+          if (err instanceof DocBodyError) throw new Error(err.message);
+          throw err;
+        }
+        if (bodyChanged) {
+          if (patch.requireExpectedVersion && patch.expectedVersion === undefined) {
+            throw new Error(`expectedVersion is required when changing a doc body via MCP (currentVersion=${doc.version})`);
+          }
+          if (patch.expectedVersion !== undefined && patch.expectedVersion !== doc.version) {
+            const contentHash = await hashDocBody(doc.body);
+            const meta = bodyMeta(doc.body, contentHash);
+            throw new Error(
+              `doc version conflict: expected ${patch.expectedVersion}, current is ${doc.version} ${JSON.stringify({ currentVersion: doc.version, expectedVersion: patch.expectedVersion, ...meta })}`,
+            );
+          }
+          assertDocBodySize(nextBody);
+          requireDecisionOnlyDoc(nextBody);
+        }
+      } else if (patch.expectedVersion !== undefined && patch.expectedVersion !== doc.version) {
+        const contentHash = await hashDocBody(doc.body);
+        const meta = bodyMeta(doc.body, contentHash);
+        throw new Error(
+          `doc version conflict: expected ${patch.expectedVersion}, current is ${doc.version} ${JSON.stringify({ currentVersion: doc.version, expectedVersion: patch.expectedVersion, ...meta })}`,
+        );
+      }
+
+      const substantive = bodyChanged
+        || (patch.name !== undefined && patch.name !== doc.name)
+        || (patch.description !== undefined && patch.description !== doc.description);
       const assessment = await this.checkDocEvidence(projectId,actor,substantive,patch.assessment);
-      requireDecisionOnlyDoc(patch.body);
-      const fields = Object.keys(patch).filter(k => k !== 'assessment' && k !== 'allowNewTags' && patch[k as keyof typeof patch] !== undefined && !((k === 'addTags' || k === 'removeTags') && !patch[k]?.length));
+
+      const metaKeys = new Set(['assessment','allowNewTags','mode','edits','expectedVersion','requireExpectedVersion']);
+      const fields = Object.keys(patch).filter((k) => {
+        if (metaKeys.has(k)) return false;
+        if (k === 'body' && !bodyChanged) return false;
+        const v = patch[k as keyof typeof patch];
+        if (v === undefined) return false;
+        if ((k === 'addTags' || k === 'removeTags') && !(v as string[]).length) return false;
+        return true;
+      });
+      if (bodyChanged && !fields.includes('body')) fields.push('body');
+      if (writeMode && writeMode !== 'replace') fields.push(`mode:${writeMode}`);
+
       if (!fields.length) {
+        const contentHash = await hashDocBody(doc.body);
+        const meta = bodyMeta(doc.body, contentHash);
         if (assessment) {
           await storeRecordValidation(this.env.DB,projectId,actor,{subjectType:'doc',subjectId:docId,assessment});
           await this.emit(actor,'doc.updated','doc',docId,await this.assessmentEventPayload(projectId, 'doc', docId, assessment));
         }
-        return { ok:true, version:doc.version };
+        return { ok:true, version:doc.version, currentVersion:doc.version, ...meta };
       }
       const version = doc.version + 1, at = nowIso();
       const evidence = await this.docEvidenceStatements(projectId,actor,docId,version,assessment);
@@ -3267,12 +3358,15 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       await this.env.DB.batch([
         this.env.DB.prepare('UPDATE docs SET name=?,description=?,body=?,folder=?,current_version=?,updated_at=?,content_activity_at=? WHERE id=? AND project_id=?')
-          .bind(patch.name ?? doc.name,patch.description ?? doc.description,patch.body ?? doc.body,patch.folder === undefined ? doc.folder : ProjectRoom.normalizeFolder(patch.folder),version,at,at,docId,projectId),
+          .bind(patch.name ?? doc.name,patch.description ?? doc.description,nextBody,patch.folder === undefined ? doc.folder : ProjectRoom.normalizeFolder(patch.folder),version,at,at,docId,projectId),
         ...tagStatements, this.docVersionStatement(docId,actor), ...evidence,
       ]);
       await this.emit(actor,'doc.updated','doc',docId,{name:patch.name ?? doc.name,fields,version});
       this.reindexSearch('doc',docId);
-      return {ok:true,version};
+      const contentHash = await hashDocBody(nextBody);
+      const meta = bodyMeta(nextBody, contentHash);
+      const hint = inlineBodySteerHint(writeMode === 'replace' ? nextBody : undefined);
+      return {ok:true, version, currentVersion: version, ...meta, ...(hint ? { hint } : {})};
     });
   }
 
@@ -3352,36 +3446,82 @@ export class ProjectRoom extends DurableObject<Env> {
       const plan = await this.env.DB.prepare('SELECT id FROM plans WHERE id = ? AND project_id = ?')
         .bind(planId, this.projectId).first<{ id: string }>();
       if (!plan) throw new Error('plan not found in this project');
+      const body = input.body ?? '';
+      assertDocBodySize(body, 'plan doc body');
       const id = newId('pdoc');
       await this.env.DB.prepare(
         'INSERT INTO plan_docs (id, plan_id, project_id, name, description, body, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      ).bind(id, planId, this.projectId, input.name, input.description ?? '', input.body ?? '', actor.kind, actor.name).run();
+      ).bind(id, planId, this.projectId, input.name, input.description ?? '', body, actor.kind, actor.name).run();
       await this.emit(actor, 'plan_doc.created', 'plan_doc', id, { name: input.name, planId });
-      return { id, planId, name: input.name };
+      const contentHash = await hashDocBody(body);
+      return { id, planId, name: input.name, ...bodyMeta(body, contentHash) };
     });
   }
 
   async updatePlanDoc(
     projectId: string, actor: Actor, docId: string,
-    patch: { name?: string; description?: string; body?: string },
+    patch: {
+      name?: string; description?: string; body?: string;
+      mode?: DocWriteMode; edits?: DocPatchEdit[];
+      expectedContentHash?: string;
+      requireExpectedContentHash?: boolean;
+    },
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const doc = await this.env.DB.prepare('SELECT id, plan_id AS planId, name FROM plan_docs WHERE id = ? AND project_id = ?')
-        .bind(docId, this.projectId).first<{ id: string; planId: string; name: string }>();
+      const doc = await this.env.DB.prepare('SELECT id, plan_id AS planId, name, description, body FROM plan_docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; planId: string; name: string; description: string; body: string }>();
       if (!doc) throw new Error('plan doc not found in this project');
       // No doclint here on purpose (PLNR-200): a plan doc may hold open questions / TBDs.
+      const currentHash = await hashDocBody(doc.body);
+      let nextBody = doc.body;
+      let bodyChanged = false;
+      let writeMode: DocWriteMode | undefined;
+      const touchingBody = patch.body !== undefined || patch.mode === 'append' || patch.mode === 'patch' || (patch.edits?.length ?? 0) > 0;
+      if (touchingBody) {
+        try {
+          const resolved = resolveDocWriteBody({
+            mode: patch.mode, body: patch.body, edits: patch.edits, currentBody: doc.body,
+          });
+          nextBody = resolved.nextBody;
+          bodyChanged = resolved.bodyChanged;
+          writeMode = resolved.mode;
+        } catch (err) {
+          if (err instanceof DocBodyError) throw new Error(err.message);
+          throw err;
+        }
+        if (bodyChanged) {
+          if (patch.requireExpectedContentHash && !patch.expectedContentHash) {
+            throw new Error(`expectedContentHash is required when changing a plan doc body via MCP (contentHash=${currentHash})`);
+          }
+          if (patch.expectedContentHash && patch.expectedContentHash !== currentHash) {
+            const meta = bodyMeta(doc.body, currentHash);
+            throw new Error(
+              `plan doc contentHash conflict: expected ${patch.expectedContentHash}, current is ${currentHash} ${JSON.stringify({ ...meta, expectedContentHash: patch.expectedContentHash })}`,
+            );
+          }
+          assertDocBodySize(nextBody, 'plan doc body');
+        }
+      } else if (patch.expectedContentHash && patch.expectedContentHash !== currentHash) {
+        const meta = bodyMeta(doc.body, currentHash);
+        throw new Error(
+          `plan doc contentHash conflict: expected ${patch.expectedContentHash}, current is ${currentHash} ${JSON.stringify({ ...meta, expectedContentHash: patch.expectedContentHash })}`,
+        );
+      }
+
       const sets: string[] = [];
       const binds: unknown[] = [];
-      if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
-      if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
-      if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
-      if (!sets.length) return { ok: true };
+      const fields: string[] = [];
+      if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); fields.push('name'); }
+      if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); fields.push('description'); }
+      if (bodyChanged) { sets.push('body = ?'); binds.push(nextBody); fields.push('body'); if (writeMode && writeMode !== 'replace') fields.push(`mode:${writeMode}`); }
+      if (!sets.length) return { ok: true, ...bodyMeta(doc.body, currentHash) };
       sets.push('updated_at = ?');
       binds.push(nowIso(), docId);
       await this.env.DB.prepare(`UPDATE plan_docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-      await this.emit(actor, 'plan_doc.updated', 'plan_doc', docId, { name: patch.name ?? doc.name, planId: doc.planId, fields: Object.keys(patch) });
-      return { ok: true };
+      await this.emit(actor, 'plan_doc.updated', 'plan_doc', docId, { name: patch.name ?? doc.name, planId: doc.planId, fields });
+      const contentHash = await hashDocBody(nextBody);
+      return { ok: true, ...bodyMeta(nextBody, contentHash) };
     });
   }
 

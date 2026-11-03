@@ -72,6 +72,28 @@ task context, graph retrieval, and the vector store without deleting its version
 doc remains readable by exact id and must be restored before it can be revised. Permanent delete
 is a separate destructive action and removes the whole history.
 
+## Large docs (outline → section → patch)
+
+Bodies can be tens of kilobytes. Do **not** rewrite a 50k+ body to change one paragraph.
+
+1. **Outline first.** \`get_doc\` with \`view: "outline"\` returns a TOC of ATX headings (no body)
+   plus a **segment map**. Prefer this when the doc is above ~12 KiB.
+2. **Open one section.** \`get_doc\` with \`section: "Architecture / Storage"\` (path or unique
+   title) or \`startLine\`/\`endLine\` returns that markdown slice only. Every partial read
+   includes \`segments\` with \`included\` flags so you see sibling sections you did not load.
+3. **Discover with grep.** \`grep_docs\` returns hits with enclosing section \`path\` and the
+   heading block's \`startLine\`/\`endLine\` — pull that whole section next, not a single line.
+4. **Patch, don't replace.** \`update_doc\` with \`mode: "patch"\`, exact
+   \`edits: [{ oldText, newText, occurrence?}]\`, and **\`expectedVersion\`** (required on every
+   body change). Ambiguous \`oldText\` (0 or >1 matches without \`occurrence\`) is rejected.
+   \`mode: "append"\` concatenates; \`replace\` remains the default full-body write.
+5. **Upload for large create/replace.** Soft max **512 KiB**. Above ~**32 KiB** prefer
+   \`bodySource: { kind: "upload" }\` — mint returns \`uploadUrl\`; \`PUT\` UTF-8 markdown to
+   commit (lint + version + index). Never rely on local files as a side channel for settled
+   project docs.
+6. Reads/writes expose \`bodyChars\`, \`contentHash\`, \`totalLines\`, \`currentVersion\`,
+   \`searchIndexedChars\`, and \`searchTruncated\` (indexing covers ~96k chars / 64 chunks).
+
 ## Coverage — the corpus, not just the doc
 
 Completeness is judged twice. Each doc is complete for its own scope (see "Writing
