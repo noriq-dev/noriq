@@ -8,10 +8,10 @@ import {
 import { tokenCanReachProject, userCanAccessProject } from './visibility';
 import {
   applyExecutionEvent,
-  createOrchestration,
   declareExecution,
+  refreshOrchestrationStatus,
 } from './orchestration-store';
-import { nowIso } from './util';
+import { newId, nowIso } from './util';
 
 type CopilotActor = {
   id: string;
@@ -165,16 +165,59 @@ export async function validateCopilotSessionContext(
   }
 }
 
-async function executionForPresence(env: Env, presenceId: string, projectId: string): Promise<ExecutionAssignment | null> {
+type SessionExecution = ExecutionAssignment & {
+  projectId: string;
+  actorId: string | null;
+  status: string;
+  createdAt: string;
+  orchestrationStatus: string;
+};
+
+async function executionForPresence(env: Env, presenceId: string, projectId: string): Promise<SessionExecution | null> {
   const row = await env.DB.prepare(
-    `SELECT id AS executionId, orchestration_id AS orchestrationId,
-            parent_execution_id AS parentExecutionId, role,
-            completeness_status AS lineageStatus
-       FROM execution_nodes
-      WHERE presence_id = ? AND project_id = ? AND kind = 'copilot_session'
-      ORDER BY created_at DESC LIMIT 1`,
-  ).bind(presenceId, projectId).first<Omit<ExecutionAssignment, 'schemaVersion'>>();
+    `SELECT n.id AS executionId, n.project_id AS projectId, n.orchestration_id AS orchestrationId,
+            n.parent_execution_id AS parentExecutionId, n.role,
+            n.completeness_status AS lineageStatus, n.actor_id AS actorId,
+            n.status, n.created_at AS createdAt, o.status AS orchestrationStatus
+       FROM execution_nodes n JOIN orchestrations o ON o.id = n.orchestration_id
+      WHERE n.producer_scope = ? AND n.local_node_key = 'session'
+        AND n.presence_id = ? AND n.project_id = ? AND n.kind = 'copilot_session'
+        AND n.actor_kind = 'copilot'`,
+  ).bind(`mcp-session/${presenceId}/${projectId}`, presenceId, projectId)
+    .first<Omit<SessionExecution, 'schemaVersion'>>();
   return row ? { schemaVersion: 1, ...row } : null;
+}
+
+async function ensureSessionStarted(env: Env, execution: SessionExecution): Promise<void> {
+  let needsStatusRefresh = execution.orchestrationStatus === 'pending';
+  if (execution.status === 'pending') {
+    try {
+      const result = await applyExecutionEvent(env, {
+        projectId: execution.projectId,
+        orchestrationId: execution.orchestrationId, executionId: execution.executionId,
+        eventId: `evt_session_${execution.executionId}_started`, revision: 1,
+        type: 'started', observedAt: execution.createdAt,
+        metadata: { source: 'mcp_session_activity' },
+      });
+      if (result.applied) needsStatusRefresh = false;
+    } catch (error) {
+      // Another request may have inserted the same event after our pending read.
+      // Only that exact event is an acceptable race winner.
+      const accepted = await env.DB.prepare(
+        `SELECT 1 FROM execution_lifecycle_events
+          WHERE event_id = ? AND execution_id = ? AND revision = 1
+            AND event_type = 'started' AND observed_at = ? AND reason IS NULL
+            AND metadata = ?`,
+      ).bind(
+        `evt_session_${execution.executionId}_started`, execution.executionId,
+        execution.createdAt, JSON.stringify({ source: 'mcp_session_activity' }),
+      ).first();
+      if (!accepted) throw error;
+    }
+  }
+  if (needsStatusRefresh) {
+    await refreshOrchestrationStatus(env.DB, execution.orchestrationId);
+  }
 }
 
 async function ensureSessionExecution(
@@ -189,6 +232,7 @@ async function ensureSessionExecution(
     if (hintedParentExecutionId && existing.parentExecutionId !== hintedParentExecutionId) {
       throw new Error('session execution already has a different immutable parent');
     }
+    await ensureSessionStarted(env, existing);
     return existing;
   }
 
@@ -201,39 +245,35 @@ async function ensureSessionExecution(
   }
   if (parent && parent.projectId !== projectId) throw new Error('parent execution is in another project/orchestration');
 
-  let orchestrationId: string;
-  if (parent) {
-    orchestrationId = parent.orchestrationId;
-  } else {
-    orchestrationId = (await createOrchestration(env, {
-      projectId,
-      anchor: { type: 'none' },
-      createdBy: { kind: 'copilot', id: actor.id },
-      completeness: { status: 'partial', missing: ['parent'], reason: 'immediate_parent_unknown' },
-    })).id;
-  }
+  const orchestrationId = parent?.orchestrationId ?? newId('orc');
   const observedAt = nowIso();
-  const declared = await declareExecution(env, {
-    projectId, orchestrationId,
-    parentExecutionId: parent?.id ?? null,
-    producerScope: `mcp-session/${presence.id}/${projectId}`,
-    localNodeKey: 'session',
-    kind: 'copilot_session',
-    role: actor.role === 'orchestrator' ? 'orchestrator' : 'worker',
-    actor: { kind: 'copilot', id: actor.id },
-    presenceId: presence.id,
-    completeness: parent
-      ? { status: 'complete', missing: [], reason: null }
-      : { status: 'partial', missing: ['parent'], reason: 'immediate_parent_unknown' },
-    observedAt,
-  });
-  await applyExecutionEvent(env, {
-    projectId, orchestrationId, executionId: declared.id,
-    eventId: `evt_session_${declared.id}_started`, revision: 1,
-    type: 'started', observedAt,
-    metadata: { source: 'mcp_session_activity' },
-  });
-  return (await executionForPresence(env, presence.id, projectId))!;
+  try {
+    await declareExecution(env, {
+      projectId, orchestrationId,
+      parentExecutionId: parent?.id ?? null,
+      producerScope: `mcp-session/${presence.id}/${projectId}`,
+      localNodeKey: 'session',
+      kind: 'copilot_session',
+      role: actor.role === 'orchestrator' ? 'orchestrator' : 'worker',
+      actor: { kind: 'copilot', id: actor.id },
+      presenceId: presence.id,
+      completeness: parent
+        ? { status: 'complete', missing: [], reason: null }
+        : { status: 'partial', missing: ['parent'], reason: 'immediate_parent_unknown' },
+      newOrchestration: parent ? undefined : {
+        createdBy: { kind: 'copilot', id: actor.id },
+        completeness: { status: 'partial', missing: ['parent'], reason: 'immediate_parent_unknown' },
+      },
+      observedAt,
+    });
+  } catch (error) {
+    const winner = await executionForPresence(env, presence.id, projectId);
+    if (!winner || winner.actorId !== actor.id || (parent && winner.parentExecutionId !== parent.id)
+        || (hintedParentExecutionId && winner.parentExecutionId !== hintedParentExecutionId)) throw error;
+  }
+  const execution = (await executionForPresence(env, presence.id, projectId))!;
+  await ensureSessionStarted(env, execution);
+  return execution;
 }
 
 export async function syncCopilotSession(

@@ -52,6 +52,9 @@ export type DeclareExecutionInput = {
   /** Internal accepting-server exception: a plan pump or verifier may append a new immutable
    * child to its durable work envelope. Public clients cannot set this through REST/MCP schemas. */
   allowTerminalExtension?: boolean;
+  /** Internal session bootstrap: create an unanchored orchestration in the same D1
+   * transaction as its first node, so a losing concurrent declaration leaves no empty root. */
+  newOrchestration?: { createdBy: ActorRef; completeness: { status: LineageStatus; missing: string[]; reason: string } };
   observedAt: string;
 };
 
@@ -160,10 +163,15 @@ export async function createOrchestration(env: Env, input: {
 
 export async function declareExecution(env: Env, input: DeclareExecutionInput): Promise<{ id: string; created: boolean }> {
   const observedAt = iso(input.observedAt, 'observedAt');
-  const orchestration = await env.DB.prepare(
+  const orchestration = input.newOrchestration ? { projectId: input.projectId, status: 'pending' as const } : await env.DB.prepare(
     'SELECT project_id AS projectId, status FROM orchestrations WHERE id = ?',
   ).bind(input.orchestrationId).first<{ projectId: string; status: ExecutionStatus }>();
   if (!orchestration || orchestration.projectId !== input.projectId) throw new Error('orchestration is outside the authorized project');
+  if (input.newOrchestration && (input.parentExecutionId
+      || input.newOrchestration.createdBy.kind !== input.actor?.kind
+      || input.newOrchestration.createdBy.id !== input.actor?.id)) {
+    throw new Error('new orchestration requires a root owned by its creator');
+  }
   if (!input.localNodeKey || !input.producerScope) throw new Error('producerScope and localNodeKey are required');
   if (!await actorExists(env.DB, input.actor)) throw new Error('execution actor does not exist or has the wrong kind');
   const subject = input.subject ?? {};
@@ -226,7 +234,21 @@ export async function declareExecution(env: Env, input: DeclareExecutionInput): 
   }
 
   const id = newId('exe');
-  const statements = [
+  const statements: D1PreparedStatement[] = [];
+  if (input.newOrchestration) {
+    const { createdBy, completeness } = input.newOrchestration;
+    statements.push(env.DB.prepare(
+      `INSERT INTO orchestrations (
+         id, project_id, anchor_type, anchor_id, status, completeness_status,
+         completeness_missing, completeness_reason, created_by_kind, created_by_id, created_at, updated_at
+       ) VALUES (?, ?, 'none', NULL, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      input.orchestrationId, input.projectId, completeness.status,
+      JSON.stringify(completeness.missing), completeness.reason,
+      createdBy.kind, createdBy.id, observedAt, observedAt,
+    ));
+  }
+  statements.push(
     env.DB.prepare(
       `INSERT INTO execution_nodes (
          id, orchestration_id, project_id, parent_execution_id, local_node_key, producer_scope,
@@ -247,7 +269,7 @@ export async function declareExecution(env: Env, input: DeclareExecutionInput): 
       `UPDATE orchestrations SET root_execution_id = ?, updated_at = ?
         WHERE id = ? AND root_execution_id IS NULL AND ? IS NULL`,
     ).bind(id, observedAt, input.orchestrationId, input.parentExecutionId ?? null),
-  ];
+  );
   if (continued) {
     statements.push(env.DB.prepare(
       `INSERT INTO execution_relations (
