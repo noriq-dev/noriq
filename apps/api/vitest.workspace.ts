@@ -88,6 +88,9 @@ const project = (name: string, include: string[], extraBindings: Record<string, 
         // pay for all accumulated state — on GitHub runners the heaviest cases blow
         // through vitest's default 5s (PLNR-169). Only a real hang should time out.
         testTimeout: 30_000,
+        // beforeAll/afterAll share the same OAuth-mint cost; vitest's default hook
+        // timeout is still 10s and flakes claimed-status (and peers) under CI shard load.
+        hookTimeout: 30_000,
         // CJS deps (ajv via MCP SDK; tslib + ASN.1 libs via @simplewebauthn) break
         // the pool's ESM shim; pre-bundle them.
         deps: {
