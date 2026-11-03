@@ -476,16 +476,29 @@ export interface GrepHit {
 export const GREP_DOCS_DEFAULT_SCAN_LIMIT = 100;
 export const GREP_DOCS_MAX_SCAN_LIMIT = 200;
 
-/** Opaque cursor for project-wide grep pagination (updated_at DESC, id DESC). */
-export function encodeGrepDocsCursor(updatedAt: string, id: string): string {
-  return btoa(JSON.stringify({ u: updatedAt, i: id }));
+/**
+ * Opaque cursor for grep pagination (updated_at DESC, id DESC).
+ * - `{ u, i }` — continue with docs strictly after this doc (fully searched).
+ * - `{ u, i, l }` — resume THIS doc starting after 1-based line `l`, then older docs.
+ */
+export function encodeGrepDocsCursor(updatedAt: string, id: string, afterLine?: number): string {
+  const payload: { u: string; i: string; l?: number } = { u: updatedAt, i: id };
+  if (afterLine != null && afterLine > 0) payload.l = afterLine;
+  return btoa(JSON.stringify(payload));
 }
 
-export function decodeGrepDocsCursor(cursor: string): { updatedAt: string; id: string } | null {
+export function decodeGrepDocsCursor(
+  cursor: string,
+): { updatedAt: string; id: string; afterLine?: number } | null {
   try {
-    const raw = JSON.parse(atob(cursor)) as { u?: unknown; i?: unknown };
+    const raw = JSON.parse(atob(cursor)) as { u?: unknown; i?: unknown; l?: unknown };
     if (typeof raw.u !== 'string' || typeof raw.i !== 'string' || !raw.u || !raw.i) return null;
-    return { updatedAt: raw.u, id: raw.i };
+    let afterLine: number | undefined;
+    if (raw.l !== undefined) {
+      if (typeof raw.l !== 'number' || !Number.isInteger(raw.l) || raw.l < 1) return null;
+      afterLine = raw.l;
+    }
+    return { updatedAt: raw.u, id: raw.i, ...(afterLine != null ? { afterLine } : {}) };
   } catch {
     return null;
   }
@@ -494,20 +507,22 @@ export function decodeGrepDocsCursor(cursor: string): { updatedAt: string; id: s
 /**
  * Literal substring search over a doc body (ReDoS-safe — no caller RegExp).
  * Matching is per line; case folding uses toLocaleLowerCase when caseSensitive is false.
+ * `startAfterLine` (1-based) skips lines 1..startAfterLine so a mid-doc hit-cap can resume.
  */
 export function grepDocBody(
   docId: string,
   body: string,
   pattern: string,
-  opts: { caseSensitive?: boolean; maxHits?: number } = {},
+  opts: { caseSensitive?: boolean; maxHits?: number; startAfterLine?: number } = {},
 ): GrepHit[] {
   if (!pattern.length) throw new DocBodyError('grep pattern must be non-empty', 'range_invalid');
   const maxHits = Math.min(Math.max(opts.maxHits ?? 50, 1), 200);
+  const startAfter = Math.max(0, opts.startAfterLine ?? 0);
   const needle = opts.caseSensitive ? pattern : pattern.toLocaleLowerCase();
   const outline = parseMarkdownOutline(body);
   const { lines } = lineParts(body);
   const hits: GrepHit[] = [];
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = startAfter; i < lines.length; i++) {
     const line = lines[i]!;
     const hay = opts.caseSensitive ? line : line.toLocaleLowerCase();
     if (!hay.includes(needle)) continue;

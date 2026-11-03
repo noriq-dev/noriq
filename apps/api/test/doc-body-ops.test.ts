@@ -147,14 +147,33 @@ describe('grepDocBody', () => {
     // Regex metacharacters match literally, not as operators.
     expect(grepDocBody('doc_meta', 'cost is $5.00\n', '$5')).toHaveLength(1);
   });
+
+  it('resumes after startAfterLine within the same doc', () => {
+    const body = '# Doc\n\nMATCH one\nplain\nMATCH two\n';
+    const first = grepDocBody('doc_mid', body, 'MATCH', { maxHits: 1 });
+    expect(first).toHaveLength(1);
+    expect(first[0]!.line).toBe(3);
+    const second = grepDocBody('doc_mid', body, 'MATCH', {
+      maxHits: 1,
+      startAfterLine: first[0]!.line,
+    });
+    expect(second).toHaveLength(1);
+    expect(second[0]!.line).toBe(5);
+  });
 });
 
 describe('grep docs cursor', () => {
-  it('round-trips updatedAt + id', () => {
+  it('round-trips updatedAt + id and optional afterLine', () => {
     const enc = encodeGrepDocsCursor('2026-11-03T12:00:00.000Z', 'doc_abc');
     expect(decodeGrepDocsCursor(enc)).toEqual({
       updatedAt: '2026-11-03T12:00:00.000Z',
       id: 'doc_abc',
+    });
+    const mid = encodeGrepDocsCursor('2026-11-03T12:00:00.000Z', 'doc_abc', 4);
+    expect(decodeGrepDocsCursor(mid)).toEqual({
+      updatedAt: '2026-11-03T12:00:00.000Z',
+      id: 'doc_abc',
+      afterLine: 4,
     });
     expect(decodeGrepDocsCursor('not-a-cursor')).toBeNull();
   });

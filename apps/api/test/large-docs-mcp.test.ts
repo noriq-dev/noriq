@@ -397,15 +397,63 @@ describe('large docs MCP (PLNR-627)', () => {
     expect(page1.body.nextCursor).toEqual(expect.any(String));
     expect(page1.body.truncated).toBe(true);
 
-    const page2 = await mcpCall(agent.apiKey, 'grep_docs', {
+    // Same pattern continues mid-doc first; draining newest then reaches the sibling.
+    const page2a = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: 'HITCAP_SHARED',
+      scanLimit: 2,
+      maxHits: 1,
+      cursor: page1.body.nextCursor,
+    });
+    expect(page2a.isError).toBe(false);
+    expect(page2a.body.hits).toHaveLength(1);
+    expect(page2a.body.hits[0].docId).toBe(newest.body.id);
+    expect(page2a.body.hits[0].line).toBeGreaterThan(page1.body.hits[0].line);
+
+    const page2b = await mcpCall(agent.apiKey, 'grep_docs', {
       projectId,
       pattern: 'HITCAP_SIBLING_ONLY',
       scanLimit: 2,
+      cursor: page2a.body.nextCursor,
+    });
+    expect(page2b.isError).toBe(false);
+    expect(page2b.body.hits.some((h: { docId: string; preview: string }) => (
+      h.docId === sibling.body.id && h.preview.includes('HITCAP_SIBLING_ONLY')
+    ))).toBe(true);
+  });
+
+  it('grep_docs nextCursor retains line position for mid-doc maxHits (same pattern)', async () => {
+    const created = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId,
+      name: 'Grep mid-doc resume',
+      description: 'two matching lines for hit-cap resume',
+      body: '# Mid\n\nSettled MIDDOC_TOKEN first.\nplain line\nSettled MIDDOC_TOKEN second.\n',
+    });
+    expect(created.isError).toBe(false);
+
+    const page1 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      docId: created.body.id,
+      pattern: 'MIDDOC_TOKEN',
+      maxHits: 1,
+    });
+    expect(page1.isError).toBe(false);
+    expect(page1.body.hits).toHaveLength(1);
+    expect(page1.body.hits[0].line).toBe(3);
+    expect(page1.body.nextCursor).toEqual(expect.any(String));
+    expect(page1.body.truncated).toBe(true);
+
+    const page2 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      docId: created.body.id,
+      pattern: 'MIDDOC_TOKEN',
+      maxHits: 1,
       cursor: page1.body.nextCursor,
     });
     expect(page2.isError).toBe(false);
-    expect(page2.body.hits.some((h: { docId: string; preview: string }) => (
-      h.docId === sibling.body.id && h.preview.includes('HITCAP_SIBLING_ONLY')
-    ))).toBe(true);
+    expect(page2.body.hits).toHaveLength(1);
+    expect(page2.body.hits[0].docId).toBe(created.body.id);
+    expect(page2.body.hits[0].line).toBe(5);
+    expect(page2.body.hits[0].preview).toContain('second');
   });
 });

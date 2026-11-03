@@ -1170,46 +1170,99 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       maxHits: z.number().int().min(1).max(200).optional().describe('Default 50'),
       scanLimit: z.number().int().min(1).max(GREP_DOCS_MAX_SCAN_LIMIT).optional()
         .describe(`Docs to scan per call when docId is omitted (default ${GREP_DOCS_DEFAULT_SCAN_LIMIT}, max ${GREP_DOCS_MAX_SCAN_LIMIT})`),
-      cursor: z.string().optional().describe('Continuation from a prior nextCursor (project-wide scans only)'),
+      cursor: z.string().optional().describe('Continuation from a prior nextCursor (may resume mid-document after a hit-cap)'),
     },
     tool(async ({ projectId, pattern, docId, caseSensitive, maxHits, scanLimit, cursor }) => {
-      if (docId && cursor) throw new Error('cursor is only valid for project-wide grep_docs (omit docId)');
       const perDocCap = maxHits ?? 50;
       const limit = Math.min(Math.max(scanLimit ?? GREP_DOCS_DEFAULT_SCAN_LIMIT, 1), GREP_DOCS_MAX_SCAN_LIMIT);
-      const binds: unknown[] = [projectId];
-      let where = 'project_id = ? AND archived_at IS NULL';
-      if (docId) {
-        where += ' AND id = ?';
-        binds.push(docId);
-      } else if (cursor) {
-        const decoded = decodeGrepDocsCursor(cursor);
-        if (!decoded) throw new Error('invalid grep_docs cursor');
-        where += ' AND (updated_at < ? OR (updated_at = ? AND id < ?))';
-        binds.push(decoded.updatedAt, decoded.updatedAt, decoded.id);
+      type DocRow = { id: string; name: string; body: string; updatedAt: string };
+      const decoded = cursor ? decodeGrepDocsCursor(cursor) : null;
+      if (cursor && !decoded) throw new Error('invalid grep_docs cursor');
+      if (docId && decoded && decoded.id !== docId) {
+        throw new Error('grep_docs cursor does not match docId');
       }
-      // Fetch one extra row so we can tell whether older docs remain unscanned.
-      const fetchLimit = docId ? 1 : limit + 1;
-      const { results } = await env.DB.prepare(
-        `SELECT id, name, body, updated_at AS updatedAt FROM docs WHERE ${where} ORDER BY updated_at DESC, id DESC LIMIT ?`,
-      ).bind(...binds, fetchLimit).all<{ id: string; name: string; body: string; updatedAt: string }>();
 
-      const page = docId ? results : results.slice(0, limit);
-      const hasMoreDocs = !docId && results.length > limit;
+      const page: DocRow[] = [];
+      let hasMoreDocs = false;
+      let resumeAfterLine = 0;
+
+      if (docId) {
+        const row = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs
+           WHERE project_id = ? AND archived_at IS NULL AND id = ?`,
+        ).bind(projectId, docId).first<DocRow>();
+        if (row) page.push(row);
+        if (decoded?.afterLine) resumeAfterLine = decoded.afterLine;
+      } else if (decoded?.afterLine) {
+        // Mid-doc resume: re-fetch this doc, then older siblings within the scan budget.
+        const resume = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs
+           WHERE project_id = ? AND archived_at IS NULL AND id = ?`,
+        ).bind(projectId, decoded.id).first<DocRow>();
+        if (!resume || resume.updatedAt !== decoded.updatedAt) {
+          throw new Error('grep_docs cursor doc is stale or missing');
+        }
+        resumeAfterLine = decoded.afterLine;
+        page.push(resume);
+        const olderLimit = Math.max(limit - 1, 0);
+        if (olderLimit > 0) {
+          const { results: older } = await env.DB.prepare(
+            `SELECT id, name, body, updated_at AS updatedAt FROM docs
+             WHERE project_id = ? AND archived_at IS NULL
+               AND (updated_at < ? OR (updated_at = ? AND id < ?))
+             ORDER BY updated_at DESC, id DESC LIMIT ?`,
+          ).bind(projectId, decoded.updatedAt, decoded.updatedAt, decoded.id, olderLimit + 1)
+            .all<DocRow>();
+          hasMoreDocs = older.length > olderLimit;
+          page.push(...older.slice(0, olderLimit));
+        } else {
+          const more = await env.DB.prepare(
+            `SELECT 1 AS ok FROM docs
+             WHERE project_id = ? AND archived_at IS NULL
+               AND (updated_at < ? OR (updated_at = ? AND id < ?))
+             LIMIT 1`,
+          ).bind(projectId, decoded.updatedAt, decoded.updatedAt, decoded.id)
+            .first<{ ok: number }>();
+          hasMoreDocs = !!more;
+        }
+      } else {
+        const binds: unknown[] = [projectId];
+        let where = 'project_id = ? AND archived_at IS NULL';
+        if (decoded) {
+          // Fully past this doc — continue with strictly older docs.
+          where += ' AND (updated_at < ? OR (updated_at = ? AND id < ?))';
+          binds.push(decoded.updatedAt, decoded.updatedAt, decoded.id);
+        }
+        const { results } = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs WHERE ${where}
+           ORDER BY updated_at DESC, id DESC LIMIT ?`,
+        ).bind(...binds, limit + 1).all<DocRow>();
+        hasMoreDocs = results.length > limit;
+        page.push(...results.slice(0, limit));
+      }
+
       const hits: Array<ReturnType<typeof grepDocBody>[number] & { docName: string }> = [];
       let hitsCapped = false;
-      let lastSearched: { id: string; updatedAt: string } | null = null;
+      let lastSearched: DocRow | null = null;
+      let resumeAfterHitLine: number | null = null;
+      let lastDocLineCount = 0;
       let searched = 0;
       for (const doc of page) {
-        lastSearched = { id: doc.id, updatedAt: doc.updatedAt };
+        lastSearched = doc;
         searched += 1;
+        const startAfterLine = searched === 1 && resumeAfterLine > 0 ? resumeAfterLine : 0;
+        const body = doc.body ?? '';
+        lastDocLineCount = body.length ? body.split(/\r?\n/).length : 0;
         try {
-          for (const hit of grepDocBody(doc.id, doc.body ?? '', pattern, {
+          for (const hit of grepDocBody(doc.id, body, pattern, {
             caseSensitive,
             maxHits: perDocCap - hits.length,
+            startAfterLine,
           })) {
             hits.push({ ...hit, docName: doc.name });
             if (hits.length >= perDocCap) {
               hitsCapped = true;
+              resumeAfterHitLine = hit.line;
               break;
             }
           }
@@ -1219,13 +1272,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }
         if (hitsCapped) break;
       }
-      // Cursor advances from the last doc we actually searched — not the last fetched.
-      // Hitting maxHits mid-page must still continue into remaining siblings on that page
-      // (and any docs beyond), otherwise those bodies are silently skipped.
-      const unscannedRemain = !docId && !!lastSearched && (searched < page.length || hasMoreDocs);
-      const nextCursor = unscannedRemain
-        ? encodeGrepDocsCursor(lastSearched!.updatedAt, lastSearched!.id)
-        : null;
+
+      // Prefer mid-doc continuation when maxHits stopped before the last line; otherwise
+      // advance past the last fully searched doc when siblings/older docs remain.
+      let nextCursor: string | null = null;
+      if (lastSearched) {
+        if (hitsCapped && resumeAfterHitLine != null && resumeAfterHitLine < lastDocLineCount) {
+          nextCursor = encodeGrepDocsCursor(lastSearched.updatedAt, lastSearched.id, resumeAfterHitLine);
+        } else if (searched < page.length || hasMoreDocs) {
+          nextCursor = encodeGrepDocsCursor(lastSearched.updatedAt, lastSearched.id);
+        }
+      }
       return {
         hits,
         truncated: hitsCapped || !!nextCursor,
