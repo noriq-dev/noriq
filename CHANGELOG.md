@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.81.4 - 2026-11-03
+
+### Concurrent copilot session bootstrap
+
+- Harden copilot session execution bootstrap so concurrent sessions no longer race when claiming or creating the session execution row.
+- `catalogRevision` remains **8** (no MCP catalog change).
+
 ## 0.81.3 - 2026-11-03
 
 ### Large docs MCP (PLNR-627)
