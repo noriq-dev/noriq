@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.81.3 - 2026-11-03
+
+### Large docs MCP (PLNR-627)
+
+- Agents can patch/append/replace project doc bodies with `expectedVersion`, upload full bodies via `doc_body` tokens, and read markdown outlines, sections, and segment maps without full-body round-trips.
+- Adds `grep_docs` (literal, ReDoS-safe) with honest project-wide scan pagination, raises `MAX_DOC_CHUNKS` to 64, and bumps MCP `catalogRevision` to **8**.
+
 ## 0.81.2 - 2026-10-31
 
 ### Validation event labels (PLNR-624)
