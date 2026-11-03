@@ -58,7 +58,7 @@ describe('docs contract at the write seam', () => {
 
   it('update_doc enforces the same contract', async () => {
     const r = await mcpCall(agent.apiKey, 'update_doc', {
-      projectId, docId, body: 'We need to decide where sessions live.',
+      projectId, docId, expectedVersion: 1, body: 'We need to decide where sessions live.',
     });
     expect(r.isError).toBe(true);
     const reread = await mcpCall(agent.apiKey, 'get_doc', { projectId, docId });
@@ -67,7 +67,7 @@ describe('docs contract at the write seam', () => {
 
   it('a clean revision passes', async () => {
     const r = await mcpCall(agent.apiKey, 'update_doc', {
-      projectId, docId, body: 'Sessions live in the session store DO, keyed by cookie id. TTL is 30 days.',
+      projectId, docId, expectedVersion: 1, body: 'Sessions live in the session store DO, keyed by cookie id. TTL is 30 days.',
     });
     expect(r.isError).toBe(false);
   });

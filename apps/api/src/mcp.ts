@@ -41,7 +41,27 @@ import { LOCKING_SKILL_MD } from './skill-locking';
 import { PLANNING_SKILL_MD } from './skill-planning';
 import { MEMORY_SKILL_MD } from './skill-memory';
 import { SKILL_MD } from './skill';
-import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
+import { signUploadToken, signDocBodyUploadToken, resolveUploadSecret } from './lib/upload-token';
+import {
+  DOC_BODY_INLINE_STEER_BYTES,
+  DOC_BODY_OUTLINE_HINT_CHARS,
+  DOC_BODY_SOFT_MAX_BYTES,
+  DOC_PATCH_MAX_EDITS,
+  DOC_PATCH_MAX_TEXT_CHARS,
+  DocBodyError,
+  GREP_DOCS_DEFAULT_SCAN_LIMIT,
+  GREP_DOCS_MAX_SCAN_LIMIT,
+  bodyMeta,
+  buildSegmentMap,
+  decodeGrepDocsCursor,
+  encodeGrepDocsCursor,
+  grepDocBody,
+  hashDocBody,
+  inlineBodySteerHint,
+  parseMarkdownOutline,
+  sliceBySection,
+  sliceDocByLines,
+} from './lib/doc-body-ops';
 import { presentCreatedPhases, presentPhaseOrder } from './lib/phase-order';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import pkg from '../package.json';
@@ -396,7 +416,7 @@ const WRITE_DESTRUCTIVE: ToolHints = { ...WRITE, destructiveHint: true };
  */
 export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   get_briefing: READ, my_updates: READ, list_agents: READ, list_groups: READ,
-  list_templates: READ, list_docs: READ, get_doc: READ, get_project: READ, get_task: READ,
+  list_templates: READ, list_docs: READ, get_doc: READ, grep_docs: READ, get_project: READ, get_task: READ,
   list_comments: READ,
   search_tasks: READ, semantic_search: READ, tag_report: READ,
   next_claimable: READ, check_locks: READ, list_locks: READ,
@@ -431,7 +451,7 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
 export type ToolAudience = 'core' | 'planning' | 'maintenance' | 'orchestration';
 export const MCP_TOOL_AUDIENCE: Record<string, ToolAudience> = {
   get_briefing: 'core', my_updates: 'core', configure_agent: 'core', list_agents: 'core',
-  list_docs: 'core', get_doc: 'core', get_project: 'core', create_tasks: 'core', update_tasks: 'core',
+  list_docs: 'core', get_doc: 'core', grep_docs: 'core', get_project: 'core', create_tasks: 'core', update_tasks: 'core',
   get_task: 'core', list_comments: 'core', handoff_task: 'core', search_tasks: 'core', semantic_search: 'core', attach_files: 'core',
   next_claimable: 'core', claim_task: 'core', heartbeat: 'core', release_task: 'core', acquire_lock: 'core',
   release_lock: 'core', check_locks: 'core', list_locks: 'core', post_comment: 'core', acknowledge_comment: 'core',
@@ -477,7 +497,7 @@ export const SERVER_INFO = {
   description:
     'AI-native project management — MCP coordination for agents, mission control for humans. Call get_briefing first; claim before work; boardId is required on create_tasks (the UI All board is virtual and not a boardId).',
   websiteUrl: 'https://plan.frs.llc',
-  catalogRevision: 7,
+  catalogRevision: 8,
 };
 
 /** Discovery metadata for the deployed catalogue. */
@@ -1030,9 +1050,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_doc',
-    'Read a project doc in full (markdown), plus its immutable version index and the tasks that cite it. Also returns `freshness` / `supersession` / `lastValidatedAt` for the current subject (same shape as get_task — no follow-up get_freshness needed). Omit version for the current body or pass a version number to read that historical snapshot. Archived docs remain readable by exact id but are absent from list_docs and search. What the current version states is settled — build to it; if reality has moved on, restore if needed and update_doc to the new truth rather than silently deviating.',
-    { projectId: z.string(), docId: z.string(), version: z.number().int().positive().optional().describe('Read a specific historical version (1-based); omit for the current one') },
-    tool(async ({ projectId, docId, version }) => {
+    'Read a project doc. Prefer view="outline" first on large docs, then section/path or startLine/endLine to fetch one subtree — partial reads always include a segment map of peer sections you did not load. Full body still works; above ~12 KiB the result hints outline-first. Also returns freshness/supersession/lastValidatedAt (same shape as get_task). Pass version for a historical snapshot. Soft body max 512 KiB; resource noriq://doc/{id} remains full-body.',
+    {
+      projectId: z.string(),
+      docId: z.string(),
+      version: z.number().int().positive().optional().describe('Read a specific historical version (1-based); omit for the current one'),
+      view: z.enum(['full', 'outline']).optional().describe('outline = TOC only (no body); default full'),
+      section: z.string().optional().describe('Heading title or path like "Architecture / Storage / D1" — returns that markdown subtree'),
+      startLine: z.number().int().positive().optional().describe('1-based inclusive line range start (escape hatch)'),
+      endLine: z.number().int().positive().optional().describe('1-based inclusive line range end'),
+      depth: z.number().int().min(0).max(6).optional().describe('Nesting limit under section (default: full subtree until next same-or-higher heading)'),
+    },
+    tool(async ({ projectId, docId, version, view, section, startLine, endLine, depth }) => {
       const current = await env.DB.prepare(
         `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind,
                 d.author_name AS authorName, d.updated_at AS updatedAt,
@@ -1053,6 +1082,64 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         delete doc.tagsJson;
       }
       if (version === undefined) doc.tags = doc.tags ? String(doc.tags).split(',') : [];
+      const fullBody = String(doc.body ?? '');
+      const contentHash = await hashDocBody(fullBody);
+      const meta = bodyMeta(fullBody, contentHash);
+      const [freshness, supersession] = await Promise.all([
+        subjectFreshness(env.DB, projectId, 'doc', docId),
+        getSupersession(env.DB, projectId, 'doc', docId),
+      ]);
+      const base = {
+        id: doc.id, name: doc.name, description: doc.description, folder: doc.folder,
+        tags: doc.tags, authorKind: doc.authorKind, authorName: doc.authorName, updatedAt: doc.updatedAt,
+        version: doc.version, currentVersion: doc.currentVersion, archivedAt: doc.archivedAt,
+        resource: docUri(String(doc.id)),
+        freshness, supersession, lastValidatedAt: freshness.lastValidatedAt,
+        ...meta,
+      };
+
+      const wantsOutline = view === 'outline';
+      const wantsPartial = !!(section || (startLine != null && endLine != null));
+      if (wantsOutline) {
+        const outline = parseMarkdownOutline(fullBody);
+        return {
+          ...base,
+          view: 'outline',
+          outline,
+          segments: buildSegmentMap(fullBody, null),
+          selection: { mode: 'outline' as const },
+          body: undefined,
+          hint: 'Use get_doc with section="<path>" or startLine/endLine to load one subtree; partial reads include a segment map of unloaded peers.',
+        };
+      }
+
+      if (wantsPartial) {
+        try {
+          const sliced = section
+            ? sliceBySection(fullBody, { path: section, title: section }, depth)
+            : (() => {
+              const lines = sliceDocByLines(fullBody, startLine!, endLine!);
+              const covering = parseMarkdownOutline(fullBody).find(
+                (h) => h.startLine <= lines.startLine && h.endLine >= lines.endLine,
+              );
+              return { ...lines, path: covering?.path ?? '', selection: { ...lines.selection, path: covering?.path } };
+            })();
+          return {
+            ...base,
+            body: sliced.body,
+            segments: buildSegmentMap(fullBody, { startLine: sliced.startLine, endLine: sliced.endLine }),
+            selection: sliced.selection,
+            versions: undefined,
+            linkedTasks: undefined,
+          };
+        } catch (err) {
+          if (err instanceof DocBodyError) {
+            throw new Error(`${err.message}${err.details?.candidates ? ` candidates=${JSON.stringify(err.details.candidates)}` : ''}`);
+          }
+          throw err;
+        }
+      }
+
       const { results: versions } = await env.DB.prepare(
         `SELECT version, name, description, author_kind AS authorKind, author_name AS authorName,
                 created_at AS createdAt FROM doc_versions WHERE doc_id = ? ORDER BY version DESC`,
@@ -1061,57 +1148,282 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status
          FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ? ORDER BY t.key`,
       ).bind(docId).all();
-      // Freshness is always for the live subject (current version), even when reading history.
-      const [freshness, supersession] = await Promise.all([
-        subjectFreshness(env.DB, projectId, 'doc', docId),
-        getSupersession(env.DB, projectId, 'doc', docId),
-      ]);
+      const hint = meta.bodyChars > DOC_BODY_OUTLINE_HINT_CHARS
+        ? `Body is ${meta.bodyChars} chars — prefer get_doc view="outline" then section/path for targeted reads before patching.`
+        : undefined;
       return {
-        ...doc, resource: docUri(String(doc.id)), versions, linkedTasks: tasks,
-        freshness, supersession, lastValidatedAt: freshness.lastValidatedAt,
+        ...base, body: fullBody, versions, linkedTasks: tasks,
+        selection: { mode: 'full' as const },
+        ...(hint ? { hint } : {}),
       };
     }),
   );
 
   defineTool(
+    'grep_docs',
+    'Literal substring search over project doc bodies (ReDoS-safe — not a RegExp). Each hit includes the enclosing markdown section path plus suggested startLine/endLine for that heading block so the next get_doc can pull the whole section. Project-wide scans page with scanLimit + cursor/nextCursor; truncated is true when hits are capped or unscanned docs remain.',
+    {
+      projectId: z.string(),
+      pattern: z.string().min(1).max(200).describe('Literal substring to find (case-insensitive by default; not a RegExp)'),
+      docId: z.string().optional().describe('Limit to one doc; omit to scan active docs in the project (paged)'),
+      caseSensitive: z.boolean().optional(),
+      maxHits: z.number().int().min(1).max(200).optional().describe('Default 50'),
+      scanLimit: z.number().int().min(1).max(GREP_DOCS_MAX_SCAN_LIMIT).optional()
+        .describe(`Docs to scan per call when docId is omitted (default ${GREP_DOCS_DEFAULT_SCAN_LIMIT}, max ${GREP_DOCS_MAX_SCAN_LIMIT})`),
+      cursor: z.string().optional().describe('Continuation from a prior nextCursor (may resume mid-document after a hit-cap)'),
+    },
+    tool(async ({ projectId, pattern, docId, caseSensitive, maxHits, scanLimit, cursor }) => {
+      const perDocCap = maxHits ?? 50;
+      const limit = Math.min(Math.max(scanLimit ?? GREP_DOCS_DEFAULT_SCAN_LIMIT, 1), GREP_DOCS_MAX_SCAN_LIMIT);
+      type DocRow = { id: string; name: string; body: string; updatedAt: string };
+      const decoded = cursor ? decodeGrepDocsCursor(cursor) : null;
+      if (cursor && !decoded) throw new Error('invalid grep_docs cursor');
+      if (docId && decoded && decoded.id !== docId) {
+        throw new Error('grep_docs cursor does not match docId');
+      }
+
+      const page: DocRow[] = [];
+      let hasMoreDocs = false;
+      let resumeAfterLine = 0;
+
+      if (docId) {
+        const row = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs
+           WHERE project_id = ? AND archived_at IS NULL AND id = ?`,
+        ).bind(projectId, docId).first<DocRow>();
+        if (row) page.push(row);
+        if (decoded?.afterLine) resumeAfterLine = decoded.afterLine;
+      } else if (decoded?.afterLine) {
+        // Mid-doc resume: re-fetch this doc, then older siblings within the scan budget.
+        const resume = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs
+           WHERE project_id = ? AND archived_at IS NULL AND id = ?`,
+        ).bind(projectId, decoded.id).first<DocRow>();
+        if (!resume || resume.updatedAt !== decoded.updatedAt) {
+          throw new Error('grep_docs cursor doc is stale or missing');
+        }
+        resumeAfterLine = decoded.afterLine;
+        page.push(resume);
+        const olderLimit = Math.max(limit - 1, 0);
+        if (olderLimit > 0) {
+          const { results: older } = await env.DB.prepare(
+            `SELECT id, name, body, updated_at AS updatedAt FROM docs
+             WHERE project_id = ? AND archived_at IS NULL
+               AND (updated_at < ? OR (updated_at = ? AND id < ?))
+             ORDER BY updated_at DESC, id DESC LIMIT ?`,
+          ).bind(projectId, decoded.updatedAt, decoded.updatedAt, decoded.id, olderLimit + 1)
+            .all<DocRow>();
+          hasMoreDocs = older.length > olderLimit;
+          page.push(...older.slice(0, olderLimit));
+        } else {
+          const more = await env.DB.prepare(
+            `SELECT 1 AS ok FROM docs
+             WHERE project_id = ? AND archived_at IS NULL
+               AND (updated_at < ? OR (updated_at = ? AND id < ?))
+             LIMIT 1`,
+          ).bind(projectId, decoded.updatedAt, decoded.updatedAt, decoded.id)
+            .first<{ ok: number }>();
+          hasMoreDocs = !!more;
+        }
+      } else {
+        const binds: unknown[] = [projectId];
+        let where = 'project_id = ? AND archived_at IS NULL';
+        if (decoded) {
+          // Fully past this doc — continue with strictly older docs.
+          where += ' AND (updated_at < ? OR (updated_at = ? AND id < ?))';
+          binds.push(decoded.updatedAt, decoded.updatedAt, decoded.id);
+        }
+        const { results } = await env.DB.prepare(
+          `SELECT id, name, body, updated_at AS updatedAt FROM docs WHERE ${where}
+           ORDER BY updated_at DESC, id DESC LIMIT ?`,
+        ).bind(...binds, limit + 1).all<DocRow>();
+        hasMoreDocs = results.length > limit;
+        page.push(...results.slice(0, limit));
+      }
+
+      const hits: Array<ReturnType<typeof grepDocBody>[number] & { docName: string }> = [];
+      let hitsCapped = false;
+      let lastSearched: DocRow | null = null;
+      let resumeAfterHitLine: number | null = null;
+      let lastDocLineCount = 0;
+      let searched = 0;
+      for (const doc of page) {
+        lastSearched = doc;
+        searched += 1;
+        const startAfterLine = searched === 1 && resumeAfterLine > 0 ? resumeAfterLine : 0;
+        const body = doc.body ?? '';
+        lastDocLineCount = body.length ? body.split(/\r?\n/).length : 0;
+        try {
+          for (const hit of grepDocBody(doc.id, body, pattern, {
+            caseSensitive,
+            maxHits: perDocCap - hits.length,
+            startAfterLine,
+          })) {
+            hits.push({ ...hit, docName: doc.name });
+            if (hits.length >= perDocCap) {
+              hitsCapped = true;
+              resumeAfterHitLine = hit.line;
+              break;
+            }
+          }
+        } catch (err) {
+          if (err instanceof DocBodyError) throw new Error(err.message);
+          throw err;
+        }
+        if (hitsCapped) break;
+      }
+
+      // Prefer mid-doc continuation when maxHits stopped before the last line; otherwise
+      // advance past the last fully searched doc when siblings/older docs remain.
+      let nextCursor: string | null = null;
+      if (lastSearched) {
+        if (hitsCapped && resumeAfterHitLine != null && resumeAfterHitLine < lastDocLineCount) {
+          nextCursor = encodeGrepDocsCursor(lastSearched.updatedAt, lastSearched.id, resumeAfterHitLine);
+        } else if (searched < page.length || hasMoreDocs) {
+          nextCursor = encodeGrepDocsCursor(lastSearched.updatedAt, lastSearched.id);
+        }
+      }
+      return {
+        hits,
+        truncated: hitsCapped || !!nextCursor,
+        scanLimit: docId ? 1 : limit,
+        scanned: searched,
+        nextCursor,
+      };
+    }),
+  );
+
+  const bodySourceSchema = z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('inline'), text: z.string().describe('Markdown body (prefer upload above 32 KiB)') }),
+    z.object({ kind: z.literal('upload') }),
+  ]).optional().describe(`Inline text or mint a PUT upload URL (soft max ${DOC_BODY_SOFT_MAX_BYTES} bytes). Prefer upload when body ≳ ${DOC_BODY_INLINE_STEER_BYTES} bytes.`);
+
+  defineTool(
     'create_doc',
-    'Record a SETTLED decision or established fact as a project doc (markdown). FIRST doc of your session? Read the authoring guide first — resources/read noriq://skill/doc-authoring (or GET /skill/docs.md) — it covers what belongs in a doc, the shapes that work, and placement. The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". An undecided point is never encoded as fact: settle it (request_input) if it blocks the doc\'s central claim, or scope the doc to exclude it and ship what IS settled. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_tasks/update_tasks docIds. For revising an existing doc use update_doc.',
+    `Record a SETTLED decision or established fact as a project doc (markdown). Soft max ${DOC_BODY_SOFT_MAX_BYTES} bytes; above ~${DOC_BODY_INLINE_STEER_BYTES} bytes prefer bodySource.kind="upload" (returns uploadUrl — PUT UTF-8 markdown). FIRST doc of your session? Read noriq://skill/doc-authoring. Contract enforced: decisions/facts only. For revising use update_doc with mode patch/append when possible.`,
     {
       projectId: z.string(),
       assessment: AssessmentInput.optional().describe('Passing document evidence required for agent-authored substantive writes in strict projects; bound atomically to the resulting version'),
       name: z.string().min(1).max(120).describe('Doc title, 1-120 chars — the name agents scan in list_docs'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
-      body: z.string().optional().describe('The document, markdown'),
+      body: z.string().max(DOC_BODY_SOFT_MAX_BYTES).optional().describe(`Inline markdown (max ${DOC_BODY_SOFT_MAX_BYTES} chars advertised). Prefer bodySource for large bodies.`),
+      bodySource: bodySourceSchema,
       folder: z.string().max(200).optional().describe('Folder path for human browsing, e.g. "design/networking" — organizational only, the doc is always addressed by its id. Reuse existing folders (see list_docs) before minting new ones.'),
       tags: z.array(z.string()).optional().describe('1-3 tags from the project vocabulary (get_project.tags / list_docs) — tags are shared FILTERS, so reuse before minting (near-duplicates are rejected) and only tag with words that group 3+ items. Never restate the folder or the title as a tag; finding one specific doc is semantic search\'s job.'),
       allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
-    tool(async ({ projectId, name, description, body, folder, tags, allowNewTags, assessment }) => {
+    tool(async ({ projectId, name, description, body, bodySource, folder, tags, allowNewTags, assessment }) => {
       validateTagNames(tags);
-      return room(env, projectId).createDoc(projectId, actor, { name, description, body, folder, tags, allowNewTags, assessment });
+      const inlineFromSource = bodySource?.kind === 'inline' ? bodySource.text : undefined;
+      if (bodySource?.kind === 'upload') {
+        if (body !== undefined || inlineFromSource !== undefined) {
+          throw new Error('bodySource.kind=upload cannot combine with inline body — omit body and PUT markdown to uploadUrl');
+        }
+        const secret = resolveUploadSecret(env);
+        const origin = env.PUBLIC_ORIGIN ?? opts.origin;
+        if (!secret || !origin) throw new Error('doc body upload URLs are not enabled on this instance');
+        const docId = newId('doc');
+        const expMs = Date.now() + UPLOAD_TOKEN_TTL_MS;
+        const token = await signDocBodyUploadToken(secret, {
+          typ: 'doc_body', op: 'create', pid: projectId, docId, agentId: agent.id,
+          name, description, folder, tagsJson: tags ? JSON.stringify(tags) : undefined,
+          allowNewTags,
+          assessmentJson: assessment ? JSON.stringify(assessment) : undefined,
+          max: DOC_BODY_SOFT_MAX_BYTES, exp: Math.floor(expMs / 1000),
+        });
+        const uploadUrl = `${origin.replace(/\/$/, '')}/api/docs/upload/${token}`;
+        return {
+          pending: true, docId, uploadUrl, method: 'PUT',
+          headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+          maxBytes: DOC_BODY_SOFT_MAX_BYTES,
+          expiresAt: new Date(expMs).toISOString(),
+          resource: docUri(docId),
+          curl: `curl -X PUT -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @doc.md '${uploadUrl}'`,
+          hint: 'PUT the full UTF-8 markdown body to uploadUrl; the doc is created on successful commit (lint + version 1 + index). Assessment from this call is bound at PUT when provided.',
+        };
+      }
+      const text = inlineFromSource ?? body;
+      const hint = inlineBodySteerHint(text);
+      const created = await room(env, projectId).createDoc(projectId, actor, {
+        name, description, body: text, folder, tags, allowNewTags, assessment,
+      });
+      return { ...created, ...(hint ? { hint } : {}) };
     }),
   );
 
   defineTool(
     'update_doc',
-    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). Every effective update appends an immutable version while only the current version remains searchable. Archived docs are read-only until a human restores them. A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended — for a substantial rewrite, read the authoring guide first (resources/read noriq://skill/doc-authoring).',
+    `Revise a project doc. Prefer mode="patch" with exact edits[{oldText,newText,occurrence?}] for section edits — never resend a 50k+ body for a paragraph change. mode append concatenates; replace is the default full body. expectedVersion is REQUIRED whenever the body changes. Soft max ${DOC_BODY_SOFT_MAX_BYTES} bytes; bodySource.kind=upload for large full replaces. Archived docs are read-only until restored. Same settled-only contract as create_doc.`,
     {
       projectId: z.string(),
       assessment: AssessmentInput.optional().describe('Passing document evidence required for agent-authored substantive writes in strict projects; bound atomically to the resulting version'),
       docId: z.string(),
+      expectedVersion: z.number().int().positive().optional().describe('Required when body changes — must match currentVersion from get_doc'),
+      mode: z.enum(['replace', 'append', 'patch']).optional().describe('Default replace. patch uses edits[]; append concatenates body'),
+      edits: z.array(z.object({
+        oldText: z.string().min(1).max(DOC_PATCH_MAX_TEXT_CHARS),
+        newText: z.string().max(DOC_PATCH_MAX_TEXT_CHARS),
+        occurrence: z.number().int().positive().optional().describe('1-based match when oldText appears more than once; omit only when unique'),
+      })).max(DOC_PATCH_MAX_EDITS).optional().describe(`Exact-string patches (max ${DOC_PATCH_MAX_EDITS}); each oldText must match occurrence times (default 1)`),
       name: z.string().min(1).max(120).optional().describe('New doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
-      body: z.string().optional().describe('Full replacement markdown'),
+      body: z.string().max(DOC_BODY_SOFT_MAX_BYTES).optional().describe('Replacement or append markdown depending on mode'),
+      bodySource: bodySourceSchema,
       folder: z.string().max(200).optional().describe('Move the doc to this folder path ("" = root) — organizational only, links and ids are unaffected'),
       tags: z.array(z.string()).optional().describe('REPLACES the tag set ([] clears) — prefer addTags/removeTags for edits. Reuse the project vocabulary; near-duplicates are rejected.'),
       addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones'),
       removeTags: z.array(z.string()).optional().describe('Remove these tags, keeping the rest'),
       allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
-    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags, allowNewTags, assessment }) => {
+    tool(async ({ projectId, docId, expectedVersion, mode, edits, name, description, body, bodySource, folder, tags, addTags, removeTags, allowNewTags, assessment }) => {
       validateTagNames(tags);
       validateTagNames(addTags);
-      return room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags, allowNewTags, assessment });
+      if (bodySource?.kind === 'upload') {
+        if (body !== undefined || mode === 'patch' || mode === 'append' || (edits?.length ?? 0) > 0) {
+          throw new Error('bodySource.kind=upload is for full replace only — omit body/edits/mode or use mode replace without inline body');
+        }
+        if (expectedVersion === undefined) {
+          throw new Error('expectedVersion is required when uploading a replacement doc body');
+        }
+        const secret = resolveUploadSecret(env);
+        const origin = env.PUBLIC_ORIGIN ?? opts.origin;
+        if (!secret || !origin) throw new Error('doc body upload URLs are not enabled on this instance');
+        const expMs = Date.now() + UPLOAD_TOKEN_TTL_MS;
+        const token = await signDocBodyUploadToken(secret, {
+          typ: 'doc_body', op: 'replace', pid: projectId, docId, agentId: agent.id,
+          expectedVersion,
+          name, description, folder,
+          tagsJson: tags ? JSON.stringify(tags) : undefined,
+          addTagsJson: addTags ? JSON.stringify(addTags) : undefined,
+          removeTagsJson: removeTags ? JSON.stringify(removeTags) : undefined,
+          allowNewTags,
+          assessmentJson: assessment ? JSON.stringify(assessment) : undefined,
+          max: DOC_BODY_SOFT_MAX_BYTES, exp: Math.floor(expMs / 1000),
+        });
+        const uploadUrl = `${origin.replace(/\/$/, '')}/api/docs/upload/${token}`;
+        return {
+          pending: true, docId, uploadUrl, method: 'PUT',
+          headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+          maxBytes: DOC_BODY_SOFT_MAX_BYTES, expectedVersion,
+          expiresAt: new Date(expMs).toISOString(),
+          resource: docUri(docId),
+          curl: `curl -X PUT -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @doc.md '${uploadUrl}'`,
+          hint: 'PUT UTF-8 markdown to uploadUrl. Assessment and name/description/folder/tag fields from this call are applied on commit.',
+        };
+      }
+      const inlineFromSource = bodySource?.kind === 'inline' ? bodySource.text : undefined;
+      const text = inlineFromSource ?? body;
+      try {
+        return await room(env, projectId).updateDoc(projectId, actor, docId, {
+          name, description, body: text, folder, tags, addTags, removeTags, allowNewTags, assessment,
+          mode, edits, expectedVersion, requireExpectedVersion: true,
+        });
+      } catch (err) {
+        if (err instanceof DocBodyError) {
+          throw new Error(`${err.message}${err.details ? ` ${JSON.stringify(err.details)}` : ''}`);
+        }
+        throw err;
+      }
     }),
   );
 
@@ -2250,13 +2562,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   // needs, so the project knowledge base (create_doc) stays reserved for settled facts.
   defineTool(
     'create_plan_doc',
-    'Create a working document attached to a plan (PLNR-200). Distinct from create_doc: a plan doc is scoped to this plan, is NOT searchable/indexed, and has NO "settled decisions only" rule — it may hold open questions and change as the plan evolves. Use it for design notes, scratch, or supporting material the plan needs; reserve create_doc for settled project-wide facts.',
+    `Create a working document attached to a plan (PLNR-200). Distinct from create_doc: a plan doc is scoped to this plan, is NOT searchable/indexed, and has NO settled-only rule. Soft max ${DOC_BODY_SOFT_MAX_BYTES} bytes.`,
     {
       projectId: z.string(),
       planId: z.string(),
       name: z.string().min(1).max(120).describe('Plan doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
-      body: z.string().optional().describe('The document, markdown — may be provisional'),
+      body: z.string().max(DOC_BODY_SOFT_MAX_BYTES).optional().describe('The document, markdown — may be provisional'),
     },
     tool(async ({ projectId, planId, name, description, body }) =>
       room(env, projectId).createPlanDoc(projectId, actor, planId, { name, description, body })),
@@ -2264,30 +2576,90 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_plan_doc',
-    'Revise a plan-local doc (PLNR-200) — pass the full new body (read it first via get_plan_doc). No contract is enforced; a plan doc is expected to change as the design firms up.',
+    `Revise a plan-local doc (PLNR-200). Same write modes as update_doc (replace|append|patch) but no doclint. expectedContentHash is REQUIRED when the body changes (plan docs have no version counter). Prefer patch for large bodies.`,
     {
       projectId: z.string(),
       docId: z.string(),
+      expectedContentHash: z.string().min(16).optional().describe('Required when body changes — SHA-256 hex from get_plan_doc'),
+      mode: z.enum(['replace', 'append', 'patch']).optional().describe('Default replace. patch uses edits[]; append concatenates body'),
+      edits: z.array(z.object({
+        oldText: z.string().min(1).max(DOC_PATCH_MAX_TEXT_CHARS).describe('Exact text that must appear occurrence times'),
+        newText: z.string().max(DOC_PATCH_MAX_TEXT_CHARS).describe('Replacement text'),
+        occurrence: z.number().int().positive().optional().describe('1-based match index when oldText appears more than once'),
+      })).max(DOC_PATCH_MAX_EDITS).optional().describe(`Exact-string patches (max ${DOC_PATCH_MAX_EDITS})`),
       name: z.string().min(1).max(120).optional().describe('New plan doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
-      body: z.string().optional().describe('Full replacement markdown'),
+      body: z.string().max(DOC_BODY_SOFT_MAX_BYTES).optional().describe('Replacement or append markdown depending on mode'),
     },
-    tool(async ({ projectId, docId, name, description, body }) =>
-      room(env, projectId).updatePlanDoc(projectId, actor, docId, { name, description, body })),
+    tool(async ({ projectId, docId, expectedContentHash, mode, edits, name, description, body }) => {
+      try {
+        return await room(env, projectId).updatePlanDoc(projectId, actor, docId, {
+          name, description, body, mode, edits, expectedContentHash, requireExpectedContentHash: true,
+        });
+      } catch (err) {
+        if (err instanceof DocBodyError) {
+          throw new Error(`${err.message}${err.details ? ` ${JSON.stringify(err.details)}` : ''}`);
+        }
+        throw err;
+      }
+    }),
   );
 
   defineTool(
     'get_plan_doc',
-    'Read one plan-local doc in full (PLNR-200). Discover their ids via get_plans (each plan lists its docs).',
-    { projectId: z.string(), docId: z.string() },
-    tool(async ({ projectId, docId }) => {
-      const doc = await env.DB.prepare(
+    'Read one plan-local doc in full (PLNR-200). Discover their ids via get_plans (each plan lists its docs). Returns contentHash/bodyChars for concurrency on update_plan_doc.',
+    {
+      projectId: z.string(),
+      docId: z.string(),
+      view: z.enum(['full', 'outline']).optional().describe('outline = TOC only (no body); default full'),
+      section: z.string().optional().describe('Heading title or path — returns that markdown subtree'),
+      startLine: z.number().int().positive().optional().describe('1-based inclusive line range start'),
+      endLine: z.number().int().positive().optional().describe('1-based inclusive line range end'),
+      depth: z.number().int().min(0).max(6).optional().describe('Nesting limit under section'),
+    },
+    tool(async ({ projectId, docId, view, section, startLine, endLine, depth }) => {
+      const row = await env.DB.prepare(
         `SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName,
                 created_at AS createdAt, updated_at AS updatedAt
          FROM plan_docs WHERE id = ? AND project_id = ?`,
-      ).bind(docId, projectId).first();
-      if (!doc) throw new Error('plan doc not found in this project');
-      return { doc };
+      ).bind(docId, projectId).first<Record<string, unknown>>();
+      if (!row) throw new Error('plan doc not found in this project');
+      const fullBody = String(row.body ?? '');
+      const contentHash = await hashDocBody(fullBody);
+      const meta = bodyMeta(fullBody, contentHash);
+      const base = { ...row, ...meta };
+      if (view === 'outline') {
+        return {
+          doc: {
+            ...base, body: undefined,
+            outline: parseMarkdownOutline(fullBody),
+            segments: buildSegmentMap(fullBody, null),
+            selection: { mode: 'outline' as const },
+          },
+        };
+      }
+      if (section || (startLine != null && endLine != null)) {
+        try {
+          const sliced = section
+            ? sliceBySection(fullBody, { path: section, title: section }, depth)
+            : (() => {
+              const lines = sliceDocByLines(fullBody, startLine!, endLine!);
+              return { ...lines, path: '' as string };
+            })();
+          return {
+            doc: {
+              ...base,
+              body: sliced.body,
+              segments: buildSegmentMap(fullBody, { startLine: sliced.startLine, endLine: sliced.endLine }),
+              selection: sliced.selection,
+            },
+          };
+        } catch (err) {
+          if (err instanceof DocBodyError) throw new Error(err.message);
+          throw err;
+        }
+      }
+      return { doc: { ...base, body: fullBody, selection: { mode: 'full' as const } } };
     }),
   );
 

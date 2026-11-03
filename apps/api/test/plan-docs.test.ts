@@ -55,7 +55,11 @@ describe('plan-local docs (PLNR-200)', () => {
       body: '# Open\n\nTBD: shard key.\nShould we shard by user or by project?',
     });
     expect(created.isError).toBeFalsy(); // create_doc would REJECT this body (doclint)
-    const upd = await mcpCall(apiKey, 'update_plan_doc', { projectId, docId: created.body.id, body: 'still WIP — open question?' });
+    const hash = created.body.contentHash as string;
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    const upd = await mcpCall(apiKey, 'update_plan_doc', {
+      projectId, docId: created.body.id, expectedContentHash: hash, body: 'still WIP — open question?',
+    });
     expect(upd.isError).toBeFalsy();
   });
 

@@ -121,7 +121,7 @@ describe('subscriptions/listen', () => {
       expect(changed.params._meta[SUB_ID]).toBe(id);
 
       // Editing the subscribed doc → resources/updated with its uri.
-      await mcpCall(apiKey, 'update_doc', { projectId, docId, body: 'Edited. The stream reports doc edits. This fact is settled.' });
+      await mcpCall(apiKey, 'update_doc', { projectId, docId, expectedVersion: 1, body: 'Edited. The stream reports doc edits. This fact is settled.' });
       const updated = await frames.next();
       expect(updated.method).toBe('notifications/resources/updated');
       expect(updated.params.uri).toBe(uri);

@@ -765,7 +765,7 @@ describe('project docs', () => {
     const read = await mcpCall(orch.apiKey, 'get_doc', { projectId: pid, docId: made.body.id });
     expect(read.body.body).toContain('kebab-case');
 
-    await mcpCall(orch.apiKey, 'update_doc', { projectId: pid, docId: made.body.id, body: '# Naming\n\nsnake_case now.' });
+    await mcpCall(orch.apiKey, 'update_doc', { projectId: pid, docId: made.body.id, expectedVersion: 1, body: '# Naming\n\nsnake_case now.' });
     const reread = await mcpCall(orch.apiKey, 'get_doc', { projectId: pid, docId: made.body.id });
     expect(reread.body.body).toContain('snake_case');
 

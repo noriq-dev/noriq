@@ -85,7 +85,7 @@ describe('entity validation (PLNR-576)', () => {
     expect(v1.body.contentFingerprint).toBe('v:1');
 
     await mcpCall(agent.apiKey, 'update_doc', {
-      projectId, docId, body: 'The sky is blue on clear days.',
+      projectId, docId, expectedVersion: 1, body: 'The sky is blue on clear days.',
     });
     const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'doc', subjectId: docId });
     expect(fresh.body.criticalCauses).toContain('content_changed');
@@ -110,7 +110,7 @@ describe('doc@version pins (PLNR-577)', () => {
     expect(detail.body.docs[0].drifted).toBe(false);
 
     await mcpCall(agent.apiKey, 'update_doc', {
-      projectId, docId, body: 'Use OAuth 2.1 with PKCE. Refresh tokens rotate.',
+      projectId, docId, expectedVersion: 1, body: 'Use OAuth 2.1 with PKCE. Refresh tokens rotate.',
     });
 
     const fresh = await mcpCall(agent.apiKey, 'get_freshness', { projectId, subjectType: 'task', subjectId: taskId });
@@ -126,7 +126,7 @@ describe('doc@version pins (PLNR-577)', () => {
       projectId, name: 'Explicit pin', description: 'v pin', body: 'Version one fact.',
     });
     const docId = doc.body.id;
-    await mcpCall(agent.apiKey, 'update_doc', { projectId, docId, body: 'Version two fact.' });
+    await mcpCall(agent.apiKey, 'update_doc', { projectId, docId, expectedVersion: 1, body: 'Version two fact.' });
     const task = await mcpCall(agent.apiKey, 'create_tasks', {
       projectId,
       tasks: [{
