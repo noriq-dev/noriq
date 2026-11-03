@@ -61,15 +61,17 @@ export interface DocBodyUploadClaims {
   /** Existing doc id for replace; pre-allocated id for create. */
   docId: string;
   agentId: string;
-  /** Required for create — name is fixed at mint time. */
+  /** Required for create — name is fixed at mint time. Optional on replace when renaming. */
   name?: string;
   description?: string;
   folder?: string;
   tagsJson?: string;
+  addTagsJson?: string;
+  removeTagsJson?: string;
   allowNewTags?: boolean;
   /** For replace — optimistic concurrency when set. */
   expectedVersion?: number;
-  /** Serialized AssessmentInput for create commits (strict projects). */
+  /** Serialized AssessmentInput bound at PUT for create and replace (strict projects). */
   assessmentJson?: string;
   max: number;
   exp: number;

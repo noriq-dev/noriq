@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   applyDocPatches,
   buildSegmentMap,
+  decodeGrepDocsCursor,
   DocBodyError,
+  encodeGrepDocsCursor,
   grepDocBody,
   hashDocBody,
   parseMarkdownOutline,
@@ -133,6 +135,28 @@ describe('grepDocBody', () => {
     expect(hits[0]!.path).toBe('Architecture / Storage / D1');
     expect(hits[0]!.startLine).toBeLessThanOrEqual(hits[0]!.line);
     expect(hits[0]!.endLine).toBeGreaterThanOrEqual(hits[0]!.line);
+  });
+
+  it('treats pattern as literal substring (ReDoS-safe)', () => {
+    const body = `${'a'.repeat(27)}!\nsettled ALPHA line\n`;
+    const t0 = Date.now();
+    const hits = grepDocBody('doc_redos', body, '(a+)+$');
+    expect(Date.now() - t0).toBeLessThan(50);
+    expect(hits).toHaveLength(0);
+    expect(grepDocBody('doc_redos', body, 'ALPHA')).toHaveLength(1);
+    // Regex metacharacters match literally, not as operators.
+    expect(grepDocBody('doc_meta', 'cost is $5.00\n', '$5')).toHaveLength(1);
+  });
+});
+
+describe('grep docs cursor', () => {
+  it('round-trips updatedAt + id', () => {
+    const enc = encodeGrepDocsCursor('2026-11-03T12:00:00.000Z', 'doc_abc');
+    expect(decodeGrepDocsCursor(enc)).toEqual({
+      updatedAt: '2026-11-03T12:00:00.000Z',
+      id: 'doc_abc',
+    });
+    expect(decodeGrepDocsCursor('not-a-cursor')).toBeNull();
   });
 });
 

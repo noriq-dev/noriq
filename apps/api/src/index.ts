@@ -4168,9 +4168,32 @@ app.put('/api/docs/upload/:token', async (c) => {
       });
       return c.json({ ...created, ok: true, resource: `noriq://doc/${claims.docId}` });
     }
+    let assessment: ReturnType<typeof AssessmentInput.parse> | undefined;
+    if (claims.assessmentJson) {
+      try { assessment = AssessmentInput.parse(JSON.parse(claims.assessmentJson)); }
+      catch { return c.json({ error: 'upload token assessment is invalid' }, 400); }
+    }
+    let tags: string[] | undefined;
+    let addTags: string[] | undefined;
+    let removeTags: string[] | undefined;
+    try {
+      if (claims.tagsJson) tags = JSON.parse(claims.tagsJson) as string[];
+      if (claims.addTagsJson) addTags = JSON.parse(claims.addTagsJson) as string[];
+      if (claims.removeTagsJson) removeTags = JSON.parse(claims.removeTagsJson) as string[];
+    } catch {
+      return c.json({ error: 'upload token tags are invalid' }, 400);
+    }
     const updated = await room(c.env, claims.pid).updateDoc(claims.pid, actor, claims.docId, {
       mode: 'replace',
       body,
+      name: claims.name,
+      description: claims.description,
+      folder: claims.folder,
+      tags,
+      addTags,
+      removeTags,
+      allowNewTags: claims.allowNewTags,
+      assessment,
       expectedVersion: claims.expectedVersion,
       requireExpectedVersion: true,
     });

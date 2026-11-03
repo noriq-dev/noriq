@@ -1,10 +1,23 @@
 // PLNR-627: large docs MCP — patch/append/upload writes + outline/section/grep reads.
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, loginSession, mcpCall } from './helpers';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
+let adminCookie: string;
+
+const docAssessment = {
+  purpose: 'document',
+  outcome: 'passed',
+  scope: 'non_code',
+  summary: 'Inspected the markdown and confirmed it records settled facts only.',
+  evidence: [{
+    kind: 'inspection',
+    reference: 'Doc body',
+    result: 'Body contains only settled decisions and facts; no open questions.',
+  }],
+};
 
 const LARGE_BODY = `# Root
 
@@ -29,6 +42,7 @@ ${'Settled fact line.\n'.repeat(40)}
 
 beforeAll(async () => {
   agent = await createAgent('large-docs-agent');
+  adminCookie = await loginSession('agent-mint@example.com', 'longenough1');
   projectId = (await mcpCall(agent.apiKey, 'create_project', { key: 'LDMC', name: 'large docs mcp' })).body.id;
 }, 60_000);
 
@@ -216,5 +230,139 @@ describe('large docs MCP (PLNR-627)', () => {
     });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/soft max|exceeds|Too big|524288/i);
+  });
+
+  it('replace upload carries assessment + metadata through the signed token (strict)', async () => {
+    const policy = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/validation-policy`, {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'strict', reason: 'Exercise replace-upload assessment binding.' }),
+    });
+    expect(policy.status).toBe(200);
+
+    const created = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId,
+      name: 'Strict upload base',
+      description: 'needs assessed replace',
+      body: '# Strict\n\nOriginal settled body.\n',
+      folder: 'contracts',
+      tags: ['docs'],
+      assessment: docAssessment,
+    });
+    expect(created.isError).toBe(false);
+
+    const bareMint = await mcpCall(agent.apiKey, 'update_doc', {
+      projectId,
+      docId: created.body.id,
+      expectedVersion: 1,
+      bodySource: { kind: 'upload' },
+    });
+    expect(bareMint.isError).toBe(false);
+    const barePut = await SELF.fetch(bareMint.body.uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+      body: '# Strict\n\nUnassessed replace must fail.\n',
+    });
+    expect(barePut.status).toBe(400);
+    expect(await barePut.text()).toMatch(/assessment/i);
+
+    const assessedMint = await mcpCall(agent.apiKey, 'update_doc', {
+      projectId,
+      docId: created.body.id,
+      expectedVersion: 1,
+      bodySource: { kind: 'upload' },
+      name: 'Strict upload renamed',
+      description: 'replaced via assessed upload',
+      folder: 'contracts/v2',
+      addTags: ['alpha'],
+      assessment: docAssessment,
+    });
+    expect(assessedMint.isError).toBe(false);
+    expect(assessedMint.body.hint).toMatch(/Assessment/i);
+
+    const put = await SELF.fetch(assessedMint.body.uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+      body: '# Strict\n\nAssessed REPLACE_META_TOKEN body.\n',
+    });
+    expect(put.status).toBe(200);
+    const putBody = await put.json() as { version: number };
+    expect(putBody.version).toBe(2);
+
+    const got = await mcpCall(agent.apiKey, 'get_doc', { projectId, docId: created.body.id });
+    expect(got.body.body).toContain('REPLACE_META_TOKEN');
+    expect(got.body.name).toBe('Strict upload renamed');
+    expect(got.body.description).toBe('replaced via assessed upload');
+    expect(got.body.folder).toBe('contracts/v2');
+    expect(got.body.tags).toEqual(expect.arrayContaining(['docs', 'alpha']));
+    expect(got.body.version).toBe(2);
+
+    // Leave project legacy so subsequent suite cases are not gated.
+    const legacy = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/validation-policy`, {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'legacy', reason: 'Restore legacy after replace-upload check.' }),
+    });
+    expect(legacy.status).toBe(200);
+  });
+
+  it('grep_docs is literal and pages project-wide scans with nextCursor', async () => {
+    // Create oldest → newest. The unique old token lives only in the oldest of these three,
+    // so scanLimit=2 (newest two) must miss it until the caller continues with nextCursor.
+    const created: Array<{ id: string; token: string }> = [];
+    for (const [name, token] of [
+      ['Grep page old', 'GREP_UNIQUE_OLD_TOKEN'],
+      ['Grep page mid', 'GREP_UNIQUE_MID_TOKEN'],
+      ['Grep page new', 'GREP_UNIQUE_NEW_TOKEN'],
+    ] as const) {
+      const r = await mcpCall(agent.apiKey, 'create_doc', {
+        projectId,
+        name,
+        description: 'grep paging fixture',
+        body: `# ${name}\n\nSettled body with ${token}.\n`,
+      });
+      expect(r.isError).toBe(false);
+      created.push({ id: r.body.id, token });
+    }
+
+    const redos = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: '(a+)+$',
+      maxHits: 10,
+    });
+    expect(redos.isError).toBe(false);
+    expect(redos.body.hits).toEqual([]);
+
+    const page1 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: 'GREP_UNIQUE_OLD_TOKEN',
+      scanLimit: 2,
+      maxHits: 50,
+    });
+    expect(page1.isError).toBe(false);
+    expect(page1.body.scanned).toBe(2);
+    expect(page1.body.scanLimit).toBe(2);
+    expect(page1.body.nextCursor).toEqual(expect.any(String));
+    expect(page1.body.truncated).toBe(true);
+    expect(page1.body.hits).toHaveLength(0);
+
+    const page2 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: 'GREP_UNIQUE_OLD_TOKEN',
+      scanLimit: 2,
+      cursor: page1.body.nextCursor,
+    });
+    expect(page2.isError).toBe(false);
+    expect(page2.body.hits.some((h: { preview: string }) => h.preview.includes('GREP_UNIQUE_OLD_TOKEN'))).toBe(true);
+
+    const one = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      docId: created[0]!.id,
+      pattern: 'GREP_UNIQUE_OLD_TOKEN',
+    });
+    expect(one.isError).toBe(false);
+    expect(one.body.hits).toHaveLength(1);
+    expect(one.body.nextCursor).toBeNull();
+    expect(one.body.truncated).toBe(false);
   });
 });

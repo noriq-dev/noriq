@@ -473,26 +473,44 @@ export interface GrepHit {
   endLine: number;
 }
 
+export const GREP_DOCS_DEFAULT_SCAN_LIMIT = 100;
+export const GREP_DOCS_MAX_SCAN_LIMIT = 200;
+
+/** Opaque cursor for project-wide grep pagination (updated_at DESC, id DESC). */
+export function encodeGrepDocsCursor(updatedAt: string, id: string): string {
+  return btoa(JSON.stringify({ u: updatedAt, i: id }));
+}
+
+export function decodeGrepDocsCursor(cursor: string): { updatedAt: string; id: string } | null {
+  try {
+    const raw = JSON.parse(atob(cursor)) as { u?: unknown; i?: unknown };
+    if (typeof raw.u !== 'string' || typeof raw.i !== 'string' || !raw.u || !raw.i) return null;
+    return { updatedAt: raw.u, id: raw.i };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Literal substring search over a doc body (ReDoS-safe — no caller RegExp).
+ * Matching is per line; case folding uses toLocaleLowerCase when caseSensitive is false.
+ */
 export function grepDocBody(
   docId: string,
   body: string,
   pattern: string,
   opts: { caseSensitive?: boolean; maxHits?: number } = {},
 ): GrepHit[] {
+  if (!pattern.length) throw new DocBodyError('grep pattern must be non-empty', 'range_invalid');
   const maxHits = Math.min(Math.max(opts.maxHits ?? 50, 1), 200);
-  let re: RegExp;
-  try {
-    re = new RegExp(pattern, opts.caseSensitive ? 'g' : 'gi');
-  } catch {
-    throw new DocBodyError(`invalid grep pattern: ${pattern}`, 'range_invalid');
-  }
+  const needle = opts.caseSensitive ? pattern : pattern.toLocaleLowerCase();
   const outline = parseMarkdownOutline(body);
   const { lines } = lineParts(body);
   const hits: GrepHit[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    re.lastIndex = 0;
-    if (!re.test(line)) continue;
+    const hay = opts.caseSensitive ? line : line.toLocaleLowerCase();
+    if (!hay.includes(needle)) continue;
     const lineNo = i + 1;
     const enclosing = [...outline].reverse().find((h) => h.startLine <= lineNo && h.endLine >= lineNo);
     hits.push({

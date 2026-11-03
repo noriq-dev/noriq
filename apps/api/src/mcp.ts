@@ -49,8 +49,12 @@ import {
   DOC_PATCH_MAX_EDITS,
   DOC_PATCH_MAX_TEXT_CHARS,
   DocBodyError,
+  GREP_DOCS_DEFAULT_SCAN_LIMIT,
+  GREP_DOCS_MAX_SCAN_LIMIT,
   bodyMeta,
   buildSegmentMap,
+  decodeGrepDocsCursor,
+  encodeGrepDocsCursor,
   grepDocBody,
   hashDocBody,
   inlineBodySteerHint,
@@ -1157,36 +1161,71 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'grep_docs',
-    'Pattern-search project doc bodies. Each hit includes the enclosing markdown section path plus suggested startLine/endLine for that heading block so the next get_doc can pull the whole section. Prefer this for discovery in large docs before outline/section reads.',
+    'Literal substring search over project doc bodies (ReDoS-safe — not a RegExp). Each hit includes the enclosing markdown section path plus suggested startLine/endLine for that heading block so the next get_doc can pull the whole section. Project-wide scans page with scanLimit + cursor/nextCursor; truncated is true when hits are capped or unscanned docs remain.',
     {
       projectId: z.string(),
-      pattern: z.string().min(1).max(200).describe('JavaScript RegExp source (not /slashes/)'),
-      docId: z.string().optional().describe('Limit to one doc; omit to scan all active docs in the project'),
+      pattern: z.string().min(1).max(200).describe('Literal substring to find (case-insensitive by default; not a RegExp)'),
+      docId: z.string().optional().describe('Limit to one doc; omit to scan active docs in the project (paged)'),
       caseSensitive: z.boolean().optional(),
       maxHits: z.number().int().min(1).max(200).optional().describe('Default 50'),
+      scanLimit: z.number().int().min(1).max(GREP_DOCS_MAX_SCAN_LIMIT).optional()
+        .describe(`Docs to scan per call when docId is omitted (default ${GREP_DOCS_DEFAULT_SCAN_LIMIT}, max ${GREP_DOCS_MAX_SCAN_LIMIT})`),
+      cursor: z.string().optional().describe('Continuation from a prior nextCursor (project-wide scans only)'),
     },
-    tool(async ({ projectId, pattern, docId, caseSensitive, maxHits }) => {
+    tool(async ({ projectId, pattern, docId, caseSensitive, maxHits, scanLimit, cursor }) => {
+      if (docId && cursor) throw new Error('cursor is only valid for project-wide grep_docs (omit docId)');
+      const perDocCap = maxHits ?? 50;
+      const limit = Math.min(Math.max(scanLimit ?? GREP_DOCS_DEFAULT_SCAN_LIMIT, 1), GREP_DOCS_MAX_SCAN_LIMIT);
       const binds: unknown[] = [projectId];
       let where = 'project_id = ? AND archived_at IS NULL';
-      if (docId) { where += ' AND id = ?'; binds.push(docId); }
+      if (docId) {
+        where += ' AND id = ?';
+        binds.push(docId);
+      } else if (cursor) {
+        const decoded = decodeGrepDocsCursor(cursor);
+        if (!decoded) throw new Error('invalid grep_docs cursor');
+        where += ' AND (updated_at < ? OR (updated_at = ? AND id < ?))';
+        binds.push(decoded.updatedAt, decoded.updatedAt, decoded.id);
+      }
+      // Fetch one extra row so we can tell whether older docs remain unscanned.
+      const fetchLimit = docId ? 1 : limit + 1;
       const { results } = await env.DB.prepare(
-        `SELECT id, name, body FROM docs WHERE ${where} ORDER BY updated_at DESC LIMIT 100`,
-      ).bind(...binds).all<{ id: string; name: string; body: string }>();
-      const hits = [];
-      const perDocCap = maxHits ?? 50;
-      for (const doc of results) {
+        `SELECT id, name, body, updated_at AS updatedAt FROM docs WHERE ${where} ORDER BY updated_at DESC, id DESC LIMIT ?`,
+      ).bind(...binds, fetchLimit).all<{ id: string; name: string; body: string; updatedAt: string }>();
+
+      const page = docId ? results : results.slice(0, limit);
+      const hasMoreDocs = !docId && results.length > limit;
+      const hits: Array<ReturnType<typeof grepDocBody>[number] & { docName: string }> = [];
+      let hitsCapped = false;
+      for (const doc of page) {
         try {
-          for (const hit of grepDocBody(doc.id, doc.body ?? '', pattern, { caseSensitive, maxHits: perDocCap })) {
+          for (const hit of grepDocBody(doc.id, doc.body ?? '', pattern, {
+            caseSensitive,
+            maxHits: perDocCap - hits.length,
+          })) {
             hits.push({ ...hit, docName: doc.name });
-            if (hits.length >= perDocCap) break;
+            if (hits.length >= perDocCap) {
+              hitsCapped = true;
+              break;
+            }
           }
         } catch (err) {
           if (err instanceof DocBodyError) throw new Error(err.message);
           throw err;
         }
-        if (hits.length >= perDocCap) break;
+        if (hitsCapped) break;
       }
-      return { hits, truncated: hits.length >= perDocCap };
+      const lastScanned = page.at(-1);
+      const nextCursor = hasMoreDocs && lastScanned
+        ? encodeGrepDocsCursor(lastScanned.updatedAt, lastScanned.id)
+        : null;
+      return {
+        hits,
+        truncated: hitsCapped || !!nextCursor,
+        scanLimit: docId ? 1 : limit,
+        scanned: page.length,
+        nextCursor,
+      };
     }),
   );
 
@@ -1288,7 +1327,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const expMs = Date.now() + UPLOAD_TOKEN_TTL_MS;
         const token = await signDocBodyUploadToken(secret, {
           typ: 'doc_body', op: 'replace', pid: projectId, docId, agentId: agent.id,
-          expectedVersion, max: DOC_BODY_SOFT_MAX_BYTES, exp: Math.floor(expMs / 1000),
+          expectedVersion,
+          name, description, folder,
+          tagsJson: tags ? JSON.stringify(tags) : undefined,
+          addTagsJson: addTags ? JSON.stringify(addTags) : undefined,
+          removeTagsJson: removeTags ? JSON.stringify(removeTags) : undefined,
+          allowNewTags,
+          assessmentJson: assessment ? JSON.stringify(assessment) : undefined,
+          max: DOC_BODY_SOFT_MAX_BYTES, exp: Math.floor(expMs / 1000),
         });
         const uploadUrl = `${origin.replace(/\/$/, '')}/api/docs/upload/${token}`;
         return {
@@ -1298,6 +1344,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           expiresAt: new Date(expMs).toISOString(),
           resource: docUri(docId),
           curl: `curl -X PUT -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @doc.md '${uploadUrl}'`,
+          hint: 'PUT UTF-8 markdown to uploadUrl. Assessment and name/description/folder/tag fields from this call are applied on commit.',
         };
       }
       const inlineFromSource = bodySource?.kind === 'inline' ? bodySource.text : undefined;

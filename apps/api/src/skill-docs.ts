@@ -81,8 +81,10 @@ Bodies can be tens of kilobytes. Do **not** rewrite a 50k+ body to change one pa
 2. **Open one section.** \`get_doc\` with \`section: "Architecture / Storage"\` (path or unique
    title) or \`startLine\`/\`endLine\` returns that markdown slice only. Every partial read
    includes \`segments\` with \`included\` flags so you see sibling sections you did not load.
-3. **Discover with grep.** \`grep_docs\` returns hits with enclosing section \`path\` and the
-   heading block's \`startLine\`/\`endLine\` — pull that whole section next, not a single line.
+3. **Discover with grep.** \`grep_docs\` is a **literal** substring search (not RegExp). Hits
+   include enclosing section \`path\` and the heading block's \`startLine\`/\`endLine\` — pull that
+   whole section next. Project-wide scans page via \`scanLimit\` + \`cursor\`/\`nextCursor\`;
+   \`truncated\` is true when hits are capped **or** older docs remain unscanned.
 4. **Patch, don't replace.** \`update_doc\` with \`mode: "patch"\`, exact
    \`edits: [{ oldText, newText, occurrence?}]\`, and **\`expectedVersion\`** (required on every
    body change). Ambiguous \`oldText\` (0 or >1 matches without \`occurrence\`) is rejected.
