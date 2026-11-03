@@ -7,6 +7,7 @@
 ### Concurrent copilot session bootstrap
 
 - Harden copilot session execution bootstrap so concurrent sessions no longer race when claiming or creating the session execution row.
+- Raise Vitest `hookTimeout` to 30s alongside `testTimeout` so OAuth-mint `beforeAll` hooks do not flake under CI shard load.
 - `catalogRevision` remains **8** (no MCP catalog change).
 
 ## 0.81.3 - 2026-11-03
