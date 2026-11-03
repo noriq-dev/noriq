@@ -365,4 +365,47 @@ describe('large docs MCP (PLNR-627)', () => {
     expect(one.body.nextCursor).toBeNull();
     expect(one.body.truncated).toBe(false);
   });
+
+  it('grep_docs nextCursor advances from last searched when maxHits fills mid-page', async () => {
+    // Newest doc alone saturates maxHits=1; sibling on the same fetch page must remain
+    // reachable via nextCursor (not skipped, and not lost when nothing lies beyond the page).
+    const sibling = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId,
+      name: 'Grep hit-cap sibling',
+      description: 'must be reachable after maxHits stop',
+      body: '# Sibling\n\nSettled HITCAP_SHARED and HITCAP_SIBLING_ONLY.\n',
+    });
+    expect(sibling.isError).toBe(false);
+    const newest = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId,
+      name: 'Grep hit-cap newest',
+      description: 'fills maxHits alone',
+      body: '# Newest\n\nSettled HITCAP_SHARED line one.\nSettled HITCAP_SHARED line two.\n',
+    });
+    expect(newest.isError).toBe(false);
+
+    const page1 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: 'HITCAP_SHARED',
+      scanLimit: 2,
+      maxHits: 1,
+    });
+    expect(page1.isError).toBe(false);
+    expect(page1.body.hits).toHaveLength(1);
+    expect(page1.body.hits[0].docId).toBe(newest.body.id);
+    expect(page1.body.scanned).toBe(1);
+    expect(page1.body.nextCursor).toEqual(expect.any(String));
+    expect(page1.body.truncated).toBe(true);
+
+    const page2 = await mcpCall(agent.apiKey, 'grep_docs', {
+      projectId,
+      pattern: 'HITCAP_SIBLING_ONLY',
+      scanLimit: 2,
+      cursor: page1.body.nextCursor,
+    });
+    expect(page2.isError).toBe(false);
+    expect(page2.body.hits.some((h: { docId: string; preview: string }) => (
+      h.docId === sibling.body.id && h.preview.includes('HITCAP_SIBLING_ONLY')
+    ))).toBe(true);
+  });
 });

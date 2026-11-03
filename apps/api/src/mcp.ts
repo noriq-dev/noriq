@@ -1197,7 +1197,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const hasMoreDocs = !docId && results.length > limit;
       const hits: Array<ReturnType<typeof grepDocBody>[number] & { docName: string }> = [];
       let hitsCapped = false;
+      let lastSearched: { id: string; updatedAt: string } | null = null;
+      let searched = 0;
       for (const doc of page) {
+        lastSearched = { id: doc.id, updatedAt: doc.updatedAt };
+        searched += 1;
         try {
           for (const hit of grepDocBody(doc.id, doc.body ?? '', pattern, {
             caseSensitive,
@@ -1215,15 +1219,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }
         if (hitsCapped) break;
       }
-      const lastScanned = page.at(-1);
-      const nextCursor = hasMoreDocs && lastScanned
-        ? encodeGrepDocsCursor(lastScanned.updatedAt, lastScanned.id)
+      // Cursor advances from the last doc we actually searched — not the last fetched.
+      // Hitting maxHits mid-page must still continue into remaining siblings on that page
+      // (and any docs beyond), otherwise those bodies are silently skipped.
+      const unscannedRemain = !docId && !!lastSearched && (searched < page.length || hasMoreDocs);
+      const nextCursor = unscannedRemain
+        ? encodeGrepDocsCursor(lastSearched!.updatedAt, lastSearched!.id)
         : null;
       return {
         hits,
         truncated: hitsCapped || !!nextCursor,
         scanLimit: docId ? 1 : limit,
-        scanned: page.length,
+        scanned: searched,
         nextCursor,
       };
     }),
