@@ -7,30 +7,35 @@ type Actor = { kind: string; id: string; name: string };
 /** Includes dependency state and doc versions, never comment/title/claim activity. */
 export async function assessmentContext(db: D1Database, projectId: string, type: ValidationSubjectType, id: string, fingerprint: string) {
   const facts: unknown[] = [fingerprint];
-  const policy = await projectValidationPolicy(db, projectId);
-  let required = policy.mode === 'strict';
   if (type === 'task') {
-    const direction = await db.prepare('SELECT direction_generation AS generation FROM tasks WHERE id = ? AND project_id = ?').bind(id, projectId).first<{generation:number}>();
-    if (policy.generation || direction?.generation) facts.push({ policyGeneration: policy.generation, directionGeneration: direction?.generation ?? 0 });
-    const deps = await db.prepare(`SELECT t.id, t.status, t.content_activity_at, t.readiness_generation,
+    const [policy, direction, deps, docs, membership, previous] = await Promise.all([
+      projectValidationPolicy(db, projectId),
+      db.prepare('SELECT direction_generation AS generation FROM tasks WHERE id = ? AND project_id = ?').bind(id, projectId).first<{generation:number}>(),
+      db.prepare(`SELECT t.id, t.status, t.content_activity_at, t.readiness_generation,
       (SELECT group_concat(ref) FROM (SELECT ref FROM task_refs WHERE task_id = t.id AND kind = 'commit' ORDER BY ref)) AS commits
-      FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id WHERE d.task_id = ? ORDER BY t.id`).bind(id).all();
-    const docs = await db.prepare(`SELECT d.id, td.pinned_version, d.current_version, d.archived_at
-      FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.id`).bind(id).all();
-    const membership = await db.prepare(`SELECT p.id AS planId, p.body AS planBody, p.readiness_required,
+      FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id WHERE d.task_id = ? ORDER BY t.id`).bind(id).all(),
+      db.prepare(`SELECT d.id, td.pinned_version, d.current_version, d.archived_at
+      FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.id`).bind(id).all(),
+      db.prepare(`SELECT p.id AS planId, p.body AS planBody, p.readiness_required,
       ph.id, ph.title, ph.body, ph."order" FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
       JOIN plans p ON p.id = ph.plan_id WHERE pt.task_id = ? AND p.status != 'rejected'
-      ORDER BY p.id, ph."order", ph.id`).bind(id).all<any>();
-    const previous = await db.prepare(`SELECT DISTINCT p.id AS planId, prev.id AS phaseId, prev.title, prev.body,
+      ORDER BY p.id, ph."order", ph.id`).bind(id).all<any>(),
+      db.prepare(`SELECT DISTINCT p.id AS planId, prev.id AS phaseId, prev.title, prev.body,
       t.id, t.status, t.readiness_generation,
       (SELECT group_concat(ref) FROM (SELECT ref FROM task_refs WHERE task_id = t.id AND kind = 'commit' ORDER BY ref)) AS commits
       FROM phase_tasks mine JOIN phases ph ON ph.id = mine.phase_id JOIN plans p ON p.id = ph.plan_id
       JOIN phases prev ON prev.plan_id = p.id AND prev."order" < ph."order"
       JOIN phase_tasks pt ON pt.phase_id = prev.id JOIN tasks t ON t.id = pt.task_id
-      WHERE mine.task_id = ? AND p.status != 'rejected' ORDER BY p.id, prev.id, t.id`).bind(id).all();
-    required = required || membership.results.some(p => !!p.readiness_required);
+      WHERE mine.task_id = ? AND p.status != 'rejected' ORDER BY p.id, prev.id, t.id`).bind(id).all(),
+    ]);
+    // Preserve the established fingerprint's property and row ordering byte-for-byte.
+    if (policy.generation || direction?.generation) facts.push({ policyGeneration: policy.generation, directionGeneration: direction?.generation ?? 0 });
     facts.push(deps.results, docs.results, membership.results, previous.results);
+    return { fingerprint: await sha256Hex(JSON.stringify(facts)),
+      required: policy.mode === 'strict' || membership.results.some(p => !!p.readiness_required), projectPolicy: policy.mode };
   }
+  const policy = await projectValidationPolicy(db, projectId);
+  const required = policy.mode === 'strict';
   if (type === 'plan') {
     const docs = await db.prepare(`SELECT d.id, r.pinned_version, d.current_version, d.archived_at
       FROM plan_doc_refs r JOIN docs d ON d.id = r.doc_id WHERE r.plan_id = ? ORDER BY d.id`).bind(id).all();
@@ -76,11 +81,14 @@ export async function recordAssessment(db: D1Database, projectId: string, actor:
 
 export async function assessmentState(db: D1Database, projectId: string, type: ValidationSubjectType, id: string,
   fingerprint: string, revision?: { repositoryKey?: string | null; branch?: string | null; baseId?: string | null } | null): Promise<AssessmentState> {
-  const context = await assessmentContext(db, projectId, type, id, fingerprint);
-  const { results } = await db.prepare(`SELECT * FROM (
+  const [context, { results }, directionMarkers] = await Promise.all([
+    assessmentContext(db, projectId, type, id, fingerprint),
+    db.prepare(`SELECT * FROM (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY purpose ORDER BY created_at DESC, rowid DESC) AS rn
     FROM entity_assessments WHERE project_id = ? AND subject_type = ? AND subject_id = ?
-  ) WHERE rn = 1`).bind(projectId, type, id).all<any>();
+  ) WHERE rn = 1`).bind(projectId, type, id).all<any>(),
+    type === 'task' ? unresolvedDirections(db, projectId, id) : Promise.resolve([]),
+  ]);
   const records: AssessmentRecord[] = results.map(row => ({
     ...AssessmentInput.parse(JSON.parse(row.assessment_json)), id: row.id, subjectType: type, subjectId: id,
     contentFingerprint: row.content_fingerprint, contextFingerprint: row.context_fingerprint,
@@ -96,7 +104,7 @@ export async function assessmentState(db: D1Database, projectId: string, type: V
     const stale = record.contentFingerprint !== fingerprint || record.contextFingerprint !== context.fingerprint || revisionMismatch;
     return { state: stale ? 'stale' : record.outcome, record };
   };
-  return { required: context.required, projectPolicy: context.projectPolicy, directionMarkers: type === 'task' ? await unresolvedDirections(db, projectId, id) : [], contextFingerprint: context.fingerprint,
+  return { required: context.required, projectPolicy: context.projectPolicy, directionMarkers, contextFingerprint: context.fingerprint,
     readiness: view(type === 'task' ? 'readiness' : 'document'), implementation: view('implementation') };
 }
 
