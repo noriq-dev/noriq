@@ -231,14 +231,16 @@ async function latestValidations(
   subjectType: ValidationSubjectType,
   subjectId: string,
 ): Promise<{ latestAny: ValidationRow | null; latestMatching: ValidationRow | null; fingerprint: string }> {
-  const fingerprint = await currentFingerprint(db, projectId, subjectType, subjectId);
-  const { results } = await db.prepare(
+  const [fingerprint, { results }] = await Promise.all([
+    currentFingerprint(db, projectId, subjectType, subjectId),
+    db.prepare(
     `SELECT id, project_id, subject_type, subject_id, content_fingerprint, validated_at,
             actor_kind, actor_id, actor_name, baselines_json, note
        FROM entity_validations
       WHERE project_id = ? AND subject_type = ? AND subject_id = ?
       ORDER BY validated_at DESC LIMIT ?`,
-  ).bind(projectId, subjectType, subjectId, VALIDATION_LOOKBACK).all();
+  ).bind(projectId, subjectType, subjectId, VALIDATION_LOOKBACK).all(),
+  ]);
   const rows = (results ?? []).map((r) => validationFromRow(r as Parameters<typeof validationFromRow>[0]));
   const latestAny = rows[0] ?? null;
   const latestMatching = rows.find((r) => r.contentFingerprint === fingerprint) ?? null;
@@ -438,8 +440,8 @@ export async function subjectFreshness(
   subjectId: string,
   opts?: SubjectFreshnessOptions,
 ): Promise<SubjectFreshness> {
-  const { latestAny, latestMatching, fingerprint } = await latestValidations(db, projectId, subjectType, subjectId);
-  const [docPins, replacedBy, storedCauses, dormancy, activity] = await Promise.all([
+  const [{ latestAny, latestMatching, fingerprint }, docPins, replacedBy, storedCauses, dormancy, activity] = await Promise.all([
+    latestValidations(db, projectId, subjectType, subjectId),
     loadDocPins(db, subjectType, subjectId),
     supersededById(db, subjectType, subjectId),
     loadStoredCauses(db, projectId, subjectType, subjectId),

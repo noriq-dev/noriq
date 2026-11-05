@@ -246,6 +246,11 @@ strict-policy candidates against individual freshness evaluation, checks query-c
 reduction and exercises notices/cursor delivery. Run it from `apps/api` with
 `npx vitest run test/mcp-performance.test.ts`. Apply normal D1 migrations when deploying:
 `0126_mcp_read_performance.sql` adds the polling and session-lookup indexes.
+`0127_memory_event_recency.sql` indexes the briefing memory pulse by project, event
+type and global sequence. Freshness reads combine matching SELECTs in groups of up
+to five (also bounded by D1's parameter and SQL-size limits), retaining each
+subject's ordering and limits. Independent validation and assessment reads run
+together; no freshness results are cached across requests or completed batches.
 
 ## Status
 

@@ -63,8 +63,77 @@ describe('MCP performance without changing readiness or delivery', () => {
     expect(batched.value).toEqual(baseline.value);
     expect(batched.value.map(t => t.id)).toEqual([tasks[0]!.id]);
     expect(batched.metrics.dbCalls).toBeLessThan(baseline.metrics.dbCalls / 2);
-    expect(batched.metrics.dbQueries).toBeLessThan(baseline.metrics.dbQueries);
+    expect(batched.metrics.dbCalls).toBeLessThanOrEqual(8);
+    expect(batched.metrics.dbQueries).toBeLessThanOrEqual(80);
     console.log('Freshness baseline vs batched', { baseline: baseline.metrics, batched: batched.metrics });
+  });
+
+  it('preserves full per-task freshness results, not just the eligible subset', async () => {
+    const opts = { now: '2026-11-05T20:00:00.000Z' };
+    const expected = [];
+    for (const task of tasks) expected.push(await subjectFreshness(env.DB, projectId, 'task', task.id, opts));
+    const reads = batchedFreshnessReads(env.DB);
+    const actual = await Promise.all(tasks.map(task => subjectFreshness(reads, projectId, 'task', task.id, opts)));
+    expect(actual).toEqual(expected);
+  });
+
+  it('bounds combined query parameters and keeps ORDER BY, LIMIT and empty results per read', async () => {
+    const result = await measured(async db => {
+      const reads = batchedFreshnessReads(db);
+      const sql = 'SELECT value FROM json_each(?) WHERE value > ? AND value < ? ORDER BY value DESC LIMIT ? OFFSET ?';
+      return Promise.all(Array.from({ length: 45 }, (_, i) => reads.prepare(sql)
+        .bind(JSON.stringify([i, i + 1, i + 2, i + 3]), i - 1, i + 4, i === 44 ? 0 : 2, 1).all<{ value: number }>()));
+    });
+    result.value.forEach((r, i) => expect(r.results).toEqual(i === 44 ? [] : [{ value: i + 2 }, { value: i + 1 }]));
+    // D1 allows five UNION arms; the 45 independent reads become nine statements.
+    expect(result.metrics.dbCalls).toBe(1);
+    expect(result.metrics.dbQueries).toBe(9);
+  });
+
+  it('splits at 100 parameters and leaves numbered parameters independent', async () => {
+    const large = await measured(async db => {
+      const reads = batchedFreshnessReads(db);
+      const sql = `SELECT ? AS value WHERE ${Array.from({ length: 24 }, () => '? IS NOT NULL').join(' AND ')}`;
+      return Promise.all(Array.from({ length: 6 }, (_, i) => reads.prepare(sql).bind(i, ...Array(24).fill(1)).first('value')));
+    });
+    expect(large.value).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(large.metrics.dbQueries).toBe(2); // Four arms (100 variables), then two.
+    const numbered = batchedFreshnessReads(env.DB);
+    expect(await Promise.all([1, 2, 3].map(n => numbered.prepare('SELECT ?1 AS value').bind(n).first('value'))))
+      .toEqual([1, 2, 3]);
+  });
+
+  it('rejects every queued reader if combined statement preparation fails', async () => {
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === 'prepare') return (sql: string) => {
+          if (sql.includes('UNION ALL')) throw new Error('prepare failed');
+          return target.prepare(sql);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const reads = batchedFreshnessReads(db);
+    const results = await Promise.allSettled([1, 2].map(n => reads.prepare('SELECT ? AS n').bind(n).first()));
+    expect(results.every(r => r.status === 'rejected' && r.reason.message === 'prepare failed')).toBe(true);
+  });
+
+  it('uses the memory-event index to filter and order the pulse without a temporary sort', async () => {
+    const sql = `SELECT subject_id AS subjectId, payload, created_at AS createdAt
+      FROM events WHERE project_id = ? AND verb = 'memory.changed' ORDER BY global_seq DESC LIMIT 40`;
+    const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(projectId).all<{ detail: string }>();
+    expect(plan.results.some(r => r.detail.includes('idx_events_project_verb_global_seq'))).toBe(true);
+    expect(plan.results.some(r => /SCAN events|TEMP B-TREE/.test(r.detail))).toBe(false);
+    const last = await env.DB.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM events WHERE project_id = ?')
+      .bind(projectId).first<{ seq: number }>();
+    await env.DB.batch(Array.from({ length: 80 }, (_, i) => env.DB.prepare(
+      `INSERT INTO events(id,project_id,seq,actor_kind,actor_id,verb,subject_type,subject_id)
+       VALUES(?,?,?,'human','sender',?,'memory',?)`,
+    ).bind(`perf-memory-${i}`, projectId, last!.seq + i + 1, i % 2 ? 'memory.changed' : 'task.updated', `memory-${i}`)));
+    const rows = await env.DB.prepare(sql).bind(projectId).all<{ subjectId: string }>();
+    expect(rows.results.map(r => r.subjectId)).toEqual(Array.from({ length: 40 }, (_, i) => `memory-${79 - i * 2}`));
+    expect(rows.meta.rows_read).toBeLessThanOrEqual(100);
   });
 
   it('does not reuse stale reads after a batch has finished', async () => {

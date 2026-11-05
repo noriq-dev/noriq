@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.81.6 - 2026-11-05
+
+### Freshness SQL + memory event recency (PLNR-632)
+
+- Combine freshness reads and index memory event recency so briefing pulse LIMIT scans stay bounded.
+- Add D1 index (`0127_memory_event_recency`) on `events(project_id, verb, global_seq DESC)`.
+- `catalogRevision` remains **8** (no MCP catalog change).
+
 ## 0.81.5 - 2026-11-05
 
 ### MCP read performance (PLNR-630)
