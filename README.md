@@ -226,6 +226,27 @@ npm run typecheck
 
 CI runs `typecheck` + `test` on every PR (`.github/workflows/ci.yml`).
 
+### Investigating slow MCP tools
+
+Workers logs include one structured `mcp.tool.performance` summary per registered tool
+invocation, for both MCP transports. Group by `tool` and compare `durationMs`, error
+outcomes, `stagesMs`, `dbCalls` (round trips) and `dbQueries` (statements). The `updates`
+and `freshness` stages are nested inside their callers; stage durations and summed
+`dbWaitMs` can overlap and must not be added to the total. HTTP authentication/session
+setup and database work inside Durable Objects are outside this measurement.
+
+`dbSqlMs`, `dbRowsRead` and `dbRowsWritten` cover only results exposing D1 metadata
+(`all`, `run`, and `batch`); `first`/`raw` still count toward calls and wait time.
+`dbResultsWithMeta` identifies that coverage. Logs contain no tool arguments, SQL,
+credentials or response content. Correlate the summary with the Worker invocation
+and D1 query insights to distinguish repeated round trips from expensive scans.
+
+The regression fixture in `apps/api/test/mcp-performance.test.ts` compares twenty
+strict-policy candidates against individual freshness evaluation, checks query-call
+reduction and exercises notices/cursor delivery. Run it from `apps/api` with
+`npx vitest run test/mcp-performance.test.ts`. Apply normal D1 migrations when deploying:
+`0126_mcp_read_performance.sql` adds the polling and session-lookup indexes.
+
 ## Status
 
 Live today: the coordination core (claims, plans with computed phase gating, execution

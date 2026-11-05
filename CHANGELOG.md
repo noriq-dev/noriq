@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.81.5 - 2026-11-05
+
+### MCP read performance (PLNR-630)
+
+- Reduce MCP update round trips and database scans for subscription polling and presence resolution.
+- Add D1 indexes (`0126_mcp_read_performance`) on `events(created_at)` and `agent_presences(kind, actor_id)`.
+- `catalogRevision` remains **8** (no MCP catalog change).
+
 ## 0.81.4 - 2026-11-03
 
 ### Concurrent copilot session bootstrap
