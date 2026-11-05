@@ -2906,6 +2906,7 @@ export class ProjectRoom extends DurableObject<Env> {
                  FROM phases ph
                  JOIN phase_tasks pt ON pt.phase_id = ph.id
                  JOIN tasks t ON t.id = pt.task_id
+                WHERE ph.plan_id = plans.id
                 GROUP BY ph.plan_id
                HAVING COUNT(*) > 0
                   AND SUM(CASE WHEN t.status IN ('done','cancelled') THEN 0 ELSE 1 END) = 0

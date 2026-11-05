@@ -69,6 +69,17 @@ export async function computeUpdates(
   agent: AgentIdentity,
   opts: { advanceCursor?: boolean; oauthTokenId?: string | null } = {},
 ): Promise<AgentUpdates> {
+  const delivery = await collectUpdates(env, agent, opts);
+  await delivery.complete(opts.advanceCursor !== false);
+  return delivery.updates;
+}
+
+/** Collect once, then advance only the cursor represented by this result on delivery. */
+export async function collectUpdates(
+  env: Env,
+  agent: AgentIdentity,
+  opts: { oauthTokenId?: string | null; noticesOnly?: boolean } = {},
+) {
   // The token's own project scope (RUN-38). This feed is what an agent is TOLD exists —
   // claimable work, notices, broadcast chatter — so leaving it unscoped would advertise
   // projects the credential cannot actually touch: the agent would see the work, try it, and
@@ -76,6 +87,7 @@ export async function computeUpdates(
   const tokenId = opts.oauthTokenId ?? null;
   const session = env.AGENT_SESSION.get(env.AGENT_SESSION.idFromName(agent.id));
   let cursor = await session.cursor();
+  const deliveredCursor = cursor;
 
   // A brand-new session (cursor 0) must NOT replay the whole event history as "new"
   // notices — start at the tip as of agent registration. Jumping to the *current*
@@ -88,7 +100,6 @@ export async function computeUpdates(
        WHERE e.created_at <= a.created_at`,
     ).bind(agent.id).first<{ m: number }>();
     cursor = boot?.m ?? 0;
-    if (opts.advanceCursor !== false) await session.advanceCursor(cursor);
   }
 
   // New events since the cursor that concern this agent.
@@ -112,10 +123,9 @@ export async function computeUpdates(
     await env.DB.prepare('SELECT project_id AS pid FROM agents WHERE id = ?').bind(agent.id).first<{ pid: string | null }>()
   )?.pid ?? null;
 
-  // Dependency-unblocked, unclaimed tasks in the agent's project (user-wide if it has
-  // none yet). Computed up front so the "new task available" notice (PLNR-90) can
-  // confirm a freshly-created task is actually claimable now (not dependency-gated).
-  const claimable = await filterFreshTasks(env.DB, (
+  // Full orientation needs the claimable queue. Piggyback notices do not: new-task
+  // nudges below independently check eligibility for just the event-window candidates.
+  const claimable = opts.noticesOnly ? [] : await filterFreshTasks(env.DB, (
     await env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
@@ -142,9 +152,9 @@ export async function computeUpdates(
   const nudgeableIds = new Set<string>();
   if (heldTaskIds.size === 0 && newTaskIds.length) {
     const { results } = await env.DB.prepare(
-      `SELECT t.id
+      `SELECT t.id, t.project_id AS projectId
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-       WHERE t.id IN (${newTaskIds.map((_, i) => `?${i + 4}`).join(',')})
+       WHERE t.id IN (SELECT value FROM json_each(?4))
          AND t.status = 'todo' AND t.claimed_by IS NULL AND t.failed_at IS NULL
          AND ${USER_PROJECT_WHERE}
          AND ${tokenProjectWhere('?3')}
@@ -155,12 +165,8 @@ export async function computeUpdates(
          AND ${TASK_NOT_IN_PROPOSED_PLAN}
          AND ${TASK_NOT_PROPOSED_SPINOFF}
          AND ${TASK_NOT_PHASE_BLOCKED}`,
-    ).bind(agent.userId, agentProjectId, tokenId, ...newTaskIds).all<{ id: string }>();
-    const ids = results.map(r => r.id);
-    if (ids.length) {
-      const facts = await env.DB.prepare('SELECT id, project_id AS projectId FROM tasks WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(ids)).all<{id:string; projectId:string}>();
-      for (const r of await filterFreshTasks(env.DB, facts.results)) nudgeableIds.add(r.id);
-    }
+    ).bind(agent.userId, agentProjectId, tokenId, JSON.stringify(newTaskIds)).all<{ id: string; projectId: string }>();
+    for (const r of await filterFreshTasks(env.DB, results)) nudgeableIds.add(r.id);
   }
 
   // Projects the agent's USER can reach — scopes broadcast messages/notices so an
@@ -258,7 +264,7 @@ export async function computeUpdates(
 
   // Open comments on unclaimed tasks — sticky for everyone, so a question posted
   // to a task nobody holds still reaches an agent (dogfooding find, 2026-07-13).
-  const unassignedComments = (
+  const unassignedComments = opts.noticesOnly && heldTaskIds.size ? [] : (
     await env.DB.prepare(
       `SELECT c.id, c.task_id AS taskId, t.key AS taskKey, c.kind, c.body
        FROM comments c JOIN tasks t ON t.id = c.task_id JOIN projects p ON p.id = t.project_id
@@ -271,7 +277,7 @@ export async function computeUpdates(
   ).results;
 
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
-  const messages = (
+  const messages = opts.noticesOnly ? [] : (
     await env.DB.prepare(
       `SELECT m.id, m.from_name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
        FROM messages m JOIN projects p ON p.id = m.project_id
@@ -281,7 +287,7 @@ export async function computeUpdates(
   ).results;
 
   // Input requests this agent is still waiting on (so it doesn't re-ask or forget).
-  const pendingInputRequests = (
+  const pendingInputRequests = opts.noticesOnly ? [] : (
     await env.DB.prepare(
       `SELECT s.id, t.key AS taskKey, s.title, s.created_at AS createdAt
        FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
@@ -290,14 +296,18 @@ export async function computeUpdates(
     ).bind(agent.id).all<AgentUpdates['pendingInputRequests'][number]>()
   ).results;
 
-  if (opts.advanceCursor !== false && maxRid > cursor) {
-    await session.advanceCursor(maxRid);
-  }
-  await session.touch();
-
-  return {
+  const updates: AgentUpdates = {
     notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages, pendingInputRequests,
     agentProjectId, memoryChanges,
+  };
+  return {
+    updates,
+    complete: async (advanceCursor = true) => {
+      // Also persist the registration-time bootstrap cursor when there were no new events.
+      // AgentSession.advanceCursor is monotonic across overlapping requests.
+      if (advanceCursor && maxRid > deliveredCursor) await session.advanceCursor(maxRid);
+      await session.touch();
+    },
   };
 }
 

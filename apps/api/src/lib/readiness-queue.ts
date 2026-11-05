@@ -1,4 +1,6 @@
 import { subjectFreshness } from './entity-validation-store';
+import { batchedFreshnessReads } from './batched-freshness-reads';
+import { measureMcpStage } from './mcp-performance';
 
 /** SQL has already applied status, approval and dependency gates. Fast-path untouched legacy tasks. */
 export async function filterFreshTasks<T extends { id: string; projectId: string }>(db: D1Database, tasks: T[]): Promise<T[]> {
@@ -14,8 +16,19 @@ export async function filterFreshTasks<T extends { id: string; projectId: string
   )`).bind(JSON.stringify(tasks.map(t => t.id))).all<{id:string}>();
   const needsCheck = new Set(results.map(r => r.id));
   const eligible: T[] = [];
-  for (const t of tasks) {
-    if (!needsCheck.has(t.id) || !(await subjectFreshness(db, t.projectId, 'task', t.id)).criticalCauses.length) eligible.push(t);
-  }
+  await measureMcpStage('freshness', async () => {
+    const reads = batchedFreshnessReads(db);
+    // Limit live evaluators, including larger new-task notification windows. Preserve order.
+    for (let i = 0; i < tasks.length; i += 20) {
+      const chunk = tasks.slice(i, i + 20);
+      const fresh = await Promise.allSettled(chunk.map(async t =>
+        !needsCheck.has(t.id) || !(await subjectFreshness(reads, t.projectId, 'task', t.id)).criticalCauses.length));
+      // Drain all sibling evaluators before propagating an error; never silently admit tasks.
+      for (const [n, result] of fresh.entries()) {
+        if (result.status === 'rejected') throw result.reason;
+        if (result.value) eligible.push(chunk[n]!);
+      }
+    }
+  });
   return eligible;
 }

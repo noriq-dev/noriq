@@ -26,7 +26,10 @@ export class AgentSession extends DurableObject<Env> {
 
   /** Read the delivery cursor and advance it (no-ack model). */
   async advanceCursor(to: number): Promise<void> {
-    await this.ctx.storage.put('lastEventRowid', to);
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const current = (await this.ctx.storage.get<number>('lastEventRowid')) ?? 0;
+      if (to > current) await this.ctx.storage.put('lastEventRowid', to);
+    });
   }
 
   async cursor(): Promise<number> {
