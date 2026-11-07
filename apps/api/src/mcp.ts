@@ -498,7 +498,7 @@ export const SERVER_INFO = {
   description:
     'AI-native project management — MCP coordination for agents, mission control for humans. Call get_briefing first; claim before work; boardId is required on create_tasks (the UI All board is virtual and not a boardId).',
   websiteUrl: 'https://plan.frs.llc',
-  catalogRevision: 8,
+  catalogRevision: 9,
 };
 
 /** Discovery metadata for the deployed catalogue. */
@@ -1639,7 +1639,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_tasks',
-    'Update one or many tasks with heterogeneous patches, dependency edits, and git references. `defaults` is merged with each item\'s set (item wins). `boardId` moves a task between boards (ids from get_project.boards / list_boards — not milestones); `milestoneId` reassigns the time/goal bucket. Results are per task; one failure does not stop later items. executionSpec replaces the whole value; use defaults.executionSpec only when the same contract genuinely applies to every item. ' + EXECUTION_SPEC_DESC,
+    'Update one or many tasks in one call — parallel to create_tasks. Pass `tasks` (1-100) with per-item patches; use `defaults` for shared fields (item `set` wins). Heterogeneous patches, dependency edits, and git refs are fine in the same batch. `boardId` moves a task between boards (ids from get_project.boards / list_boards — not milestones); `milestoneId` reassigns the time/goal bucket. Results are per task (`ok` / `error`); one failure does not stop later items. A single-task update is just a one-element `tasks` array. executionSpec replaces the whole value; use defaults.executionSpec only when the same contract genuinely applies to every item. ' + EXECUTION_SPEC_DESC,
     {
       projectId: z.string(),
       defaults: z.object({

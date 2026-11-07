@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### MCP batch `update_tasks` ergonomics (PLNR-636)
+
+- Clarify `update_tasks` as create_tasks-parallel: multi-item `tasks[]`, shared `defaults`, per-item `ok`/`error`, single-item as a one-element array.
+- Lock the production wire contract in tests via `mcpCallRaw` (no test-only `taskIds` shim).
+- Bump MCP `catalogRevision` to **9**.
+
 ## 0.81.7 - 2026-11-06
 
 ### Mobile Plans quick nav (PLNR-634)

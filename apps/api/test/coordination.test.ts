@@ -1,6 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, mcpList, authorizeForAllProjects } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpCallRaw, mcpList, authorizeForAllProjects } from './helpers';
 
 let orch: { id: string; apiKey: string };
 let nova: { id: string; apiKey: string };
@@ -298,9 +298,9 @@ describe('create_tasks — batch creation', () => {
   });
 });
 
-// ---- PLNR-135: batch mutation + non-destructive tag edits -------------------------
+// ---- PLNR-135 / PLNR-636: batch mutation parallel to create_tasks -----------------
 describe('update_tasks — batch mutation', () => {
-  it('applies one change to many tasks; addTags/removeTags never clobber', async () => {
+  it('applies defaults + per-item sets; addTags/removeTags never clobber; bad items fail alone', async () => {
     const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'BLK', name: 'bulk' });
     const pid = proj.body.id;
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
@@ -314,12 +314,16 @@ describe('update_tasks — batch mutation', () => {
     })).body.created;
     const ids = Object.fromEntries(made.map((i: { ref: string; id: string; key: string }) => [i.ref, i]));
 
-    // Bulk: priority + an added tag across all three — by MIXED id and display key.
-    // Only claim/release resolved keys before; update paths now do too (PLNR-135).
-    const bulk = await mcpCall(orch.apiKey, 'update_tasks', {
+    // Canonical wire shape (create_tasks-parallel): defaults + tasks[] with mixed id/key.
+    // mcpCallRaw skips the test-only taskIds shim so this proves the production schema.
+    const bulk = await mcpCallRaw(orch.apiKey, 'update_tasks', {
       projectId: pid,
-      taskIds: [ids.x.id, ids.y.key, ids.z.key],
-      set: { priority: 4, addTags: ['sprint-1'] },
+      defaults: { priority: 4, addTags: ['sprint-1'] },
+      tasks: [
+        { taskId: ids.x.id },
+        { taskId: ids.y.key },
+        { taskId: ids.z.key },
+      ],
     });
     expect(bulk.isError).toBe(false);
     expect(bulk.body.count).toBe(3);
@@ -335,22 +339,31 @@ describe('update_tasks — batch mutation', () => {
     const tagNames = new Set(snap.body.tags.map((t: { name: string }) => t.name));
     expect(tagNames.has('keepme')).toBe(true);
     expect(tagNames.has('sprint-1')).toBe(true);
-    const rm = await mcpCall(orch.apiKey, 'update_tasks', {
-      projectId: pid, taskIds: [ids.x.id], set: { removeTags: ['sprint-1'] },
+    const rm = await mcpCallRaw(orch.apiKey, 'update_tasks', {
+      projectId: pid,
+      tasks: [{ taskId: ids.x.id, set: { removeTags: ['sprint-1'] } }],
     });
     expect(rm.body.failed).toBe(0);
     const xAfter = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.x.id });
     // keepme survives on x; sprint-1 is gone from x only.
     // (get_task has no tags in its payload; assert via the project snapshot's task_tags.)
 
-    // A bad id fails alone; the rest of the batch lands.
-    const mixed = await mcpCall(orch.apiKey, 'update_tasks', {
-      projectId: pid, taskIds: [ids.z.id, 'task_nonexistent'], set: { status: 'blocked' },
+    // Heterogeneous patches + a bad id: one failure does not stop the rest.
+    const mixed = await mcpCallRaw(orch.apiKey, 'update_tasks', {
+      projectId: pid,
+      tasks: [
+        { taskId: ids.z.id, set: { status: 'blocked', priority: 1 } },
+        { taskId: 'task_nonexistent', set: { status: 'blocked' } },
+      ],
     });
     expect(mixed.body.count).toBe(1);
     expect(mixed.body.failed).toBe(1);
+    const results = mixed.body.results as Array<{ taskId: string; ok: boolean; error?: string }>;
+    expect(results.find((r) => r.taskId === ids.z.id)?.ok).toBe(true);
+    expect(results.find((r) => r.taskId === 'task_nonexistent')?.ok).toBe(false);
     const z = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.z.id });
     expect(z.body.task.status).toBe('blocked');
+    expect(z.body.task.priority).toBe(1);
     expect(xAfter.isError).toBe(false);
   });
 });
@@ -655,7 +668,7 @@ describe('due dates', () => {
       ],
     })).body.created;
     const ids = Object.fromEntries(made.map((i: { ref: string; id: string }) => [i.ref, i]));
-    await mcpCall(orch.apiKey, 'update_tasks', { projectId: pid, taskIds: [ids.doneLate.id], set: { status: 'done' } });
+    await mcpCall(orch.apiKey, 'update_tasks', { projectId: pid, tasks: [{ taskId: ids.doneLate.id, set: { status: 'done' } }] });
 
     const got = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.late.id });
     expect(got.body.task.due_at).toBe(past);

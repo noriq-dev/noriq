@@ -103,7 +103,9 @@ describe('status on a claimed task, via MCP (PLNR-226)', () => {
 
   it('update_tasks refuses per task: the claimed task stands, the unclaimed one moves', async () => {
     const res = await mcpCall(orch.apiKey, 'update_tasks', {
-      projectId, taskIds: [claimed.id, unclaimed.id], set: { status: 'blocked' },
+      projectId,
+      defaults: { status: 'blocked' },
+      tasks: [{ taskId: claimed.id }, { taskId: unclaimed.id }],
     });
     expect(res.isError).toBeFalsy();
     const results = res.body.results as Array<{ taskId: string; ok: boolean; error?: string }>;
