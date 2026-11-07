@@ -13,7 +13,7 @@ describe('MobileTabBar', () => {
     document.body.appendChild(container);
     act(() => createRoot(container).render(<MobileTabBar view="board" signalCount={7} onNavigate={onNavigate} />));
     expect([...container.querySelectorAll('button')].map((button) => button.textContent)).toEqual([
-      '◉Feed7', '▦Board', '✦Ask', '◇Insight', '•••More',
+      '◉Feed7', '▦Board', '✦Ask', '☷Plans', '•••More',
     ]);
     expect(container.querySelector('[data-signal-badge]')?.textContent).toBe('7');
     expect(container.querySelector('[aria-current="page"]')?.getAttribute('aria-label')).toBe('Board');
