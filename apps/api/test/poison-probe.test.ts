@@ -28,7 +28,9 @@ describe('update_tasks survives a DO-level failure mid-list', () => {
     // Re-parenting A under itself throws inside the DO (cycle guard); the same patch applied
     // to B is legal. Before the fix, B's result was A's error verbatim.
     const res = await mcpCall(orch.apiKey, 'update_tasks', {
-      projectId, taskIds: [a.id, b.id], set: { parentTaskId: a.id },
+      projectId,
+      defaults: { parentTaskId: a.id },
+      tasks: [{ taskId: a.id }, { taskId: b.id }],
     });
     expect(res.isError).toBeFalsy();
     const results = res.body.results as Array<{ taskId: string; ok: boolean; error?: string }>;

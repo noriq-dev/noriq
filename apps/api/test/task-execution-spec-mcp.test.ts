@@ -116,8 +116,8 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
 
     const stamp = await mcpCall(agent.apiKey, 'update_tasks', {
       projectId,
-      taskIds: [one.body.id, two.body.id],
-      set: { executionSpec: { requiredReading: ['ARCHITECTURE.md'] } },
+      defaults: { executionSpec: { requiredReading: ['ARCHITECTURE.md'] } },
+      tasks: [{ taskId: one.body.id }, { taskId: two.body.id }],
     });
     expect(stamp.body.failed).toBe(0);
     for (const t of [one, two]) {
@@ -127,7 +127,9 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
     }
 
     const cleared = await mcpCall(agent.apiKey, 'update_tasks', {
-      projectId, taskIds: [one.body.id, two.body.id], set: { executionSpec: null },
+      projectId,
+      defaults: { executionSpec: null },
+      tasks: [{ taskId: one.body.id }, { taskId: two.body.id }],
     });
     expect(cleared.body.failed).toBe(0);
     expect(await specOf(one.body.id)).toBeNull();
@@ -240,8 +242,9 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
     const getTask = tools.get('get_task')!.description;
     expect(getTask).toContain('lockedDecisions bind you');
     expect(getTask).toContain('executionSpecUnreadable');
-    // The bulk tool warns rather than forbids.
+    // The bulk tool warns rather than forbids, and advertises create_tasks-parallel ergonomics.
     expect(tools.get('update_tasks')!.description).toMatch(/same contract genuinely applies to every item/);
+    expect(tools.get('update_tasks')!.description).toMatch(/parallel to create_tasks/);
     // …and the field really is in the advertised schema, not merely described.
     expect(JSON.stringify(tools.get('create_tasks')!.inputSchema)).toContain('anticipatedFiles');
   });
