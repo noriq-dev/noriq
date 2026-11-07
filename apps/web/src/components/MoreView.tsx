@@ -75,6 +75,15 @@ export function MoreView({ store }: { store: AppStore }) {
               store.actions.setView('plans');
             }}
           />
+          <MoreRow
+            icon="◇"
+            label="Project health"
+            detail="Claimable work, readiness gaps, and historical evidence"
+            onClick={() => {
+              if (!store.currentPid) store.actions.selectProject(project.id);
+              store.actions.setView('intelligence');
+            }}
+          />
         </MoreSection>}
 
         {project && <MoreSection title={`Desktop tools · ${project.key}`}>

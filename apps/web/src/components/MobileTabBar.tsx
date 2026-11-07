@@ -1,13 +1,13 @@
 import type { ViewId } from '../types';
 import { MOBILE_TAB_BAR_HEIGHT, TAB_ITEM_HEIGHT } from '../viewport';
 
-export type MobileTab = 'feed' | 'board' | 'ask' | 'insight' | 'more';
+export type MobileTab = 'feed' | 'board' | 'ask' | 'plans' | 'more';
 
 const TABS: Array<{ id: MobileTab; label: string; icon: string; view: ViewId }> = [
   { id: 'feed', label: 'Feed', icon: '◉', view: 'control' },
   { id: 'board', label: 'Board', icon: '▦', view: 'board' },
   { id: 'ask', label: 'Ask', icon: '✦', view: 'ask' },
-  { id: 'insight', label: 'Insight', icon: '◇', view: 'intelligence' },
+  { id: 'plans', label: 'Plans', icon: '☷', view: 'plans' },
   { id: 'more', label: 'More', icon: '•••', view: 'more' },
 ];
 
@@ -15,7 +15,7 @@ export function mobileTabForView(view: ViewId): MobileTab {
   if (view === 'control') return 'feed';
   if (view === 'board') return 'board';
   if (view === 'ask') return 'ask';
-  if (view === 'intelligence') return 'insight';
+  if (view === 'plans') return 'plans';
   return 'more';
 }
 
