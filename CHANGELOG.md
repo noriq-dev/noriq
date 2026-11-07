@@ -8,6 +8,14 @@
 - Lock the production wire contract in tests via `mcpCallRaw` (no test-only `taskIds` shim).
 - Bump MCP `catalogRevision` to **9**.
 
+## 0.81.7 - 2026-11-06
+
+### Mobile Plans quick nav (PLNR-634)
+
+- Phone bottom-tab fourth slot is **Plans** instead of Insight; Project health remains reachable from More.
+- Desktop Project health / Operate nav unchanged.
+- `catalogRevision` remains **8** (no MCP catalog change).
+
 ## 0.81.6 - 2026-11-05
 
 ### Freshness SQL + memory event recency (PLNR-632)
