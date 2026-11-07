@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.81.8 - 2026-11-06
+
 ### MCP batch `update_tasks` ergonomics (PLNR-636)
 
 - Clarify `update_tasks` as create_tasks-parallel: multi-item `tasks[]`, shared `defaults`, per-item `ok`/`error`, single-item as a one-element array.
