@@ -76,6 +76,15 @@ export function MoreView({ store }: { store: AppStore }) {
             }}
           />
           <MoreRow
+            icon="▤"
+            label="Documents"
+            detail="Browse settled project docs and read full bodies"
+            onClick={() => {
+              if (!store.currentPid) store.actions.selectProject(project.id);
+              store.actions.setView('docs');
+            }}
+          />
+          <MoreRow
             icon="◇"
             label="Project health"
             detail="Claimable work, readiness gaps, and historical evidence"

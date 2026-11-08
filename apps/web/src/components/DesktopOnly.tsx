@@ -6,7 +6,6 @@ import { Button } from './ui';
 export const DESKTOP_ONLY_VIEWS = {
   graph: ['Coordination graph', 'Explore dependencies, ownership, and live coordination across a wide connected canvas.'],
   roadmap: ['Roadmap', 'Arrange milestones and delivery windows across the project timeline.'],
-  docs: ['Docs', 'Read and edit long-form project documents with their surrounding workspace context.'],
   memory: ['Memory', 'Explore durable memories and evidence relationships in the full constellation workspace.'],
   agents: ['Agents', 'Manage agent and copilot presence, history, and administrative controls.'],
 } satisfies Partial<Record<ViewId, readonly [string, string]>>;

@@ -11,6 +11,7 @@ import { MonoTag, SectionLabel } from './bits';
 import { Button, TextInput } from './ui';
 import { confirm } from './Dialog';
 import { ValidityStrip } from './ValidityStrip';
+import { MIN_TOUCH_TARGET, useViewport } from '../viewport';
 
 export interface DocumentDiffRow {
   kind: 'same' | 'changed' | 'added' | 'removed' | 'omitted';
@@ -153,6 +154,7 @@ export function diffDocumentLines(fromText: string, toText: string): DocumentDif
 
 export function DocsView({ store }: { store: AppStore }) {
   const { currentPid, snapshot, actions } = store;
+  const { phone, tablet } = useViewport();
   const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
   const [archivedDocs, setArchivedDocs] = useState<ApiProjectDoc[]>([]);
   const [showArchived, setShowArchived] = useState(false);
@@ -173,6 +175,16 @@ export function DocsView({ store }: { store: AppStore }) {
   const [eBody, setEBody] = useState('');
   const [eFolder, setEFolder] = useState('');
   const [eTags, setETags] = useState('');
+
+  const showList = !phone || (!selected && !editing);
+  const showReader = !phone || !!selected || editing;
+  const backToList = () => {
+    setSelected(null);
+    setEditing(false);
+    setViewedVersion(null);
+    setCompareOpen(false);
+    setComparison(null);
+  };
 
   const load = () => Promise.all([api.docs(currentPid), api.docs(currentPid, true)])
     .then(([active, archived]) => { setDocs(active.docs); setArchivedDocs(archived.docs); })
@@ -322,7 +334,8 @@ export function DocsView({ store }: { store: AppStore }) {
       onClick={() => { requestedVersion.current = null; setSelected(d.id); setEditing(false); }}
       className="hover-border"
       style={{
-        padding: '9px 12px', borderRadius: 10, cursor: 'pointer', marginLeft: indent ? 14 : 0,
+        padding: phone ? '12px 12px' : '9px 12px', borderRadius: 10, cursor: 'pointer', marginLeft: indent ? 14 : 0,
+        minHeight: phone ? MIN_TOUCH_TARGET : undefined,
         background: selected === d.id ? 'var(--w-045)' : 'var(--w-02)',
         border: `1px solid ${selected === d.id ? 'var(--w-18)' : 'var(--w-07)'}`,
       }}
@@ -340,83 +353,112 @@ export function DocsView({ store }: { store: AppStore }) {
     </div>
   );
 
-  return (
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '320px 1fr', minHeight: 0 }} className="agents-grid">
-      <div style={{ borderRight: '1px solid var(--line)', overflowY: 'auto', padding: '16px 14px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-          <SectionLabel>{showArchived ? 'Archived docs' : 'Docs'} · {visibleDocs.length}</SectionLabel>
-          <div style={{ flex: 1 }} />
-          {archivedDocs.length > 0 && (
-            <Button
-              variant="ghost"
-              style={{ padding: '4px 10px', fontSize: 11 }}
-              onClick={() => { setShowArchived((value) => !value); setSelected(null); setEditing(false); setTagFilter(null); }}
-            >
-              {showArchived ? 'active' : `archive · ${archivedDocs.length}`}
-            </Button>
-          )}
-          {!showArchived && <Button variant="ghost" style={{ padding: '4px 10px', fontSize: 11 }} onClick={startNew}>+ new</Button>}
-        </div>
-        {tagsInUse.length > 0 && (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
-            {tagsInUse.map((t) => {
-              const on = tagFilter === t;
-              return (
-                <button
-                  key={t}
-                  onClick={() => setTagFilter(on ? null : t)}
-                  style={{
-                    cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, borderRadius: 6, padding: '2px 8px',
-                    color: on ? '#0a0b0d' : (tagColor.get(t) ?? 'var(--text-mid)'),
-                    background: on ? (tagColor.get(t) ?? 'var(--accent)') : 'var(--w-04)',
-                    border: `1px solid ${on ? (tagColor.get(t) ?? 'var(--accent)') : 'var(--w-1)'}`,
-                  }}
-                >
-                  {t}
-                </button>
-              );
-            })}
-          </div>
+  const listPanel = (
+    <div className="docs-sidebar" style={{ borderRight: phone ? undefined : '1px solid var(--line)', overflowY: 'auto', padding: phone ? '12px 12px 16px' : '16px 14px', minHeight: 0, minWidth: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+        <SectionLabel>{showArchived ? 'Archived docs' : 'Docs'} · {visibleDocs.length}</SectionLabel>
+        <div style={{ flex: 1 }} />
+        {archivedDocs.length > 0 && (
+          <Button
+            variant="ghost"
+            style={{ padding: phone ? '6px 11px' : '4px 10px', fontSize: 11, minHeight: phone ? MIN_TOUCH_TARGET : undefined }}
+            onClick={() => { setShowArchived((value) => !value); setSelected(null); setEditing(false); setTagFilter(null); }}
+          >
+            {showArchived ? 'active' : `archive · ${archivedDocs.length}`}
+          </Button>
         )}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-          {groups.map(([folder, list]) => folder === '' ? (
-            list.map((d) => docCard(d, false))
-          ) : (
-            <div key={folder} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {!showArchived && !phone && <Button variant="ghost" style={{ padding: '4px 10px', fontSize: 11 }} onClick={startNew}>+ new</Button>}
+      </div>
+      {tagsInUse.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
+          {tagsInUse.map((t) => {
+            const on = tagFilter === t;
+            return (
               <button
-                onClick={() => setCollapsed((c) => {
-                  const n = new Set(c);
-                  n.has(folder) ? n.delete(folder) : n.add(folder);
-                  return n;
-                })}
+                key={t}
+                onClick={() => setTagFilter(on ? null : t)}
                 style={{
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, background: 'transparent',
-                  border: 'none', padding: '3px 2px', color: 'var(--text-mid)', textAlign: 'left',
+                  cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, borderRadius: 6, padding: phone ? '6px 10px' : '2px 8px',
+                  minHeight: phone ? MIN_TOUCH_TARGET : undefined,
+                  color: on ? '#0a0b0d' : (tagColor.get(t) ?? 'var(--text-mid)'),
+                  background: on ? (tagColor.get(t) ?? 'var(--accent)') : 'var(--w-04)',
+                  border: `1px solid ${on ? (tagColor.get(t) ?? 'var(--accent)') : 'var(--w-1)'}`,
                 }}
               >
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{collapsed.has(folder) ? '▸' : '▾'}</span>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, letterSpacing: '.03em' }}>📁 {folder}</span>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{list.length}</span>
+                {t}
               </button>
-              {!collapsed.has(folder) && list.map((d) => docCard(d, true))}
-            </div>
-          ))}
-          {!visibleDocs.length && !editing && (
-            <div style={{ padding: 30, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
-              {showArchived ? 'no archived docs' : 'no docs yet — conventions, architecture notes, decisions live here'}
-            </div>
-          )}
-          {visibleDocs.length > 0 && groups.length === 0 && (
-            <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
-              nothing tagged “{tagFilter}”
-            </div>
-          )}
+            );
+          })}
         </div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+        {groups.map(([folder, list]) => folder === '' ? (
+          list.map((d) => docCard(d, false))
+        ) : (
+          <div key={folder} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <button
+              onClick={() => setCollapsed((c) => {
+                const n = new Set(c);
+                n.has(folder) ? n.delete(folder) : n.add(folder);
+                return n;
+              })}
+              style={{
+                cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, background: 'transparent',
+                border: 'none', padding: phone ? '6px 2px' : '3px 2px', color: 'var(--text-mid)', textAlign: 'left',
+                minHeight: phone ? MIN_TOUCH_TARGET : undefined,
+              }}
+            >
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{collapsed.has(folder) ? '▸' : '▾'}</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, letterSpacing: '.03em' }}>📁 {folder}</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{list.length}</span>
+            </button>
+            {!collapsed.has(folder) && list.map((d) => docCard(d, true))}
+          </div>
+        ))}
+        {!visibleDocs.length && !editing && (
+          <div style={{ padding: 30, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+            {showArchived ? 'no archived docs' : 'no docs yet — conventions, architecture notes, decisions live here'}
+          </div>
+        )}
+        {visibleDocs.length > 0 && groups.length === 0 && (
+          <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+            nothing tagged “{tagFilter}”
+          </div>
+        )}
       </div>
+    </div>
+  );
 
-      <div style={{ overflowY: 'auto', padding: '18px 24px' }}>
+  return (
+    <div
+      data-testid="docs-view"
+      className="docs-view"
+      style={{
+        position: 'absolute', inset: 0, minHeight: 0,
+        display: phone ? 'flex' : 'grid',
+        flexDirection: phone ? 'column' : undefined,
+        gridTemplateColumns: phone ? undefined : (tablet ? 'minmax(0, 280px) minmax(0, 1fr)' : '320px 1fr'),
+      }}
+    >
+      {showList && listPanel}
+      {showReader && (
+      <div className="docs-reader" style={{ overflowY: 'auto', padding: phone ? '12px 14px 20px' : '18px 24px', minHeight: 0, minWidth: 0, flex: phone ? 1 : undefined, overscrollBehaviorY: phone ? 'contain' : undefined }}>
+        {phone && (selected || editing) && (
+          <button
+            type="button"
+            onClick={backToList}
+            aria-label="Back to document list"
+            style={{
+              minHeight: MIN_TOUCH_TARGET, marginBottom: 12, padding: '0 10px', cursor: 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 6, borderRadius: 8,
+              background: 'var(--w-04)', border: '1px solid var(--w-08)', color: 'var(--text-mid)', fontSize: 13, fontWeight: 600,
+            }}
+          >
+            <span aria-hidden="true">←</span> Docs
+          </button>
+        )}
         {editing ? (
-          <div style={{ maxWidth: 780, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ maxWidth: phone ? undefined : 780, display: 'flex', flexDirection: 'column', gap: 10 }}>
             <TextInput autoFocus placeholder="doc name" value={eName} onChange={(e) => setEName(e.target.value)} />
             <TextInput placeholder="one-line description (what a reader finds inside)" value={eDesc} onChange={(e) => setEDesc(e.target.value)} />
             <div style={{ display: 'flex', gap: 10 }}>
@@ -447,8 +489,8 @@ export function DocsView({ store }: { store: AppStore }) {
             </div>
           </div>
         ) : sel && readDoc ? (
-          <div style={{ maxWidth: 780 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <div style={{ maxWidth: phone ? undefined : 780 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
               <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{readDoc.name}</h2>
               <MonoTag color={viewingHistory ? 'var(--amber)' : 'var(--accent)'} bg="var(--w-04)" size={9}>
                 v{readDoc.version}{viewingHistory ? ' · HISTORY' : ''}
@@ -658,11 +700,12 @@ export function DocsView({ store }: { store: AppStore }) {
             <Markdown source={readDoc.body || '_empty_'} />
           </div>
         ) : (
-          <div style={{ padding: 60, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-            select a doc — or write one
+          <div style={{ padding: phone ? '36px 12px' : 60, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+            {phone ? 'select a doc from the list' : 'select a doc — or write one'}
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
