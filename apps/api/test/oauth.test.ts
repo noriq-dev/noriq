@@ -116,6 +116,32 @@ describe('oauth 2.1 for MCP', () => {
     expect(clientId).toMatch(/^client_/);
   });
 
+  it('DCR derives a host-based default name and clarifies bad redirect_uris (PLNR-642)', async () => {
+    const unnamed = await SELF.fetch('https://noriq.test/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [redirectUri] }),
+    });
+    expect(unnamed.status).toBe(201);
+    expect(((await unnamed.json()) as { client_name: string }).client_name).toBe('Localhost MCP client');
+
+    const missing = await SELF.fetch('https://noriq.test/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Nope' }),
+    });
+    expect(missing.status).toBe(400);
+    expect(((await missing.json()) as { error_description: string }).error_description).toMatch(/redirect_uris is required/);
+
+    const bad = await SELF.fetch('https://noriq.test/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: ['http://evil.example/cb'] }),
+    });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error_description: string }).error_description).toMatch(/no usable redirect_uris/);
+  });
+
   it('authorize → consent → code → token (PKCE) → MCP access', async () => {
     const { verifier } = pkce();
     const challenge = await s256(verifier);

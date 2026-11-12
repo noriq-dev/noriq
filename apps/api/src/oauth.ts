@@ -134,12 +134,31 @@ export function metadataRoutes(app: Hono<AppContext>) {
   app.get('/.well-known/oauth-protected-resource/mcp', rsHandler);
 }
 
+/** Default display name when DCR omits `client_name` — prefer a redirect host over the
+ *  generic "MCP client" so Admin OAuth Clients stays readable as registrations pile up. */
+export function defaultDcrClientName(uris: string[], requested?: string): string {
+  const named = requested?.trim();
+  if (named) return named.slice(0, 80);
+  const first = uris[0];
+  if (first) {
+    try {
+      const host = new URL(first).hostname;
+      if (host === 'localhost' || host === '127.0.0.1') return 'Localhost MCP client';
+      return `${host} MCP client`.slice(0, 80);
+    } catch {
+      /* fall through */
+    }
+  }
+  return 'MCP client';
+}
+
 // --- dynamic client registration (RFC 7591) ---------------------------------------
 oauth.post('/register', async (c) => {
   const body = await c.req
     .json<{ client_name?: string; redirect_uris?: string[]; grant_types?: string[] }>()
     .catch(() => ({}) as never);
-  const uris = (body.redirect_uris ?? []).filter((u) => {
+  const rawUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  const uris = rawUris.filter((u) => {
     try {
       const url = new URL(u);
       return url.protocol === 'https:' || url.hostname === 'localhost' || url.hostname === '127.0.0.1';
@@ -157,10 +176,13 @@ oauth.post('/register', async (c) => {
   // BOTH — the Noriq Runner does, preferring loopback and falling back to device on a
   // headless box.
   if (!uris.length && wantsCode) {
-    return c.json({ error: 'invalid_client_metadata', error_description: 'redirect_uris required (https or localhost)' }, 400);
+    const description = rawUris.length === 0
+      ? 'redirect_uris is required for authorization_code clients (https, or http on localhost / 127.0.0.1)'
+      : 'no usable redirect_uris — each must be https, or http on localhost / 127.0.0.1';
+    return c.json({ error: 'invalid_client_metadata', error_description: description }, 400);
   }
   const id = `client_${newId('').slice(1)}`;
-  const name = (body.client_name ?? 'MCP client').slice(0, 80);
+  const name = defaultDcrClientName(uris, body.client_name);
   await c.env.DB.prepare('INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES (?, ?, ?, ?)')
     .bind(id, name, JSON.stringify(uris), nowIso()).run();
   return c.json({

@@ -149,37 +149,131 @@ function PolicySelect({ label, value, onChange }: { label: string; value?: numbe
   </Select>;
 }
 
-/** Admin OAuth management (PLNR-160): every live connection instance-wide, revocable,
- *  plus the registered clients with cleanup for stale registrations. */
+type AdminClient = Awaited<ReturnType<typeof api.adminClients>>['clients'][number];
+type AdminConnection = Awaited<ReturnType<typeof api.adminConnections>>['connections'][number];
+type ClientFilter = 'all' | 'in_use' | 'idle';
+
+/** Parse redirect_uris JSON from DCR / admin list into host labels for the table. */
+export function redirectHosts(redirectUris: string): string[] {
+  try {
+    const uris = JSON.parse(redirectUris) as unknown;
+    if (!Array.isArray(uris)) return [];
+    const hosts: string[] = [];
+    for (const u of uris) {
+      if (typeof u !== 'string') continue;
+      try {
+        hosts.push(new URL(u).host || new URL(u).hostname);
+      } catch {
+        hosts.push(u);
+      }
+    }
+    return [...new Set(hosts)];
+  } catch {
+    return redirectUris ? [redirectUris] : [];
+  }
+}
+
+const checkStyle: React.CSSProperties = { width: 15, height: 15, accentColor: 'var(--accent)', cursor: 'pointer' };
+const bulkBtn: React.CSSProperties = {
+  background: 'var(--w-06)', border: '1px solid var(--w-1)', borderRadius: 7,
+  color: 'var(--text)', fontSize: 11.5, padding: '5px 10px', fontFamily: 'inherit', cursor: 'pointer',
+};
+
+/** Admin OAuth management (PLNR-160 / PLNR-642): live connections + DCR clients with
+ *  checkbox multi-select bulk actions and calmer idle-vs-in-use labeling. */
 function OAuthSection() {
-  const [connections, setConnections] = useState<Awaited<ReturnType<typeof api.adminConnections>>['connections']>([]);
-  const [clients, setClients] = useState<Awaited<ReturnType<typeof api.adminClients>>['clients']>([]);
+  const [connections, setConnections] = useState<AdminConnection[]>([]);
+  const [clients, setClients] = useState<AdminClient[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [connSelected, setConnSelected] = useState<Set<string>>(new Set());
+  const [clientSelected, setClientSelected] = useState<Set<string>>(new Set());
+  const [clientFilter, setClientFilter] = useState<ClientFilter>('all');
   const load = () => {
     api.adminConnections().then((r) => setConnections(r.connections)).catch(() => {});
     api.adminClients().then((r) => setClients(r.clients)).catch(() => {});
   };
   useEffect(load, []);
 
-  const scopeOf = (c: (typeof connections)[number]) =>
+  const scopeOf = (c: AdminConnection) =>
     c.bound ? 'run-bound' : c.scopeAll ? 'all projects' : c.scoped ? (c.projectKeys ?? 'none') : 'unscoped (legacy)';
+
+  const idleCount = clients.filter((c) => c.liveTokens === 0).length;
+  const inUseCount = clients.length - idleCount;
+  const visibleClients = clients
+    .filter((c) => clientFilter === 'all' || (clientFilter === 'idle' ? c.liveTokens === 0 : c.liveTokens > 0))
+    // Idle first within the filter so DCR residue is easy to clean; then newest.
+    .slice()
+    .sort((a, b) => {
+      if (clientFilter === 'all' && (a.liveTokens === 0) !== (b.liveTokens === 0)) {
+        return a.liveTokens === 0 ? -1 : 1;
+      }
+      return b.createdAt.localeCompare(a.createdAt);
+    });
+
+  const toggleSet = (prev: Set<string>, id: string) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  };
+  const setAll = (ids: string[], on: boolean) => (on ? new Set(ids) : new Set<string>());
+
+  const connIds = connections.map((c) => c.id);
+  const visibleClientIds = visibleClients.map((c) => c.id);
+  const allConnSelected = connIds.length > 0 && connIds.every((id) => connSelected.has(id));
+  const allClientsSelected = visibleClientIds.length > 0 && visibleClientIds.every((id) => clientSelected.has(id));
+
+  const deleteClient = async (cl: AdminClient) => {
+    setError(null);
+    try {
+      await api.adminDeleteClient(cl.id);
+      setClientSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(cl.id);
+        return next;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'delete failed');
+    }
+  };
 
   return (
     <>
       <Section title={`OAuth connections · ${connections.length}`}>
+        <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginBottom: 10, lineHeight: 1.45 }}>
+          Live authorizations instance-wide. Select rows to revoke several at once.
+        </div>
         {connections.length === 0 ? (
           <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no live connections</div>
         ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+          <div style={{ overflowX: 'auto', position: 'relative' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }} data-testid="oauth-connections-table">
               <thead>
                 <tr style={{ textAlign: 'left', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                  <Th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all connections"
+                      checked={allConnSelected}
+                      onChange={(e) => setConnSelected(setAll(connIds, e.target.checked))}
+                      style={checkStyle}
+                    />
+                  </Th>
                   <Th>User</Th><Th>Client</Th><Th>Reaches</Th><Th right>Agents</Th><Th>Last active</Th><Th>Expires</Th><Th />
                 </tr>
               </thead>
               <tbody>
                 {connections.map((c) => (
-                  <tr key={c.id} style={{ borderTop: '1px solid var(--w-05)' }}>
+                  <tr key={c.id} style={{ borderTop: '1px solid var(--w-05)', background: connSelected.has(c.id) ? 'var(--w-04)' : undefined }}>
+                    <Td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select connection ${c.clientName}`}
+                        checked={connSelected.has(c.id)}
+                        onChange={() => setConnSelected((prev) => toggleSet(prev, c.id))}
+                        style={checkStyle}
+                      />
+                    </Td>
                     <Td>
                       <span style={{ fontWeight: 600 }}>{c.userName ?? '—'}</span>{' '}
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{c.userEmail ?? ''}</span>
@@ -201,6 +295,7 @@ function OAuthSection() {
                         onClick={async () => {
                           if (await confirm(`Revoke ${c.userName ?? 'this user'}'s ${c.clientName} connection? Its agents go offline.`)) {
                             await api.adminRevokeConnection(c.id);
+                            setConnSelected((prev) => { const n = new Set(prev); n.delete(c.id); return n; });
                             load();
                           }
                         }}
@@ -213,57 +308,198 @@ function OAuthSection() {
                 ))}
               </tbody>
             </table>
+            {connSelected.size > 0 && (
+              <div className="bulk-bar" data-testid="oauth-connections-bulk" style={{
+                position: 'sticky', bottom: 8, margin: '12px auto 0', width: 'fit-content',
+                display: 'flex', alignItems: 'center', gap: 9, padding: '9px 14px',
+                background: 'var(--bg-raised)', border: '1px solid var(--w-18)', borderRadius: 12,
+                boxShadow: '0 8px 28px rgba(0,0,0,.45)', zIndex: 5,
+              }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', fontWeight: 700 }}>{connSelected.size} selected</span>
+                <button
+                  style={{ ...bulkBtn, color: 'var(--red-soft)' }}
+                  onClick={async () => {
+                    if (!(await confirm(`Revoke ${connSelected.size} connection(s)? Their agents go offline.`))) return;
+                    for (const id of connSelected) await api.adminRevokeConnection(id).catch(() => {});
+                    setConnSelected(new Set());
+                    load();
+                  }}
+                >
+                  revoke selected
+                </button>
+                <button style={{ ...bulkBtn, color: 'var(--text-dim)', border: 'none', background: 'transparent' }} onClick={() => setConnSelected(new Set())}>✕</button>
+              </div>
+            )}
           </div>
         )}
       </Section>
 
       <Section title={`OAuth clients · ${clients.length}`}>
+        <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginBottom: 10, lineHeight: 1.45 }}>
+          Dynamic Client Registration (DCR) adds a row whenever a tool registers. <b style={{ fontWeight: 600 }}>Idle</b> clients have no live connections and are safe to delete; <b style={{ fontWeight: 600 }}>In use</b> ones need their connections revoked first.
+        </div>
         {error && <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--red-soft)', marginBottom: 8 }}>{error}</div>}
+        {clients.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }} data-testid="oauth-clients-filters">
+            {([
+              ['all', `All · ${clients.length}`],
+              ['idle', `Idle · ${idleCount}`],
+              ['in_use', `In use · ${inUseCount}`],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => { setClientFilter(key); setClientSelected(new Set()); }}
+                style={{
+                  cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, padding: '3px 8px', borderRadius: 8,
+                  color: clientFilter === key ? 'var(--accent-ink)' : 'var(--text-dim)',
+                  background: clientFilter === key ? 'rgba(198,242,78,.06)' : 'var(--w-03)',
+                  border: `1px solid ${clientFilter === key ? 'rgba(198,242,78,.35)' : 'var(--w-08)'}`,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+            {idleCount > 0 && (
+              <button
+                type="button"
+                data-testid="oauth-select-idle"
+                onClick={() => setClientSelected(new Set(clients.filter((c) => c.liveTokens === 0).map((c) => c.id)))}
+                style={{ ...bulkBtn, marginLeft: 'auto', fontSize: 10.5, padding: '3px 8px' }}
+              >
+                Select idle
+              </button>
+            )}
+          </div>
+        )}
         {clients.length === 0 ? (
           <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no registered clients</div>
+        ) : visibleClients.length === 0 ? (
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no clients in this filter</div>
         ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+          <div style={{ overflowX: 'auto', position: 'relative' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }} data-testid="oauth-clients-table">
               <thead>
                 <tr style={{ textAlign: 'left', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: '.06em' }}>
-                  <Th>Client</Th><Th>Id</Th><Th right>Live connections</Th><Th>Registered</Th><Th />
+                  <Th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all visible clients"
+                      checked={allClientsSelected}
+                      onChange={(e) => setClientSelected(setAll(visibleClientIds, e.target.checked))}
+                      style={checkStyle}
+                    />
+                  </Th>
+                  <Th>Client</Th><Th>Redirects</Th><Th>Status</Th><Th right>Live</Th><Th>Registered</Th><Th />
                 </tr>
               </thead>
               <tbody>
-                {clients.map((cl) => (
-                  <tr key={cl.id} style={{ borderTop: '1px solid var(--w-05)' }}>
-                    <Td><span style={{ fontWeight: 600 }}>{cl.name}</span></Td>
-                    <Td><span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{cl.id.length > 34 ? `${cl.id.slice(0, 34)}…` : cl.id}</span></Td>
-                    <Td right><span style={{ fontFamily: 'var(--mono)', color: cl.liveTokens > 0 ? 'var(--accent-ink)' : 'var(--text-faint)' }}>{cl.liveTokens}</span></Td>
-                    <Td><span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>{new Date(cl.createdAt).toLocaleDateString()}</span></Td>
-                    <Td right>
-                      <button
-                        disabled={cl.liveTokens > 0}
-                        title={cl.liveTokens > 0 ? 'revoke its live connections first' : 'delete this client registration'}
-                        onClick={async () => {
-                          if (!(await confirm(`Delete client "${cl.name}"? Historical tokens are removed; agents survive.`))) return;
-                          setError(null);
-                          try {
-                            await api.adminDeleteClient(cl.id);
-                          } catch (e) {
-                            setError(e instanceof Error ? e.message : 'delete failed');
-                          }
-                          load();
-                        }}
-                        style={{
-                          cursor: cl.liveTokens > 0 ? 'default' : 'pointer', fontSize: 11,
-                          color: cl.liveTokens > 0 ? 'var(--text-faint)' : 'var(--red-soft)',
-                          background: 'transparent', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 10px',
-                          opacity: cl.liveTokens > 0 ? 0.5 : 1,
-                        }}
-                      >
-                        delete
-                      </button>
-                    </Td>
-                  </tr>
-                ))}
+                {visibleClients.map((cl) => {
+                  const idle = cl.liveTokens === 0;
+                  const hosts = redirectHosts(cl.redirectUris);
+                  return (
+                    <tr key={cl.id} style={{ borderTop: '1px solid var(--w-05)', background: clientSelected.has(cl.id) ? 'var(--w-04)' : undefined }}>
+                      <Td>
+                        <input
+                          type="checkbox"
+                          aria-label={`Select client ${cl.name}`}
+                          checked={clientSelected.has(cl.id)}
+                          onChange={() => setClientSelected((prev) => toggleSet(prev, cl.id))}
+                          style={checkStyle}
+                        />
+                      </Td>
+                      <Td>
+                        <div style={{ fontWeight: 600 }}>{cl.name}</div>
+                        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{cl.id.length > 28 ? `${cl.id.slice(0, 28)}…` : cl.id}</div>
+                      </Td>
+                      <Td>
+                        {hosts.length === 0 ? (
+                          <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>—</span>
+                        ) : (
+                          <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>
+                            {hosts.map((h) => (
+                              <span key={h} style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', background: 'var(--w-04)', border: '1px solid var(--w-08)', borderRadius: 5, padding: '1px 6px' }}>{h}</span>
+                            ))}
+                          </span>
+                        )}
+                      </Td>
+                      <Td>
+                        <MonoTag color={idle ? 'var(--text-dim)' : 'var(--accent-ink)'} bg="var(--w-04)" size={9.5}>
+                          {idle ? 'idle' : 'in use'}
+                        </MonoTag>
+                      </Td>
+                      <Td right><span style={{ fontFamily: 'var(--mono)', color: idle ? 'var(--text-faint)' : 'var(--accent-ink)' }}>{cl.liveTokens}</span></Td>
+                      <Td><span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>{new Date(cl.createdAt).toLocaleDateString()}</span></Td>
+                      <Td right>
+                        <button
+                          disabled={!idle}
+                          title={idle ? 'delete this client registration' : 'revoke its live connections first'}
+                          onClick={async () => {
+                            if (!(await confirm(`Delete client "${cl.name}"? Historical tokens are removed; agents survive.`))) return;
+                            await deleteClient(cl);
+                            load();
+                          }}
+                          style={{
+                            cursor: idle ? 'pointer' : 'default', fontSize: 11,
+                            color: idle ? 'var(--red-soft)' : 'var(--text-faint)',
+                            background: 'transparent', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 10px',
+                            opacity: idle ? 1 : 0.5,
+                          }}
+                        >
+                          delete
+                        </button>
+                      </Td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
+            {clientSelected.size > 0 && (
+              <div className="bulk-bar" data-testid="oauth-clients-bulk" style={{
+                position: 'sticky', bottom: 8, margin: '12px auto 0', width: 'fit-content',
+                display: 'flex', alignItems: 'center', gap: 9, padding: '9px 14px',
+                background: 'var(--bg-raised)', border: '1px solid var(--w-18)', borderRadius: 12,
+                boxShadow: '0 8px 28px rgba(0,0,0,.45)', zIndex: 5,
+              }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', fontWeight: 700 }}>{clientSelected.size} selected</span>
+                <button
+                  style={{ ...bulkBtn, color: 'var(--red-soft)' }}
+                  onClick={async () => {
+                    const selected = clients.filter((c) => clientSelected.has(c.id));
+                    const idle = selected.filter((c) => c.liveTokens === 0);
+                    const busy = selected.length - idle.length;
+                    if (idle.length === 0) {
+                      setError(busy > 0 ? `${busy} selected client(s) still have live connections — revoke those first` : null);
+                      return;
+                    }
+                    const msg = busy > 0
+                      ? `Delete ${idle.length} idle client(s)? ${busy} in-use selection(s) will be skipped.`
+                      : `Delete ${idle.length} client(s)? Historical tokens are removed; agents survive.`;
+                    if (!(await confirm(msg))) return;
+                    setError(null);
+                    let failed = 0;
+                    for (const cl of idle) {
+                      try {
+                        await api.adminDeleteClient(cl.id);
+                      } catch {
+                        failed += 1;
+                      }
+                    }
+                    if (failed > 0 || busy > 0) {
+                      setError([
+                        failed > 0 ? `${failed} delete(s) failed` : null,
+                        busy > 0 ? `${busy} in-use skipped` : null,
+                      ].filter(Boolean).join(' · '));
+                    }
+                    setClientSelected(new Set());
+                    load();
+                  }}
+                >
+                  delete idle in selection
+                </button>
+                <button style={{ ...bulkBtn, color: 'var(--text-dim)', border: 'none', background: 'transparent' }} onClick={() => setClientSelected(new Set())}>✕</button>
+              </div>
+            )}
           </div>
         )}
       </Section>
