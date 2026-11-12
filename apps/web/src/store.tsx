@@ -258,6 +258,25 @@ export function useAppStore() {
     setUser(r.user);
   }, []);
 
+  const logout = useCallback(async () => {
+    try {
+      await api.logout();
+    } catch {
+      /* still clear local state — cookie may already be gone */
+    }
+    setUser(null);
+    setCurrentPid(null);
+    setSnapshot(null);
+    setSelectedTaskId(null);
+    setView('home');
+  }, []);
+
+  const updateProfile = useCallback(async (name: string) => {
+    const r = await api.updateMe({ name });
+    setUser(r.user);
+    return r.user;
+  }, []);
+
   // --- data loading -----------------------------------------------------------
   const toProjectVM = (p: ApiProject, i: number): ProjectVM => ({
     id: p.id,
@@ -650,6 +669,8 @@ export function useAppStore() {
 
   const actions = {
     login,
+    logout,
+    updateProfile,
     goHome() {
       setView('home');
       setSelectedTaskId(null);

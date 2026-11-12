@@ -8,17 +8,77 @@ import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 import { confirm, prompt } from './Dialog';
 
 export function SettingsView({ store }: { store: AppStore }) {
-  // User management moved to the Admin menu (PLNR-83) — Settings is user-level only.
+  // User settings (PLNR-640) — reached from the avatar menu. Admin user mgmt stays in Admin.
   return (
-    <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
+    <div className="content-pad" data-testid="settings-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
-        <GroupInvitesSection />
-        <GroupsSection store={store} />
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 700, letterSpacing: '-.01em' }}>User settings</div>
+          <div style={{ fontSize: 12.5, color: 'var(--text-mid)', marginTop: 4 }}>
+            Profile and security for your account. Sign out is on your avatar menu.
+          </div>
+        </div>
+        <AccountSection store={store} />
         <PasskeysSection />
         <SessionsSection />
         <PasswordSection />
+        <GroupInvitesSection />
+        <GroupsSection store={store} />
       </div>
     </div>
+  );
+}
+
+/** Profile / email (PLNR-640). Sign out lives on the avatar menu, not here. */
+function AccountSection({ store }: { store: AppStore }) {
+  const [name, setName] = useState(store.user?.name ?? '');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const dirty = name.trim() !== (store.user?.name ?? '') && name.trim().length > 0;
+
+  useEffect(() => {
+    setName(store.user?.name ?? '');
+  }, [store.user?.name]);
+
+  return (
+    <Section title="Profile">
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+        <Field label="Display name">
+          <TextInput
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            maxLength={80}
+            aria-label="Display name"
+          />
+        </Field>
+        <Field label="Email" hint="contact admin to change">
+          <TextInput value={store.user?.email ?? ''} disabled readOnly aria-label="Email" />
+        </Field>
+      </div>
+      <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', marginBottom: 10 }}>
+        Role · {store.user?.accessMode === 'read_only' ? 'read only' : store.user?.role ?? 'member'}
+      </div>
+      {msg && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: msg.ok ? 'var(--green)' : 'var(--red-soft)', marginBottom: 10 }}>{msg.text}</div>
+      )}
+      <Button
+        disabled={!dirty || busy}
+        onClick={async () => {
+          setBusy(true);
+          setMsg(null);
+          try {
+            await store.actions.updateProfile(name.trim());
+            setMsg({ ok: true, text: 'display name saved' });
+          } catch (e) {
+            setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        Save name
+      </Button>
+    </Section>
   );
 }
 
@@ -161,6 +221,17 @@ export function UsersSection({ store }: { store: AppStore }) {
               <div style={{ display: 'flex', gap: 6 }}>
                 <SmallAction onClick={async () => { await api.patchUser(u.id, { role: u.role === 'admin' ? 'member' : 'admin' }); load(); }}>
                   {u.role === 'admin' ? 'demote' : 'promote'}
+                </SmallAction>
+                <SmallAction
+                  onClick={async () => {
+                    const next = (await prompt('Display name:', u.name))?.trim();
+                    if (next && next !== u.name) {
+                      await api.patchUser(u.id, { name: next });
+                      load();
+                    }
+                  }}
+                >
+                  rename
                 </SmallAction>
                 <SmallAction onClick={async () => { const r = await api.resetPassword(u.id); setTempReveal({ name: u.name, temp: r.tempPassword }); }}>
                   reset pw

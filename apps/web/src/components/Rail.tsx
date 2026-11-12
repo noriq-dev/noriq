@@ -6,6 +6,7 @@ import type { ProjectVM } from '../types';
 import { LiveDot } from './bits';
 import { ThemeButton } from './ThemeButton';
 import { Logo } from './Logo';
+import { UserMenu } from './UserMenu';
 
 function loadCollapsed(): Record<string, boolean> {
   try {
@@ -128,27 +129,8 @@ export function Rail({ store }: { store: AppStore }) {
       <div style={{ flex: 'none', borderTop: '1px solid var(--w-06)', padding: 8 }}>
         {store.permissions.canCreateProjects && <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />}
         {store.isAdmin && <FooterRow icon="◈" label="Admin" onClick={() => actions.openAdmin()} />}
-        <FooterRow icon="⚙" label="Settings" onClick={() => actions.setView('settings')} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 8px' }}>
-          <div
-            style={{
-              width: 24, height: 24, borderRadius: '50%', flex: 'none',
-              background: 'linear-gradient(135deg,#c6f24e,#3fd98b)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 10.5, color: 'var(--bg)', fontWeight: 700,
-            }}
-          >
-            {(store.user?.name ?? 'Y').slice(0, 1).toUpperCase()}
-          </div>
-          <div style={{ minWidth: 0, flex: 1 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {store.user?.name ?? 'you'}
-            </div>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
-              {store.user?.accessMode === 'read_only' ? 'read only' : (store.user?.role ?? 'supervisor')}
-            </div>
-          </div>
-          <ThemeButton size={28} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, paddingRight: 2 }}>
+          <UserMenu store={store} variant="rail" themeSlot={<ThemeButton size={28} />} />
         </div>
         <div
           style={{

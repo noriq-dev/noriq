@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { AppStore } from '../store';
 import { LIST_ROW_HEIGHT, MIN_TOUCH_TARGET } from '../viewport';
-import { AvatarChip } from './bits';
 import { DESKTOP_ONLY_VIEWS, type DesktopOnlyView } from './DesktopOnly';
 import { ThemeButton } from './ThemeButton';
+import { UserMenu } from './UserMenu';
 
 const NOTIFICATION_KEY = 'noriq.mobile.notifications';
 const appVersion = typeof __APP_VERSION__ === 'undefined' ? 'dev' : __APP_VERSION__;
@@ -41,18 +41,11 @@ export function MoreView({ store }: { store: AppStore }) {
   };
 
   return (
-    <main data-testid="more-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '14px 14px 24px' }}>
-      <div style={{ maxWidth: 560, margin: '0 auto' }}>
-        <section style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '12px 10px 18px' }}>
-          <AvatarChip name={store.user?.name ?? 'You'} color="you" size={42} radius={21} />
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 15, fontWeight: 700 }}>{store.user?.name ?? 'You'}</div>
-            <div style={{ color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, marginTop: 3 }}>{store.user?.accessMode === 'read_only' ? 'read only' : store.user?.role ?? 'member'}</div>
-          </div>
-        </section>
+    <main data-testid="more-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', overflowX: 'hidden', padding: '14px 14px 24px', background: 'var(--bg)' }}>
+      <div style={{ maxWidth: 560, margin: '0 auto', position: 'relative' }}>
+        <UserMenu store={store} variant="more" menuSide="bottom" />
 
         <MoreSection title="Workspace">
-          <MoreRow icon="⚙" label="Settings" detail="Account, password, and groups" onClick={() => store.actions.setView('settings')} />
           {store.isAdmin && <MoreRow icon="◈" label="Admin" detail="Instance projects and access" count={pendingUsers} onClick={() => store.actions.openAdmin()} />}
           <div style={{ minHeight: LIST_ROW_HEIGHT, display: 'flex', alignItems: 'center', gap: 12, padding: '6px 10px' }}>
             <span style={iconStyle}>◐</span><div style={{ flex: 1, fontSize: 13.5, fontWeight: 600 }}>Appearance</div><ThemeButton size={MIN_TOUCH_TARGET} label />

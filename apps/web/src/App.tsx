@@ -30,7 +30,8 @@ import { ResetPassword } from './components/ResetPassword';
 import { PublicView } from './components/PublicView';
 import { MobileTabBar } from './components/MobileTabBar';
 import { ProjectSheet } from './components/ProjectSheet';
-import { AvatarChip, LiveDot } from './components/bits';
+import { LiveDot } from './components/bits';
+import { UserMenu } from './components/UserMenu';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from './viewport';
 import { DesktopOnly, isDesktopOnlyView } from './components/DesktopOnly';
 import { MoreView } from './components/MoreView';
@@ -107,7 +108,8 @@ export function App() {
             ) : <Logo size={24} radius={7} />}
             <div style={{ flex: 1 }} />
             {project && store.view !== 'ask' && store.view !== 'more' && <><LiveDot size={6} /><span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)' }}>{liveCount} live</span></>}
-            <AvatarChip name={store.user.name} color="you" size={34} radius={17} />
+            {/* More owns its own avatar+name account menu — skip the topbar twin so they don't stack. */}
+            {store.view !== 'more' && <UserMenu store={store} variant="topbar" menuSide="bottom" />}
           </div>
         )}
         {!phone && projectView && <TopBar store={store} />}
@@ -115,7 +117,8 @@ export function App() {
           data-mobile-content-frame={phone || undefined}
           style={{ flex: 1, minHeight: 0, position: 'relative', marginBottom: phone ? MOBILE_TAB_BAR_HEIGHT : 0 }}
         >
-          {(store.view === 'home' || (!project && !['settings', 'admin', 'ask'].includes(store.view))) && <Home store={store} />}
+          {/* Exclude every non-home account surface — omitting `more` stacked Home under More when no project (PLNR-640). */}
+          {(store.view === 'home' || (!project && !['settings', 'admin', 'ask', 'more'].includes(store.view))) && <Home store={store} />}
           {store.view === 'settings' && <SettingsView store={store} />}
           {store.view === 'admin' && <AdminView store={store} />}
           {store.view === 'ask' && <AskView store={store} />}
