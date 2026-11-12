@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### OAuth Clients multi-select + calmer DCR (PLNR-642)
+
+- Admin OAuth connections and clients gain checkbox multi-select with Board-style bulk bars (revoke selected / delete idle in selection, Select idle).
+- Clients list labels Idle vs In use, filters the table, and shows redirect hosts instead of opaque rows alone.
+- DCR (`POST /oauth/register`) derives a host-based default `client_name` when omitted and clarifies redirect_uris validation errors.
+- `catalogRevision` remains **9** (no MCP catalog change).
+
 ## 0.82.0 - 2026-11-12
 
 ### Project health redesign (PLNR-635)
