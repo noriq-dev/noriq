@@ -55,9 +55,9 @@ export function UserMenu({
   const menuStyle: CSSProperties = moreInline
     ? {
         position: 'relative', zIndex: 'auto',
-        marginTop: 8, padding: 6,
+        marginTop: 10, padding: 6,
         border: '1px solid var(--w-12)', borderRadius: 12,
-        background: 'var(--bg-raised)',
+        background: 'var(--card)',
         boxSizing: 'border-box', width: '100%',
         animation: 'pl-stream .2s ease both',
       }
