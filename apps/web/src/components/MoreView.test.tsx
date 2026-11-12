@@ -37,6 +37,9 @@ describe('More mobile hub', () => {
     const plans = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Review phases, tasks'))!;
     act(() => plans.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('plans');
+    const documents = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Browse settled project docs'))!;
+    act(() => documents.click());
+    expect(appStore.actions.setView).toHaveBeenCalledWith('docs');
     const health = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Claimable work, readiness'))!;
     act(() => health.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('intelligence');
