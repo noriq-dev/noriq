@@ -8,22 +8,28 @@ import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 import { confirm, prompt } from './Dialog';
 
 export function SettingsView({ store }: { store: AppStore }) {
-  // User management moved to the Admin menu (PLNR-83) — Settings is user-level only.
+  // User settings (PLNR-640) — reached from the avatar menu. Admin user mgmt stays in Admin.
   return (
     <div className="content-pad" data-testid="settings-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 700, letterSpacing: '-.01em' }}>User settings</div>
+          <div style={{ fontSize: 12.5, color: 'var(--text-mid)', marginTop: 4 }}>
+            Profile and security for your account. Sign out is on your avatar menu.
+          </div>
+        </div>
         <AccountSection store={store} />
-        <GroupInvitesSection />
-        <GroupsSection store={store} />
         <PasskeysSection />
         <SessionsSection />
         <PasswordSection />
+        <GroupInvitesSection />
+        <GroupsSection store={store} />
       </div>
     </div>
   );
 }
 
-/** Profile basics + sign out (PLNR-640). */
+/** Profile / email (PLNR-640). Sign out lives on the avatar menu, not here. */
 function AccountSection({ store }: { store: AppStore }) {
   const [name, setName] = useState(store.user?.name ?? '');
   const [busy, setBusy] = useState(false);
@@ -35,7 +41,7 @@ function AccountSection({ store }: { store: AppStore }) {
   }, [store.user?.name]);
 
   return (
-    <Section title="Your account">
+    <Section title="Profile">
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
         <Field label="Display name">
           <TextInput
@@ -55,37 +61,23 @@ function AccountSection({ store }: { store: AppStore }) {
       {msg && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: msg.ok ? 'var(--green)' : 'var(--red-soft)', marginBottom: 10 }}>{msg.text}</div>
       )}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-        <Button
-          disabled={!dirty || busy}
-          onClick={async () => {
-            setBusy(true);
-            setMsg(null);
-            try {
-              await store.actions.updateProfile(name.trim());
-              setMsg({ ok: true, text: 'display name saved' });
-            } catch (e) {
-              setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          Save name
-        </Button>
-        <Button
-          variant="danger"
-          data-testid="sign-out"
-          disabled={busy}
-          onClick={async () => {
-            if (!(await confirm('Sign out of Noriq on this device?'))) return;
-            setBusy(true);
-            await store.actions.logout();
-          }}
-        >
-          Sign out
-        </Button>
-      </div>
+      <Button
+        disabled={!dirty || busy}
+        onClick={async () => {
+          setBusy(true);
+          setMsg(null);
+          try {
+            await store.actions.updateProfile(name.trim());
+            setMsg({ ok: true, text: 'display name saved' });
+          } catch (e) {
+            setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        Save name
+      </Button>
     </Section>
   );
 }

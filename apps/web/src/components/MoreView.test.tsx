@@ -9,6 +9,11 @@ let root: Root | null = null;
 let container: HTMLDivElement;
 const originalMatchMedia = window.matchMedia;
 
+vi.mock('./Dialog', () => ({
+  confirm: vi.fn(async () => true),
+  prompt: vi.fn(),
+}));
+
 function store(admin: boolean): AppStore {
   return {
     currentPid: 'prj_1', isAdmin: admin,
@@ -24,19 +29,27 @@ afterEach(() => {
 });
 
 describe('More mobile hub', () => {
-  it('hides Admin from non-admins and exposes mobile Plans alongside desktop tools', () => {
+  it('opens account menu from the avatar and keeps Plans/desktop tools', async () => {
     window.matchMedia = vi.fn(() => ({ matches: false, media: '', onchange: null, addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() }));
     const appStore = store(false);
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
     act(() => root!.render(<MoreView store={appStore} />));
 
     expect(container.textContent).not.toContain('Instance projects and access');
-    const settings = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Settings'))!;
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Sign out')).toBe(false);
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent?.includes('Settings') && b.textContent?.includes('Account, password'))).toBe(false);
+
+    const trigger = container.querySelector('[data-testid="user-menu-trigger"]') as HTMLButtonElement;
+    act(() => trigger.click());
+    const settings = container.querySelector('[data-testid="user-menu-settings"]') as HTMLButtonElement;
     act(() => settings.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('settings');
-    const signOut = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Sign out'))!;
-    act(() => signOut.click());
+
+    act(() => trigger.click());
+    const signOut = container.querySelector('[data-testid="user-menu-sign-out"]') as HTMLButtonElement;
+    await act(async () => { signOut.click(); await Promise.resolve(); });
     expect(appStore.actions.logout).toHaveBeenCalled();
+
     const plans = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Review phases, tasks'))!;
     act(() => plans.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('plans');

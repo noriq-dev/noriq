@@ -4,8 +4,9 @@
 
 ### User management: sign-out + self profile (PLNR-640)
 
-- Sign out from Settings, Rail, and mobile More; logout deletes the server session row.
-- Self-serve display name via `PATCH /api/auth/me` and Settings → Your account.
+- Avatar/name menu opens **User settings** and **Sign out** (no primary Sign out chrome).
+- User settings hosts profile, email, password, passkeys, and agent connections.
+- Logout deletes the server session row; self-serve display name via `PATCH /api/auth/me`.
 - Admin Users gain a rename action (existing invite/list/roles/disable unchanged).
 
 ## 0.81.9 - 2026-11-12

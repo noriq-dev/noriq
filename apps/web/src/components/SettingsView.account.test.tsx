@@ -53,8 +53,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('Settings account section (PLNR-640)', () => {
-  it('exposes display name editing and Sign out', async () => {
+describe('User settings surface (PLNR-640)', () => {
+  it('hosts profile and security without a primary Sign out control', async () => {
     const store = fakeStore();
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -63,7 +63,12 @@ describe('Settings account section (PLNR-640)', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(container.querySelector('[data-testid="settings-view"]')).toBeTruthy();
-    expect(container.textContent).toContain('Your account');
+    expect(container.textContent).toContain('User settings');
+    expect(container.textContent).toContain('Profile');
+    expect(container.textContent).toContain('Your password');
+    expect(container.textContent).toContain('Your passkeys');
+    expect(container.querySelector('[data-testid="sign-out"]')).toBeNull();
+
     const nameInput = container.querySelector('input[aria-label="Display name"]') as HTMLInputElement;
     const emailInput = container.querySelector('input[aria-label="Email"]') as HTMLInputElement;
     expect(nameInput.value).toBe('Mara');
@@ -79,9 +84,5 @@ describe('Settings account section (PLNR-640)', () => {
     expect(save.disabled).toBe(false);
     await act(async () => { save.click(); });
     expect(store.actions.updateProfile).toHaveBeenCalledWith('Mara Tuska');
-
-    const signOut = container.querySelector('[data-testid="sign-out"]') as HTMLButtonElement;
-    await act(async () => { signOut.click(); });
-    expect(store.actions.logout).toHaveBeenCalled();
   });
 });
