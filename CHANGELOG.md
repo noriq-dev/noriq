@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+## 0.82.0 - 2026-11-12
+
+### Project health redesign (PLNR-635)
+
+- Replace the flat Project health task card list with actionable sections: coordination pulse, ready-to-claim, evidence gaps, and held-back work.
+- Keep Review and historical lineage entry points; no API or MCP catalog change.
+
 ### User management: sign-out + self profile (PLNR-640)
 
 - Avatar/name menu opens **User settings** and **Sign out** (no primary Sign out chrome).
 - User settings hosts profile, email, password, passkeys, and agent connections.
 - Logout deletes the server session row; self-serve display name via `PATCH /api/auth/me`.
 - Admin Users gain a rename action (existing invite/list/roles/disable unchanged).
+- `catalogRevision` remains **9** (no MCP catalog change).
 
 ## 0.81.9 - 2026-11-12
 
