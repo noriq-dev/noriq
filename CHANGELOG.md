@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.81.9 - 2026-11-12
+
+### Mobile Documents on phone and tablet (PLNR-639)
+
+- Make Documents reachable from mobile/tablet chrome (More → Project tools).
+- Phone list/detail reading with back navigation; tablet stacked portrait and wider landscape split.
+- `catalogRevision` remains **9** (no MCP catalog change).
+
 ## 0.81.8 - 2026-11-06
 
 ### MCP batch `update_tasks` ergonomics (PLNR-636)
