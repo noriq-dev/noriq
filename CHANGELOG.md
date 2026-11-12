@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.82.1 - 2026-11-12
+
 ### OAuth Clients multi-select + calmer DCR (PLNR-642)
 
 - Admin OAuth connections and clients gain checkbox multi-select with Board-style bulk bars (revoke selected / delete idle in selection, Select idle).
