@@ -1,7 +1,7 @@
 {
   "name": "noriq",
   "private": true,
-  "version": "0.81.8",
+  "version": "0.81.9",
   "description": "AI-native project management \u2014 MCP coordination layer for agents, web app for humans",
   "license": "MIT",
   "workspaces": [
