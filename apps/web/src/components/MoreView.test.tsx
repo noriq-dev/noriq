@@ -14,7 +14,7 @@ function store(admin: boolean): AppStore {
     currentPid: 'prj_1', isAdmin: admin,
     user: { id: 'usr_1', name: 'Mara', role: admin ? 'admin' : 'member', accessMode: 'read_write' },
     data: { projects: [{ id: 'prj_1', key: 'MOB', name: 'Mobile' }] },
-    actions: { setView: vi.fn(), openAdmin: vi.fn(), selectProject: vi.fn() },
+    actions: { setView: vi.fn(), openAdmin: vi.fn(), selectProject: vi.fn(), logout: vi.fn() },
   } as unknown as AppStore;
 }
 
@@ -34,6 +34,9 @@ describe('More mobile hub', () => {
     const settings = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Settings'))!;
     act(() => settings.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('settings');
+    const signOut = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Sign out'))!;
+    act(() => signOut.click());
+    expect(appStore.actions.logout).toHaveBeenCalled();
     const plans = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Review phases, tasks'))!;
     act(() => plans.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('plans');

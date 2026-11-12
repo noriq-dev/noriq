@@ -57,6 +57,12 @@ export function MoreView({ store }: { store: AppStore }) {
           <div style={{ minHeight: LIST_ROW_HEIGHT, display: 'flex', alignItems: 'center', gap: 12, padding: '6px 10px' }}>
             <span style={iconStyle}>◐</span><div style={{ flex: 1, fontSize: 13.5, fontWeight: 600 }}>Appearance</div><ThemeButton size={MIN_TOUCH_TARGET} label />
           </div>
+          <MoreRow
+            icon="⎋"
+            label="Sign out"
+            detail="End this session on this device"
+            onClick={() => { void store.actions.logout(); }}
+          />
         </MoreSection>
 
         <MoreSection title="Notifications">

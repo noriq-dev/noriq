@@ -236,6 +236,8 @@ export const api = {
   setup: (email: string, name: string, password: string) =>
     req<{ user: import('./types').UserVM }>('POST', '/api/setup', { email, name, password }),
   me: () => req<{ user: import('./types').UserVM }>('GET', '/api/auth/me'),
+  updateMe: (patch: { name: string }) =>
+    req<{ user: import('./types').UserVM }>('PATCH', '/api/auth/me', patch),
   login: (email: string, password: string) =>
     req<{ user: import('./types').UserVM }>('POST', '/api/auth/login', { email, password }),
   logout: () => req('POST', '/api/auth/logout'),

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### User management: sign-out + self profile (PLNR-640)
+
+- Sign out from Settings, Rail, and mobile More; logout deletes the server session row.
+- Self-serve display name via `PATCH /api/auth/me` and Settings → Your account.
+- Admin Users gain a rename action (existing invite/list/roles/disable unchanged).
+
 ## 0.81.9 - 2026-11-12
 
 ### Mobile Documents on phone and tablet (PLNR-639)

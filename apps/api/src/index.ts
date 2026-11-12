@@ -543,11 +543,29 @@ app.post('/api/auth/login', async (c) => {
 });
 
 app.post('/api/auth/logout', userAuth, async (c) => {
+  // End the server-side session too — clearing only the cookie left a reusable row until
+  // the 30-day expiry (PLNR-640). Drop this browser session; leave other devices alone.
+  const sid = readSessionId(c.req.header('Cookie') ?? '');
+  if (sid) {
+    await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(await sha256Hex(sid)).run();
+  }
   c.header('Set-Cookie', SESSION_CLEAR_COOKIE);
   return c.json({ ok: true });
 });
 
 app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
+
+/** Self-serve profile basics (PLNR-640). Display name only — email stays invite/admin-bound. */
+app.patch('/api/auth/me', userAuth, async (c) => {
+  const body = await c.req.json<{ name?: string }>();
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 80) {
+    return c.json({ error: 'name required (1–80 characters)' }, 400);
+  }
+  const user = c.var.user!;
+  await c.env.DB.prepare('UPDATE users SET name = ? WHERE id = ?').bind(name, user.id).run();
+  return c.json({ user: await userWithCapabilities(c.env, { ...user, name }) });
+});
 
 // --- OAuth connections ("sessions") the user can see & revoke (agent re-model) ----
 app.get('/api/auth/sessions', userAuth, async (c) => {

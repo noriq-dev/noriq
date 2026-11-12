@@ -129,6 +129,7 @@ export function Rail({ store }: { store: AppStore }) {
         {store.permissions.canCreateProjects && <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />}
         {store.isAdmin && <FooterRow icon="◈" label="Admin" onClick={() => actions.openAdmin()} />}
         <FooterRow icon="⚙" label="Settings" onClick={() => actions.setView('settings')} />
+        <FooterRow icon="⎋" label="Sign out" onClick={() => { void actions.logout(); }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 8px' }}>
           <div
             style={{
