@@ -49,79 +49,106 @@ export function UserMenu({
     await store.actions.logout();
   };
 
-  const menuStyle: CSSProperties = {
-    position: 'absolute', zIndex: 70,
-    ...(variant === 'topbar' || variant === 'more' ? { right: 0 } : { left: 0, right: 0 }),
-    ...(menuSide === 'top' ? { bottom: 'calc(100% + 8px)' } : { top: 'calc(100% + 8px)' }),
-    padding: 6,
-    border: '1px solid var(--w-12)', borderRadius: 12,
-    background: 'var(--bg-raised)', boxShadow: '0 18px 55px rgba(0,0,0,.5)',
-    animation: `${menuSide === 'top' ? 'pl-stream-up' : 'pl-stream'} .2s ease both`,
-    minWidth: variant === 'topbar' ? 200 : undefined,
-  };
+  // More uses an in-flow panel (not absolute overlay) so account actions don't cover
+  // Workspace/Notifications underneath on the phone scroll surface (PLNR-640).
+  const moreInline = variant === 'more';
+  const menuStyle: CSSProperties = moreInline
+    ? {
+        position: 'relative', zIndex: 'auto',
+        marginTop: 8, padding: 6,
+        border: '1px solid var(--w-12)', borderRadius: 12,
+        background: 'var(--bg-raised)',
+        boxSizing: 'border-box', width: '100%',
+        animation: 'pl-stream .2s ease both',
+      }
+    : {
+        position: 'absolute', zIndex: 70,
+        ...(variant === 'topbar' ? { right: 0 } : { left: 0, right: 0 }),
+        ...(menuSide === 'top' ? { bottom: 'calc(100% + 8px)' } : { top: 'calc(100% + 8px)' }),
+        padding: 6,
+        border: '1px solid var(--w-12)', borderRadius: 12,
+        background: 'var(--bg-raised)', boxShadow: '0 18px 55px rgba(0,0,0,.5)',
+        animation: `${menuSide === 'top' ? 'pl-stream-up' : 'pl-stream'} .2s ease both`,
+        minWidth: variant === 'topbar' ? 200 : undefined,
+        boxSizing: 'border-box',
+      };
+
+  const menu = open && (
+    <div id={menuId} role="menu" aria-label="Account" style={menuStyle}>
+      <MenuItem
+        label="User settings"
+        detail="Profile, password, and passkeys"
+        onClick={openSettings}
+      />
+      <MenuItem
+        label="Sign out"
+        detail="End this session on this device"
+        danger
+        onClick={() => { void signOut(); }}
+      />
+    </div>
+  );
 
   return (
     <div
       ref={rootRef}
       data-testid="user-menu"
-      style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: variant === 'rail' ? 0 : 8, width: variant === 'rail' ? '100%' : undefined }}
+      style={{
+        position: moreInline ? 'static' : 'relative',
+        zIndex: !moreInline && open ? 40 : 'auto',
+        display: moreInline ? 'flex' : 'flex',
+        flexDirection: moreInline ? 'column' : 'row',
+        alignItems: moreInline ? 'stretch' : 'center',
+        gap: variant === 'rail' ? 0 : 8,
+        width: variant === 'rail' || variant === 'more' ? '100%' : undefined,
+        marginBottom: variant === 'more' ? 10 : undefined,
+      }}
     >
-      <button
-        type="button"
-        data-testid="user-menu-trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-controls={open ? menuId : undefined}
-        aria-label={`Account menu for ${name}`}
-        title={open ? 'Close account menu' : 'Account menu'}
-        onClick={() => setOpen((value) => !value)}
-        className="hover-bright"
-        style={triggerStyle(variant, open)}
-      >
-        {variant === 'topbar' ? (
-          <AvatarChip name={name} color="you" size={34} radius={17} />
-        ) : variant === 'more' ? (
-          <>
-            <AvatarChip name={name} color="you" size={42} radius={21} />
-            <span style={{ minWidth: 0, textAlign: 'left' }}>
-              <span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{name}</span>
-              <span style={{ display: 'block', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, marginTop: 3 }}>{roleLabel}</span>
-            </span>
-            <span aria-hidden style={{ marginLeft: 'auto', color: 'var(--text-faint)', fontSize: 12 }}>{open ? '▴' : '▾'}</span>
-          </>
-        ) : (
-          <>
-            <span style={{
-              width: 24, height: 24, borderRadius: '50%', flex: 'none',
-              background: 'linear-gradient(135deg,#c6f24e,#3fd98b)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 10.5, color: 'var(--bg)', fontWeight: 700,
-            }}>
-              {name.slice(0, 1).toUpperCase()}
-            </span>
-            <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
-              <span style={{ display: 'block', fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-              <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{roleLabel}</span>
-            </span>
-          </>
-        )}
-      </button>
-      {themeSlot}
-      {open && (
-        <div id={menuId} role="menu" aria-label="Account" style={menuStyle}>
-          <MenuItem
-            label="User settings"
-            detail="Profile, password, and passkeys"
-            onClick={openSettings}
-          />
-          <MenuItem
-            label="Sign out"
-            detail="End this session on this device"
-            danger
-            onClick={() => { void signOut(); }}
-          />
-        </div>
-      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: variant === 'rail' ? 0 : 8, width: moreInline ? '100%' : undefined, flex: variant === 'rail' ? 1 : undefined, minWidth: 0 }}>
+        <button
+          type="button"
+          data-testid="user-menu-trigger"
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          aria-label={`Account menu for ${name}`}
+          title={open ? 'Close account menu' : 'Account menu'}
+          onClick={() => setOpen((value) => !value)}
+          className="hover-bright"
+          style={triggerStyle(variant, open)}
+        >
+          {variant === 'topbar' ? (
+            <AvatarChip name={name} color="you" size={34} radius={17} />
+          ) : variant === 'more' ? (
+            <>
+              <AvatarChip name={name} color="you" size={42} radius={21} />
+              <span style={{ minWidth: 0, textAlign: 'left', flex: 1 }}>
+                <span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{name}</span>
+                <span style={{ display: 'block', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, marginTop: 3 }}>{roleLabel}</span>
+              </span>
+              <span aria-hidden style={{ color: 'var(--text-faint)', fontSize: 12 }}>{open ? '▴' : '▾'}</span>
+            </>
+          ) : (
+            <>
+              <span style={{
+                width: 24, height: 24, borderRadius: '50%', flex: 'none',
+                background: 'linear-gradient(135deg,#c6f24e,#3fd98b)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 10.5, color: 'var(--bg)', fontWeight: 700,
+              }}>
+                {name.slice(0, 1).toUpperCase()}
+              </span>
+              <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
+                <span style={{ display: 'block', fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+                <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{roleLabel}</span>
+              </span>
+            </>
+          )}
+        </button>
+        {themeSlot}
+        {!moreInline && menu}
+      </div>
+      {moreInline && menu}
     </div>
   );
 }

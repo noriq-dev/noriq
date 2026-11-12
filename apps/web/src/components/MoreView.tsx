@@ -41,8 +41,8 @@ export function MoreView({ store }: { store: AppStore }) {
   };
 
   return (
-    <main data-testid="more-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '14px 14px 24px' }}>
-      <div style={{ maxWidth: 560, margin: '0 auto' }}>
+    <main data-testid="more-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', overflowX: 'hidden', padding: '14px 14px 24px', background: 'var(--bg)' }}>
+      <div style={{ maxWidth: 560, margin: '0 auto', position: 'relative' }}>
         <UserMenu store={store} variant="more" menuSide="bottom" />
 
         <MoreSection title="Workspace">

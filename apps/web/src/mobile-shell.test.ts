@@ -16,6 +16,11 @@ describe('mobile shell content inset', () => {
     expect(tabBar).toContain('minHeight: MOBILE_TAB_BAR_HEIGHT');
   });
 
+  it('does not stack Home under More when no project is selected (PLNR-640)', () => {
+    expect(app).toContain("!['settings', 'admin', 'ask', 'more'].includes(store.view)");
+    expect(app).toContain("store.view !== 'more' && <UserMenu");
+  });
+
   it('keeps mobile overlays either above navigation or fully clear of it', () => {
     expect(drawer).toContain('bottom: MOBILE_TAB_BAR_HEIGHT');
     expect(drawer).not.toContain("paddingBottom: 'env(safe-area-inset-bottom)'");
