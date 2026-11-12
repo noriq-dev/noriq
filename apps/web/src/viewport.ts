@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 export const PHONE_BREAKPOINT = 768;
 export const DESKTOP_BREAKPOINT = 1024;
 export const WIDE_DESKTOP_BREAKPOINT = 1280;
+/** Documents uses stacked list/detail below this width inside the tablet band (768–1023). */
+export const TABLET_DOCS_SPLIT_MIN = 920;
 
 export const MIN_TOUCH_TARGET = 44;
 export const MIN_INPUT_FONT_SIZE = 16;
