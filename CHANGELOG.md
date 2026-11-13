@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.82.2 - 2026-11-13
+
 ### Agent lifecycle sweep apply on prod (PLNR-644)
 
 - Document `AGENT_LIFECYCLE_SWEEP_APPLY=true` as the intended production default after dry-run review.
