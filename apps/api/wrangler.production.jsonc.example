@@ -75,9 +75,10 @@
     "AGENT_PRESENCE_PURGE_DAYS": "90",
     "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
     "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
-    // Leave mutation off until POST /api/admin/agent-lifecycle-sweep (a dry run by default)
-    // has been reviewed.
-    "AGENT_LIFECYCLE_SWEEP_APPLY": "false",
+    // After reviewing POST /api/admin/agent-lifecycle-sweep (dry-run by default), set this
+    // true so the daily cron retires idle session copilots and archives retention-elapsed rows.
+    // Leaving it false accumulates null-project copilots and can starve the maintenance cron.
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "true",
     // Optional hardening/integration vars (see README.md > Productionizing):
     // "CIMD_ALLOWED_HOSTS": "chatgpt.com,claude.ai",
     // "SIGNAL_WEBHOOK_URL": "https://hooks.example.com/noriq",

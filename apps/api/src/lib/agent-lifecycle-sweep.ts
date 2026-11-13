@@ -113,6 +113,65 @@ function addCount(target: Record<string, number>, key: string): void {
   target[key] = (target[key] ?? 0) + 1;
 }
 
+/** Bound stored cron telemetry so a noisy batch cannot blow D1/`JSON.stringify` (Invalid string length). */
+const MAX_STORED_ERRORS = 20;
+const MAX_LAST_RESULT_CHARS = 16_384;
+
+export type AgentLifecycleSweepResult = {
+  sweepId: string;
+  dryRun: boolean;
+  projectId: string | null;
+  generatedAt: string;
+  config: AgentLifecycleSweepConfig;
+  examined: { actors: number; presences: number; runners: number };
+  transitions: Record<string, number>;
+  protections: Record<string, number>;
+  referenceCheck: { complete: boolean; blockers: string[] };
+  errorCounts: Record<string, number>;
+  errors: string[];
+  cursor: AgentLifecycleCursor;
+  complete: boolean;
+};
+
+/** Compact form written to `agent_lifecycle_sweep_state.last_result`. */
+export function serializeLifecycleSweepTelemetry(result: AgentLifecycleSweepResult): string {
+  const telemetry = {
+    sweepId: result.sweepId,
+    dryRun: result.dryRun,
+    projectId: result.projectId,
+    generatedAt: result.generatedAt,
+    config: result.config,
+    examined: result.examined,
+    transitions: result.transitions,
+    protections: result.protections,
+    referenceCheck: result.referenceCheck,
+    errorCounts: result.errorCounts,
+    errors: result.errors.slice(0, MAX_STORED_ERRORS),
+    errorsOmitted: Math.max(0, result.errors.length - MAX_STORED_ERRORS),
+    cursor: result.cursor,
+    complete: result.complete,
+  };
+  let text = JSON.stringify(telemetry);
+  if (text.length <= MAX_LAST_RESULT_CHARS) return text;
+  const truncated = {
+    ...telemetry,
+    errors: telemetry.errors.slice(0, 3),
+    errorsOmitted: Math.max(telemetry.errorsOmitted, result.errors.length - 3),
+    truncated: true,
+  };
+  text = JSON.stringify(truncated);
+  if (text.length <= MAX_LAST_RESULT_CHARS) return text;
+  return JSON.stringify({
+    sweepId: result.sweepId,
+    dryRun: result.dryRun,
+    generatedAt: result.generatedAt,
+    examined: result.examined,
+    complete: result.complete,
+    truncated: true,
+    note: 'last_result capped to avoid oversized telemetry storage',
+  });
+}
+
 function lifecycleState(row: { retiredAt: string | null; archivedAt: string | null; status?: string }): string {
   if (row.status === 'revoked') return 'revoked';
   if (row.archivedAt) return 'archived';
@@ -478,7 +537,7 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
     runnerId: runners.results.length === config.batchSize ? runners.results.at(-1)!.id : null,
   };
   const complete = !nextCursor.actorId && !nextCursor.presenceId && !nextCursor.runnerId;
-  const result = {
+  const result: AgentLifecycleSweepResult = {
     sweepId, dryRun, projectId: options.projectId ?? null, generatedAt: at, config, examined, transitions, protections,
     referenceCheck: referenceContract, errorCounts, errors, cursor: nextCursor, complete,
   };
@@ -491,7 +550,7 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
         WHERE id = 1`,
     ).bind(
       nextCursor.actorId, nextCursor.presenceId, nextCursor.runnerId, at,
-      dryRun ? 0 : 1, at, JSON.stringify(result),
+      dryRun ? 0 : 1, at, serializeLifecycleSweepTelemetry(result),
     ).run();
   }
   return result;

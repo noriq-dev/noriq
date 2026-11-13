@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Agent lifecycle sweep apply on prod (PLNR-644)
+
+- Document `AGENT_LIFECYCLE_SWEEP_APPLY=true` as the intended production default after dry-run review.
+- Cap `agent_lifecycle_sweep_state.last_result` size so cron telemetry cannot hit `Invalid string length`.
+- `catalogRevision` remains **9** (no MCP catalog change).
+
 ## 0.82.1 - 2026-11-12
 
 ### OAuth Clients multi-select + calmer DCR (PLNR-642)
