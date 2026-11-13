@@ -1,7 +1,12 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
-import { agentLifecycleSweepConfig, sweepAgentLifecycle } from '../src/lib/agent-lifecycle-sweep';
+import {
+  agentLifecycleSweepConfig,
+  serializeLifecycleSweepTelemetry,
+  sweepAgentLifecycle,
+  type AgentLifecycleSweepResult,
+} from '../src/lib/agent-lifecycle-sweep';
 import { ADMIN, createAgent, createUser, loginSession, mcpCall } from './helpers';
 
 const OLD = '2000-01-01T00:00:00.000Z';
@@ -86,6 +91,32 @@ beforeAll(async () => {
 });
 
 describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
+  it('caps stored last_result telemetry (PLNR-644)', () => {
+    const base: AgentLifecycleSweepResult = {
+      sweepId: 'als_test',
+      dryRun: true,
+      projectId: null,
+      generatedAt: NOW,
+      config: agentLifecycleSweepConfig({}),
+      examined: { actors: 1, presences: 1, runners: 0 },
+      transitions: { 'actor:active->retired:session_inactive': 1 },
+      protections: {},
+      referenceCheck: { complete: true, blockers: [] },
+      errorCounts: { noise: 40 },
+      errors: Array.from({ length: 40 }, (_, i) => `err-${i}-${'x'.repeat(200)}`),
+      cursor: { actorId: null, presenceId: null, runnerId: null },
+      complete: true,
+    };
+    const stored = JSON.parse(serializeLifecycleSweepTelemetry(base)) as {
+      errors: string[];
+      errorsOmitted: number;
+      truncated?: boolean;
+    };
+    expect(stored.errors.length).toBeLessThanOrEqual(20);
+    expect(stored.errorsOmitted).toBeGreaterThan(0);
+    expect(serializeLifecycleSweepTelemetry(base).length).toBeLessThanOrEqual(16_384);
+  });
+
   it('validates deployment overrides and keeps scheduled mutation opt-in', () => {
     expect(agentLifecycleSweepConfig({
       AGENT_LIFECYCLE_ONLINE_SECONDS: '-1',
