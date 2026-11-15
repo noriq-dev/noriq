@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.82.3 - 2026-11-15
+
+### Contributors can approve proposed plans (PLNR-645)
+
+- Plan approve/reject REST routes require **contribute** (not manage), matching task proposal accept.
+- Plans UI Approve/Reject gated on `permissions.canContribute`.
+- `catalogRevision` remains **9** (no MCP catalog change).
+
 ## 0.82.2 - 2026-11-13
 
 ### Agent lifecycle sweep apply on prod (PLNR-644)
