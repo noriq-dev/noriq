@@ -8,12 +8,15 @@ const VIEWER_POST_ROUTES = [
   /\/memory\/(search|similar-effort|explain|constellation|entities|context|acceptance)$/,
 ];
 
+// Human go/no-go gates for *proposed* work (plan approve/reject, task proposal
+// accept/reject) deliberately stay off this list so they default to `contribute`
+// — same authority as ordinary task mutation. Plan *dispatch* and memory
+// decision approve/reject remain manager-only.
 const MANAGER_ROUTES = [
   /\/meta$/,
   /\/access(?:\/.*)?$/,
   /\/runs$/,
   /\/plans\/[^/]+\/dispatch$/,
-  /\/plans\/[^/]+\/(approve|reject)$/,
   /\/locks\/[^/]+\/force-release$/,
   /\/search\/reindex$/,
   /\/memory\/repositories(?:\/[^/]+)?$/,

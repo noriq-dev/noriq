@@ -87,4 +87,48 @@ describe('Plans phone composition', () => {
     expect(css).toContain('.plan-dispatch-fields, .plan-dispatch-budget-fields { grid-template-columns: minmax(0, 1fr);');
     expect(app).toContain('marginBottom: phone ? MOBILE_TAB_BAR_HEIGHT : 0');
   });
+
+  it('shows proposed-plan Approve/Reject to contributors and hides them from viewers', () => {
+    const proposedStore = (canContribute: boolean): AppStore => {
+      const base = mobilePlanStore();
+      return {
+        ...base,
+        permissions: { canContribute, canManage: false, canView: true, canOwn: false, cappedByReadOnly: false },
+        snapshot: {
+          ...base.snapshot!,
+          plans: [{
+            ...(base.snapshot as { plans: Array<Record<string, unknown>> }).plans[0],
+            status: 'proposed',
+          }],
+        },
+        actions: {
+          ...base.actions,
+          approvePlan: vi.fn(),
+          rejectPlan: vi.fn(),
+        },
+      } as unknown as AppStore;
+    };
+
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    const contributor = proposedStore(true);
+    act(() => root!.render(<PlansView store={contributor} />));
+    expect(container.textContent).toContain('awaiting your approval');
+    expect(container.textContent).toContain('Approve');
+    expect(container.textContent).toContain('Reject');
+    act(() => [...container.querySelectorAll('button')].find((b) => b.textContent === 'Approve')!.click());
+    expect(contributor.actions.approvePlan).toHaveBeenCalledWith('plan_1');
+
+    act(() => root?.unmount());
+    container.remove();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root!.render(<PlansView store={proposedStore(false)} />));
+    expect(container.textContent).toContain('awaiting contributor approval');
+    expect(container.textContent).not.toContain('Approve');
+    expect(container.textContent).not.toContain('Reject');
+  });
 });

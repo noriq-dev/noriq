@@ -239,6 +239,63 @@ describe('plans & groups', () => {
     expect(plans.body.plans.some((p: { id: string }) => p.id === planId)).toBe(false);
   });
 
+  // Contributor+ human gate (PLNR-645 / NQ-35): same authority as task proposal accept —
+  // a project member who is not the owner/author must be able to decide a proposed plan.
+  it('lets a project contributor who is not the plan author approve or reject a proposed plan', async () => {
+    const db = () => (env as unknown as { DB: D1Database }).DB;
+    const contributor = await createUser(
+      'plan-contributor@example.com', 'Plan Contributor', 'longenough1',
+    ).catch(async () => db().prepare("SELECT id FROM users WHERE email = 'plan-contributor@example.com'").first<{ id: string }>());
+    const viewer = await createUser(
+      'plan-viewer@example.com', 'Plan Viewer', 'longenough1',
+    ).catch(async () => db().prepare("SELECT id FROM users WHERE email = 'plan-viewer@example.com'").first<{ id: string }>());
+    await db().batch([
+      db().prepare(
+        "INSERT OR REPLACE INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'contributor')",
+      ).bind(projectId, contributor!.id),
+      db().prepare(
+        "INSERT OR REPLACE INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')",
+      ).bind(projectId, viewer!.id),
+    ]);
+    const contributorCookie = await loginSession('plan-contributor@example.com', 'longenough1');
+    const viewerCookie = await loginSession('plan-viewer@example.com', 'longenough1');
+
+    const toApprove = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Contributor approves this', proposed: true,
+      phases: [{ title: 'Phase 1', newTasks: [{ title: 'ungated by contributor' }] }],
+    });
+    expect(toApprove.isError).toBe(false);
+    const approve = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/plans/${toApprove.body.id}/approve`,
+      { method: 'POST', headers: { Cookie: contributorCookie } },
+    );
+    expect(approve.status).toBe(200);
+    expect(await approve.json()).toMatchObject({ status: 'active', tasksUngated: 1 });
+
+    const toReject = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Contributor rejects this', proposed: true,
+      phases: [{ title: 'Phase 1', newTasks: [{ title: 'cancelled by contributor' }] }],
+    });
+    expect(toReject.isError).toBe(false);
+    const reject = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/plans/${toReject.body.id}/reject`,
+      { method: 'POST', headers: { Cookie: contributorCookie } },
+    );
+    expect(reject.status).toBe(200);
+    expect(((await reject.json()) as { cancelledTasks: number }).cancelledTasks).toBe(1);
+
+    const viewerBlocked = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Viewer cannot approve', proposed: true,
+      phases: [{ title: 'Phase 1', newTasks: [{ title: 'stays gated' }] }],
+    });
+    const denied = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/plans/${viewerBlocked.body.id}/approve`,
+      { method: 'POST', headers: { Cookie: viewerCookie } },
+    );
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ code: 'project_action_denied', action: 'contribute' });
+  });
+
   // ---- PLNR-153: a deleted plan takes its minted dependency edges with it ------
   it('deleting a plan frees its phase-ordering edges but never a manual one', async () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {
