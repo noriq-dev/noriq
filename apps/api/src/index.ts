@@ -2945,14 +2945,15 @@ app.post('/api/projects/:pid/plans/:plid/restore', userAuth, async (c) =>
 
 // The mandatory human gate (RUN-23): approve a proposed plan → its tasks become
 // claimable/dispatchable; reject → discard the proposal (its un-started tasks are
-// cancelled). Both are project-reach gated by the /api/projects/:pid/* middleware.
+// cancelled). Contributor+ (not manager-only) — same human go/no-go authority as
+// task proposal accept/reject; viewers stay read-only via requireProjectAccess.
 app.post('/api/projects/:pid/plans/:plid/approve', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).approvePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
 app.post('/api/projects/:pid/plans/:plid/reject', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).rejectPlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
 
 // The spin-off gate's task-level twin (PLNR-230): accept a run agent's proposed spin-off
-// (→ plain claimable todo) or reject it (→ cancelled; provenance kept). Same project-reach
+// (→ plain claimable todo) or reject it (→ cancelled; provenance kept). Same contributor+
 // gating as the plan gate above.
 app.post('/api/projects/:pid/tasks/:tid/proposal/accept', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).acceptProposal(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));

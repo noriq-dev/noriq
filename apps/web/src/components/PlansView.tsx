@@ -211,7 +211,8 @@ export function PlansView({ store }: { store: AppStore }) {
                 </div>
               </div>
 
-              {/* the mandatory human gate (RUN-23): approve → tasks become claimable */}
+              {/* the mandatory human gate (RUN-23): approve → tasks become claimable.
+                  Contributor+ only (viewers see the awaiting banner without decision buttons). */}
               {proposed && (
                 <div
                   className="plan-proposal-gate"
@@ -222,7 +223,9 @@ export function PlansView({ store }: { store: AppStore }) {
                   }}
                 >
                   <span className="plan-proposal-copy" style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f5a623' }}>
-                    ⏳ awaiting your approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched until you approve
+                    {permissions?.canContribute
+                      ? <>⏳ awaiting your approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched until you approve</>
+                      : <>⏳ awaiting contributor approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched yet</>}
                     {/* What is actually being approved (RUN-162). Approving a plan approves what
                         its tasks SAY, and a task with no execution spec is one whose scope and
                         definition of done its builder will decide for itself — which is a thing to
@@ -238,29 +241,33 @@ export function PlansView({ store }: { store: AppStore }) {
                       </>
                     )}
                   </span>
-                  <div className="plan-flex-spacer" style={{ flex: 1 }} />
-                  <Button
-                    variant="primary"
-                    style={{ padding: '6px 16px', fontSize: 12 }}
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      await store.actions.approvePlan(plan.id);
-                    }}
-                  >
-                    Approve
-                  </Button>
-                  <Button
-                    variant="danger"
-                    style={{ padding: '6px 14px', fontSize: 12 }}
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      if (await confirm(`Reject "${plan.title}"? Its un-started tasks are cancelled and the plan is discarded.`)) {
-                        await store.actions.rejectPlan(plan.id);
-                      }
-                    }}
-                  >
-                    Reject
-                  </Button>
+                  {permissions?.canContribute && (
+                    <>
+                      <div className="plan-flex-spacer" style={{ flex: 1 }} />
+                      <Button
+                        variant="primary"
+                        style={{ padding: '6px 16px', fontSize: 12 }}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          await store.actions.approvePlan(plan.id);
+                        }}
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        variant="danger"
+                        style={{ padding: '6px 14px', fontSize: 12 }}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (await confirm(`Reject "${plan.title}"? Its un-started tasks are cancelled and the plan is discarded.`)) {
+                            await store.actions.rejectPlan(plan.id);
+                          }
+                        }}
+                      >
+                        Reject
+                      </Button>
+                    </>
+                  )}
                 </div>
               )}
 
